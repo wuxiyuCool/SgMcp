@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-shared"
+version = "0.1.0"
+description = "企业三层 MCP 平台跨层共享包：审批模型 / server 启动器"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.12",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_shared"]

@@ -1,0 +1,22 @@
+# 根工程：uv workspace 编排 + 共享脚本；各层 server 有独立的 pyproject.toml
+[project]
+name = "enterprise-mcp-root"
+version = "0.1.0"
+description = "企业级三层 MCP 平台（上层审批网关 / 中层业务 / 下层通用工具）"
+requires-python = ">=3.10"
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = [
+    "shared",
+    "layers/common",
+    "layers/business/it_ops",
+    "layers/business/purchasing",
+    "layers/business/manufacturing",
+    "layers/gateway",
+]
+
+[tool.mypy]
+python_version = "3.10"

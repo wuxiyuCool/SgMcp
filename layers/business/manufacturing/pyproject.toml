@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-manufacturing-server"
+version = "0.1.0"
+description = "【中层·制造】制造系统 MCP server（预留）"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=2.2,<3",
+    "mcp-shared>=0.1.0",
+]
+
+[project.scripts]
+manufacturing-server = "mcp_manufacturing.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_manufacturing"]
