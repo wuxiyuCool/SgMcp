@@ -20,6 +20,10 @@ venv/
 # WorkBuddy local data
 .workbuddy/
 
+# serversctl 运行时文件
+logs/
+run/
+
 # Go 构建产物
 layers/business/go_datahub/bin/
 
