@@ -1,0 +1,5 @@
+# 跨平台行尾：shell 脚本必须在 Linux 检出/导出为 LF
+*.sh text eol=lf
+*.service text eol=lf
+*.py text eol=lf
+*.ps1 text eol=crlf
