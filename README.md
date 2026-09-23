@@ -41,9 +41,14 @@
 
 | Server | 状态 | 分工 |
 |--------|------|------|
-| `it_ops` | ✅ 试点中 | IT 运维：服务台工单、变更、资产、监控 |
+| `it_ops` | ✅ 试点中 | IT 运维：服务台工单、变更、资产、监控（Python 轻活） |
+| `go_datahub` | ✅ 试点中 | 数据重活：大批量采集 / 多数据库交互（Go，官方 go-sdk） |
 | `purchasing` | 🔒 预留 | 采购系统：采购申请、订单、供应商 |
 | `manufacturing` | 🔒 预留 | 制造系统：工单、排产、物料 |
+
+**轻重分工**：Python 各层负责协议编排与轻业务；重活（并发采集、Oracle/MySQL/PG/MSSQL 批量读写）
+由 Go 的 `go_datahub` 承担，长任务走 `submit_collect_job → get_job_status` 异步 job 模式，
+经网关 HITL 审批后放行。选型与实现细节见 `docs/architecture.md` §8。
 
 ## 检索与复用说明
 
@@ -82,7 +87,11 @@ uv sync --all-packages        # 或：pip install -e shared -e layers/common -e 
 uv run itops-server           # 中层 IT 运维（默认 9200）
 uv run common-server          # 下层通用工具（默认 9100）
 uv run gateway-server         # 上层审批网关（默认 9000）
-#    一键起三层（HTTP）：scripts/run-demo.ps1
+#    中层 Go 重活（可选，需 Go 1.24+；一键脚本会自动构建起停）：
+cd layers/business/go_datahub && go build -o bin/datahub-server.exe ./cmd/datahub-server && bin/datahub-server.exe   # 默认 9300
+#    Go 与网关分机部署：Go 侧 -addr 0.0.0.0 -token <串>，网关机设 MCP_GODATAHUB_URL / MCP_GODATAHUB_TOKEN
+#    （详见 docs/architecture.md §8.6 跨机部署）
+#    一键起全部层（HTTP）：scripts/run-demo.ps1
 
 # 3. 配置 MCP 客户端连接 gateway（统一入口）
 #    见 docs/client-config.md
@@ -108,7 +117,19 @@ python tests/ops/run_ops_test.py --load 100       # 附带 100 次并发压测
 python tests/ops/run_ops_test.py --url http://127.0.0.1:9000/mcp   # 自定义网关地址
 ```
 
-运维测试集当前 **21 项断言**，覆盖：三层可达性与工具清单、通用工具功能（含时区）、it_ops 工单/资产读写、网关只读放行、HITL 审批全流程（挂起→批准执行→驳回不执行→已决不可重复决策→未注册路由报错）、并发压测。
+运维测试集当前 **26 项断言**，覆盖：三层可达性与工具清单、通用工具功能（含时区）、it_ops 工单/资产读写、go_datahub 异步 job 全流程、db_ping 与 dsn_ref 防泄露、网关只读放行与 HTTP 转发、HITL 审批全流程（挂起→批准执行→驳回不执行→已决不可重复决策→审批放行 Go 采集→未注册路由报错）、并发压测。未部署 Go server 时可用 `--skip-go` 降级。
+
+## 敏感配置
+
+密码/令牌/DSN 一律写在 **不进 git** 的 env 文件里（模板复制即用，打包后可直接改、重启生效）：
+
+| 文件 | 归属 | 内容 |
+|------|------|------|
+| `config/platform.env` | Python 网关 | 网关→Go 的 URL 与 Bearer 令牌 |
+| `layers/business/go_datahub/config/datahub.env` | Go server | 监听地址/端口/令牌 + `DSN_<名称>` 连接串注册表 |
+
+优先级：命令行 > OS 环境变量 > 配置文件。数据库工具参数用 `dsn_ref` 引用服务端 DSN，
+密码不经过 AI 客户端 / 网关审批单 / 日志。详见 `docs/architecture.md` §8.7。
 
 ## 目录结构
 
@@ -116,6 +137,7 @@ python tests/ops/run_ops_test.py --url http://127.0.0.1:9000/mcp   # 自定义�
 mcp/
 ├── pyproject.toml              # 根工程编排（uv workspace，package=false）
 ├── README.md
+├── config/                     # 敏感配置入口（*.env 不进 git，只留 .example 模板）
 ├── docs/                       # 设计文档
 │   ├── architecture.md
 │   └── client-config.md
@@ -124,7 +146,8 @@ mcp/
 ├── layers/
 │   ├── common/                 # 【下层】通用工具 MCP
 │   ├── business/               # 【中层】业务系统 MCP
-│   │   ├── it_ops/             #   IT 运维（试点）
+│   │   ├── it_ops/             #   IT 运维（试点，Python 轻活）
+│   │   ├── go_datahub/         #   数据重活（试点，Go 官方 go-sdk）
 │   │   ├── purchasing/         #   采购（预留）
 │   │   └── manufacturing/      #   制造（预留）
 │   └── gateway/                # 【上层】审批网关 MCP

@@ -17,3 +17,6 @@ itops-server = "mcp_itops.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_itops"]
+
+[tool.uv.sources]
+mcp-shared = { workspace = true }

@@ -17,3 +17,6 @@ manufacturing-server = "mcp_manufacturing.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_manufacturing"]
+
+[tool.uv.sources]
+mcp-shared = { workspace = true }

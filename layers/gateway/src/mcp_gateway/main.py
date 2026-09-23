@@ -18,6 +18,7 @@ MCP Streamable HTTP 真实转发（routing.ToolRoute 的 exec_kind="http"）。
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from mcp.server import MCPServer
@@ -26,6 +27,11 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp_gateway.approvals import gate
 from mcp_gateway.routing import Router, ToolRoute, install_local_executors
 from mcp_shared.approval import ApprovalAction
+from mcp_shared.config import load_platform_env
+
+# 统一敏感配置入口：先把 config/platform.env（不进 git）注入环境，OS 环境变量优先。
+# 必须在模块导入期完成——路由注册（_build_router）会读取其中的 URL/TOKEN。
+load_platform_env()
 
 logger = logging.getLogger("mcp_gateway")
 
@@ -51,6 +57,18 @@ def _build_router() -> Router:
     # 下层通用工具（只读，直接放行）
     for t in ("now", "timestamp", "generate_id", "slugify", "echo"):
         r.register(ToolRoute(server="common-tools", tool=t, exec_kind="local", requires_approval=False, summary=f"common-tools.{t}（通用）"))
+    # 中层 go_datahub（Go 重活 server，Streamable HTTP 转发，默认 :9300）
+    # 跨机部署：MCP_GODATAHUB_URL 指远端地址，MCP_GODATAHUB_TOKEN 配 Bearer 鉴权
+    godh = os.environ.get("MCP_GODATAHUB_URL", "http://127.0.0.1:9300/mcp")
+    godh_token = os.environ.get("MCP_GODATAHUB_TOKEN")
+    godh_headers = {"Authorization": f"Bearer {godh_token}"} if godh_token else None
+    for tool, approval, summary in (
+        ("submit_collect_job", True, "提交批量采集任务（大规模数据作业，需审批）"),
+        ("cancel_job", False, "中止运行中的采集任务"),
+    ):
+        r.register(ToolRoute(server="go_datahub", tool=tool, exec_kind="http", requires_approval=approval, summary=summary, endpoint=godh, headers=godh_headers))
+    for t in ("list_sources", "get_job_status", "list_jobs", "db_ping"):
+        r.register(ToolRoute(server="go_datahub", tool=t, exec_kind="http", requires_approval=False, summary=f"go_datahub.{t}（只读）", endpoint=godh, headers=godh_headers))
     return r
 
 

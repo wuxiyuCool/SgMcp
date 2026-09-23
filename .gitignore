@@ -19,3 +19,11 @@ venv/
 
 # WorkBuddy local data
 .workbuddy/
+
+# Go 构建产物
+layers/business/go_datahub/bin/
+
+# 敏感配置统一入口（真实 .env 不进库，只保留 .example 模板）
+**/config/*.env
+*.env
+!.env.example

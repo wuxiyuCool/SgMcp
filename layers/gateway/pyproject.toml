@@ -20,3 +20,8 @@ gateway-server = "mcp_gateway.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_gateway"]
+
+[tool.uv.sources]
+mcp-shared = { workspace = true }
+mcp-itops-server = { workspace = true }
+mcp-common-server = { workspace = true }

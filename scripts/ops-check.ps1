@@ -4,7 +4,8 @@
 param(
     [int]$Load = 0,
     [int]$BootWaitSeconds = 10,
-    [string]$Python = ""
+    [string]$Python = "",
+    [string]$GodhUrl = ""   # 远端 go_datahub 地址（如 http://192.168.1.20:9300/mcp）；留空取环境变量 MCP_GODATAHUB_URL，再留空则本机起停
 )
 $ErrorActionPreference = "Stop"
 $ROOT = Split-Path $PSScriptRoot -Parent
@@ -44,6 +45,23 @@ $env:PYTHONPATH = ($srcPaths -join ";")
 $env:NO_PROXY = "*"
 $env:PYTHONIOENCODING = "utf-8"
 
+# go_datahub 地址解析：-GodhUrl > OS 环境变量 > config/platform.env > 本机默认；写回环境供网关与测试集共用
+function Get-CfgValue([string]$file, [string]$key) {
+    if (-not (Test-Path $file)) { return "" }
+    foreach ($line in Get-Content $file -Encoding UTF8) {
+        if ($line -match "^\s*(export\s+)?$key\s*=\s*(.+)$") {
+            return $Matches[2].Trim().Trim('"').Trim("'")
+        }
+    }
+    return ""
+}
+$godh = if ($GodhUrl) { $GodhUrl } `
+        elseif ($env:MCP_GODATAHUB_URL) { $env:MCP_GODATAHUB_URL } `
+        elseif (Get-CfgValue (Join-Path $ROOT "config\platform.env") "MCP_GODATAHUB_URL") { Get-CfgValue (Join-Path $ROOT "config\platform.env") "MCP_GODATAHUB_URL" } `
+        else { "http://127.0.0.1:9300/mcp" }
+$env:MCP_GODATAHUB_URL = $godh
+$godhIsLocal = $godh -match "^https?://(127\.0\.0\.1|localhost|\[?::1\]?)(:\d+)?/"
+
 Write-Host "==> 启动三层 server（HTTP）" -ForegroundColor Cyan
 $procs = @()
 foreach ($s in $servers) {
@@ -53,11 +71,39 @@ foreach ($s in $servers) {
     Write-Host "    $($s.Entry) -> :$($s.Port) (PID $($procs[-1].Id))"
 }
 
+# 中层 Go 重活 server：
+# - 远端地址（-GodhUrl / MCP_GODATAHUB_URL 非本机）→ 不起停本地，只把地址交给测试集直测
+# - 本机默认 → 二进制不存在时自动 go build，无 Go 环境则跳过并让测试集 --skip-go
+$godhExe = Join-Path $ROOT "layers\business\go_datahub\bin\datahub-server.exe"
+$testArgs = @((Join-Path $ROOT "tests\ops\run_ops_test.py"), "--godh-url", $godh)
+if (-not $godhIsLocal) {
+    Write-Host "==> go_datahub 使用远端地址：$godh（跳过本机构建/起停）" -ForegroundColor Cyan
+} elseif (-not (Test-Path $godhExe)) {
+    if (Get-Command go -ErrorAction SilentlyContinue) {
+        Write-Host "==> 构建 go_datahub" -ForegroundColor Cyan
+        Push-Location (Join-Path $ROOT "layers\business\go_datahub")
+        go build -o bin/datahub-server.exe ./cmd/datahub-server
+        $buildOk = ($LASTEXITCODE -eq 0)
+        Pop-Location
+        if (-not $buildOk) { Write-Warning "go build 失败，跳过 Go 层" }
+    } else {
+        Write-Warning "未找到 go_datahub 二进制且无 Go 环境，跳过 Go 层"
+    }
+    if (Test-Path $godhExe) {
+        $procs += Start-Process -FilePath $godhExe -ArgumentList @("-port", "9300") -PassThru -WindowStyle Hidden
+        Write-Host "    go_datahub -> :9300 (PID $($procs[-1].Id))"
+    } else {
+        $testArgs += "--skip-go"
+    }
+} else {
+    $procs += Start-Process -FilePath $godhExe -ArgumentList @("-port", "9300") -PassThru -WindowStyle Hidden
+    Write-Host "    go_datahub -> :9300 (PID $($procs[-1].Id))"
+}
+
 try {
     Start-Sleep -Seconds $BootWaitSeconds
     Write-Host "`n==> 运行运维测试集" -ForegroundColor Cyan
     # 注意：不要用 $args（PowerShell 自动变量，赋值会被忽略）
-    $testArgs = @((Join-Path $ROOT "tests\ops\run_ops_test.py"))
     if ($Load -gt 0) { $testArgs += @("--load", "$Load") }
     & $py @testArgs
     $code = $LASTEXITCODE

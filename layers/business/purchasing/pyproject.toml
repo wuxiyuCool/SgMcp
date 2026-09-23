@@ -17,3 +17,6 @@ purchasing-server = "mcp_purchasing.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_purchasing"]
+
+[tool.uv.sources]
+mcp-shared = { workspace = true }

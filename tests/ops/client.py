@@ -20,6 +20,7 @@ DEFAULT_URLS = {
     "gateway": "http://127.0.0.1:9000/mcp",
     "it_ops": "http://127.0.0.1:9200/mcp",
     "common-tools": "http://127.0.0.1:9100/mcp",
+    "go_datahub": "http://127.0.0.1:9300/mcp",
 }
 
 
@@ -51,45 +52,56 @@ def _unwrap(result: Any) -> Any:
     return data
 
 
-async def _call_async(url: str, tool: str, arguments: dict[str, Any] | None = None) -> Any:
+def _make_client(url: str, raise_exceptions: bool, headers: dict[str, str] | None):
+    """构造 SDK Client；headers 非空时经自建 httpx2.AsyncClient 注入（远端 Go 带 token 直测用）。"""
     from mcp import Client
 
-    async with Client(url, raise_exceptions=True, mode="legacy") as client:
+    if not headers:
+        return Client(url, raise_exceptions=raise_exceptions, mode="legacy")
+    import httpx2
+    from mcp.client.streamable_http import streamable_http_client
+
+    transport = streamable_http_client(url, http_client=httpx2.AsyncClient(headers=headers))
+    return Client(transport, raise_exceptions=raise_exceptions, mode="legacy")
+
+
+async def _call_async(url: str, tool: str, arguments: dict[str, Any] | None = None,
+                      headers: dict[str, str] | None = None) -> Any:
+    async with _make_client(url, True, headers) as client:
         result = await client.call_tool(tool, arguments or {})
     return _unwrap(result)
 
 
-async def _call_raw_async(url: str, tool: str, arguments: dict[str, Any] | None = None) -> Any:
+async def _call_raw_async(url: str, tool: str, arguments: dict[str, Any] | None = None,
+                          headers: dict[str, str] | None = None) -> Any:
     """同 _call_async，但错误以 is_error 结果原样返回（不抛异常）。
 
     与网关网关路径 (routing.call_downstream_http) 的行为一致，用于测试
     「未注册路由 / 下游报错」这类需要检查 is_error 的用例。
     """
-    from mcp import Client
-
-    async with Client(url, raise_exceptions=False, mode="legacy") as client:
+    async with _make_client(url, False, headers) as client:
         return await client.call_tool(tool, arguments or {})
 
 
-async def _list_async(url: str) -> list[str]:
-    from mcp import Client
-
-    async with Client(url, raise_exceptions=True, mode="legacy") as client:
+async def _list_async(url: str, headers: dict[str, str] | None = None) -> list[str]:
+    async with _make_client(url, True, headers) as client:
         tools = await client.list_tools()
     return [t.name for t in tools.tools]
 
 
 # ---- 同步封装：给「非 async」脚本 / 运维修剪人员用 ----
-def call(url: str, tool: str, arguments: dict[str, Any] | None = None) -> Any:
+def call(url: str, tool: str, arguments: dict[str, Any] | None = None,
+         headers: dict[str, str] | None = None) -> Any:
     """同步调用一个 MCP 工具并返回解包后的数据。"""
-    return asyncio.run(_call_async(url, tool, arguments))
+    return asyncio.run(_call_async(url, tool, arguments, headers))
 
 
-def call_raw(url: str, tool: str, arguments: dict[str, Any] | None = None) -> Any:
+def call_raw(url: str, tool: str, arguments: dict[str, Any] | None = None,
+             headers: dict[str, str] | None = None) -> Any:
     """同步调用，返回原始 CallToolResult（含 is_error），不抛异常。"""
-    return asyncio.run(_call_raw_async(url, tool, arguments))
+    return asyncio.run(_call_raw_async(url, tool, arguments, headers))
 
 
-def list_tools(url: str) -> list[str]:
+def list_tools(url: str, headers: dict[str, str] | None = None) -> list[str]:
     """列出一个 server 暴露的工具名。"""
-    return asyncio.run(_list_async(url))
+    return asyncio.run(_list_async(url, headers))

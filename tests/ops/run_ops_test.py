@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import os
 import sys
 import time
 import traceback
@@ -33,6 +34,16 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tests"))
 
 from ops import client  # noqa: E402
+
+# 统一敏感配置入口：standalone 运行时也从 config/platform.env 取远端 Go 的 URL/TOKEN
+try:
+    from mcp_shared.config import load_platform_env  # noqa: E402
+    load_platform_env()
+except ImportError:
+    pass
+
+_godh_token = os.environ.get("MCP_GODATAHUB_TOKEN")
+GODH_HEADERS = {"Authorization": f"Bearer {_godh_token}"} if _godh_token else None
 
 # ---------------------------------------------------------------------------
 # 测试框架（极简：不引入 pytest，便于运维直接在目标机跑）
@@ -63,7 +74,7 @@ def check(name: str, fn) -> None:
 # ---------------------------------------------------------------------------
 # 1) 连通性检查
 # ---------------------------------------------------------------------------
-def suite_check(gw: str, itops: str, common: str) -> None:
+def suite_check(gw: str, itops: str, common: str, godh: str | None) -> None:
     print("== 1. 连通性 & 工具清单 ==", flush=True)
 
     def gateway_tools():
@@ -87,11 +98,20 @@ def suite_check(gw: str, itops: str, common: str) -> None:
     check("it_ops 可达 + 工具齐全", itops_tools)
     check("common-tools 可达 + 工具齐全", common_tools)
 
+    if godh:
+        def godh_tools():
+            names = client.list_tools(godh, headers=GODH_HEADERS)
+            for expect in ("list_sources", "submit_collect_job", "get_job_status", "db_ping", "list_dsn_refs"):
+                assert expect in names, f"go_datahub 缺少 {expect}"
+            return f"{len(names)} 个工具"
+
+        check("go_datahub 可达 + 工具齐全", godh_tools)
+
 
 # ---------------------------------------------------------------------------
 # 2) 冒烟：各层核心功能
 # ---------------------------------------------------------------------------
-def suite_smoke(gw: str, itops: str, common: str) -> None:
+def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
     print("== 2. 核心工具功能 ==", flush=True)
 
     def common_echo():
@@ -172,11 +192,60 @@ def suite_smoke(gw: str, itops: str, common: str) -> None:
     check("网关放行只读工具（common）", gw_readonly_pass)
     check("网关路由只读工具（it_ops）", gw_itops_readonly)
 
+    if godh:
+        # go_datahub 直连：异步 job 全流程（提交 → 轮询 → 完成）
+        def godh_job_flow():
+            srcs = client.call(godh, "list_sources", headers=GODH_HEADERS)
+            names = [s["name"] for s in srcs["sources"]]
+            assert "synthetic" in names, names
+            sub = client.call(godh, "submit_collect_job", {
+                "source": "synthetic", "params": {"rows": 2000, "batch_pause_ms": 0},
+            }, headers=GODH_HEADERS)
+            jid = sub["job_id"]
+            assert jid.startswith("job-"), sub
+            deadline = time.time() + 20
+            while True:
+                st = client.call(godh, "get_job_status", {"job_id": jid}, headers=GODH_HEADERS)
+                if st["status"] in ("completed", "failed", "cancelled"):
+                    break
+                if time.time() > deadline:
+                    raise RuntimeError(f"job 超时: {st}")
+                time.sleep(0.2)
+            assert st["status"] == "completed" and st["rows"] == 2000, st
+            return f"{jid} 采集 2000 行完成"
+
+        def godh_db_ping_error():
+            r = client.call(godh, "db_ping", {"db_type": "mysql", "dsn": "root:x@tcp(127.0.0.1:1)/none"},
+                            headers=GODH_HEADERS)
+            assert r["ok"] is False and r["error"], r
+            return "不可达 DSN 返回结构化 ok=false"
+
+        def godh_dsn_ref_error_path():
+            """未知 dsn_ref 必须是可读的工具错误，且不得泄露任何已配置连接串。"""
+            r = client.call_raw(godh, "db_ping", {"db_type": "pg", "dsn_ref": "no_such_ref"},
+                                headers=GODH_HEADERS)
+            assert r.is_error, "未知 dsn_ref 竟然成功"
+            text = str(r.content)
+            assert "://" not in text, "错误信息疑似泄露连接串"
+            return "未知 dsn_ref 报可读错误且不泄露凭证"
+
+        def gw_godh_readonly():
+            r = client.call(gw, "gateway_call", {
+                "server": "go_datahub", "tool": "list_sources", "arguments": {},
+            })
+            assert r["executed"] is True and isinstance(r["result"], dict), r
+            return "经网关 HTTP 转发读取 go_datahub 采集器清单"
+
+        check("go_datahub 异步 job 全流程", godh_job_flow)
+        check("go_datahub db_ping 失败路径", godh_db_ping_error)
+        check("go_datahub 未知 dsn_ref 不泄露凭证", godh_dsn_ref_error_path)
+        check("网关 HTTP 转发到 go_datahub（只读）", gw_godh_readonly)
+
 
 # ---------------------------------------------------------------------------
 # 3) 审批闸门（HITL）
 # ---------------------------------------------------------------------------
-def suite_approve(gw: str, _itops: str, _common: str) -> None:
+def suite_approve(gw: str, _itops: str, _common: str, godh: str | None = None) -> None:
     print("== 3. 审批闸门（HITL）==", flush=True)
     marker = f"运维审批测试-{uuid.uuid4().hex[:6]}"
 
@@ -248,6 +317,26 @@ def suite_approve(gw: str, _itops: str, _common: str) -> None:
 
     check("已决审批单不可重复决策", gw_redecide_blocked)
 
+    if godh:
+        # 批量采集提交（Go 重活）经审批闸门：挂起 → 批准 → job 真正被创建
+        def gw_godh_submit_approval():
+            r = client.call(gw, "gateway_call", {
+                "server": "go_datahub", "tool": "submit_collect_job",
+                "arguments": {"source": "synthetic", "params": {"rows": 100}},
+            })
+            assert r["approved"] is False and r["executed"] is False, r
+            d = client.call(gw, "approve_request", {"request_id": r["request_id"], "comment": "运维测试放行采集"})
+            assert d["executed"] is True, d
+            job_id = d["result"]["job_id"]
+            assert job_id.startswith("job-"), d
+            st = client.call(gw, "gateway_call", {
+                "server": "go_datahub", "tool": "get_job_status", "arguments": {"job_id": job_id},
+            })
+            assert st["result"]["status"] in ("pending", "running", "completed"), st
+            return f"审批放行后 Go 侧创建任务 {job_id}"
+
+        check("go_datahub 采集任务经审批闸门执行", gw_godh_submit_approval)
+
     # 未注册路由 → 协议错误
     def gw_unknown_route():
         result = client.call_raw(gw, "gateway_call", {"server": "nope", "tool": "x", "arguments": {}})
@@ -284,18 +373,23 @@ def main() -> int:
     ap.add_argument("--url", default=client.DEFAULT_URLS["gateway"], help="网关 MCP 地址")
     ap.add_argument("--itops-url", default=client.DEFAULT_URLS["it_ops"], help="it_ops MCP 地址")
     ap.add_argument("--common-url", default=client.DEFAULT_URLS["common-tools"], help="common MCP 地址")
+    ap.add_argument("--godh-url", default=os.environ.get("MCP_GODATAHUB_URL", client.DEFAULT_URLS["go_datahub"]),
+                    help="go_datahub（Go 重活）MCP 地址（默认 OS 环境变量/配置文件 MCP_GODATAHUB_URL，再默认本机）")
+    ap.add_argument("--skip-go", action="store_true", help="跳过 go_datahub 相关用例（未部署 Go server 时用）")
     ap.add_argument("--suite", choices=["all", "check", "smoke", "approve"], default="all")
     ap.add_argument("--load", type=int, default=0, help="额外跑 N 次并发压测（0=不跑）")
     args = ap.parse_args()
 
-    print(f"目标：网关 {args.url}\n     it_ops {args.itops_url}\n     common {args.common_url}\n", flush=True)
+    godh = None if args.skip_go else args.godh_url
+    print(f"目标：网关 {args.url}\n     it_ops {args.itops_url}\n     common {args.common_url}\n"
+          f"     go_datahub {godh or '（跳过）'}\n", flush=True)
 
     if args.suite in ("all", "check"):
-        suite_check(args.url, args.itops_url, args.common_url)
+        suite_check(args.url, args.itops_url, args.common_url, godh)
     if args.suite in ("all", "smoke"):
-        suite_smoke(args.url, args.itops_url, args.common_url)
+        suite_smoke(args.url, args.itops_url, args.common_url, godh)
     if args.suite in ("all", "approve"):
-        suite_approve(args.url, args.itops_url, args.common_url)
+        suite_approve(args.url, args.itops_url, args.common_url, godh)
     if args.load:
         suite_load(args.url, args.itops_url, args.common_url, args.load)
 

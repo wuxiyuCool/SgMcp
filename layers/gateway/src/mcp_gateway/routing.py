@@ -27,6 +27,7 @@ class ToolRoute:
     requires_approval: bool
     summary: str
     endpoint: str | None = None  # exec_kind="http" 时的下游 MCP 地址
+    headers: dict[str, str] | None = None  # 跨机调用下游时的附加 HTTP 头（如 Bearer 鉴权）
 
 
 class Router:
@@ -64,12 +65,21 @@ class Router:
             if not route.endpoint:
                 raise RuntimeError(f"路由 {server}.{tool} 未配置 endpoint")
             logger.info("执行(HTTP) %s.%s -> %s", server, tool, route.endpoint)
-            return call_downstream_http(route.endpoint, tool, args)
+            return call_downstream_http(route.endpoint, tool, args, headers=route.headers)
         raise RuntimeError(f"未知执行类型: {route.exec_kind}")
 
 
-def call_downstream_http(endpoint: str, tool: str, arguments: dict[str, Any]) -> Any:
+def call_downstream_http(
+    endpoint: str,
+    tool: str,
+    arguments: dict[str, Any],
+    headers: dict[str, str] | None = None,
+) -> Any:
     """通过 MCP Streamable HTTP 调用下游 server 工具（同步桥接）。
+
+    headers 非空时（跨机部署的 Bearer 鉴权等），自建带默认头的 httpx2.AsyncClient
+    交给 streamable_http_client —— 该 context manager 即 Client 认可的
+    Transport（duck-typed __aenter__ 返回读写流），直接传给 Client。
 
     SDK v2 的 sync 工具运行在 worker 线程（无事件循环），这里用 asyncio.run
     起临时 loop 驱动官方 Client；工具内不要在已有 loop 的线程调用本函数。
@@ -85,8 +95,17 @@ def call_downstream_http(endpoint: str, tool: str, arguments: dict[str, Any]) ->
     """
     from mcp import Client
 
+    def _make_client() -> Client:
+        if not headers:
+            return Client(endpoint, raise_exceptions=True, mode="legacy")
+        import httpx2
+        from mcp.client.streamable_http import streamable_http_client
+
+        transport = streamable_http_client(endpoint, http_client=httpx2.AsyncClient(headers=headers))
+        return Client(transport, raise_exceptions=True, mode="legacy")
+
     async def _call() -> Any:
-        async with Client(endpoint, raise_exceptions=True, mode="legacy") as client:
+        async with _make_client() as client:
             result = await client.call_tool(tool, arguments)
         if result.is_error:
             raise RuntimeError(f"下游 {endpoint}.{tool} 执行失败: {result.content}")

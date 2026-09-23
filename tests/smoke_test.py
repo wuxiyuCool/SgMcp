@@ -123,8 +123,38 @@ def test_gateway_approval_flow() -> None:
     asyncio.run(flow())
 
 
+def test_shared_config() -> None:
+    """统一敏感配置入口：文件加载、env 优先、路径覆盖。"""
+    import os
+    import tempfile
+    from pathlib import Path
+
+    from mcp_shared import config
+
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "platform.env"
+        f.write_text('# 注释\nexport DEMO_SECRET=from-file\nDEMO_URL="http://x/y"\n坏行没有等号\n', encoding="utf-8")
+        os.environ["MCP_CONFIG_FILE"] = str(f)
+        os.environ.pop("DEMO_SECRET", None)
+        os.environ.pop("DEMO_URL", None)
+        try:
+            config._reset()
+            config.load_platform_env()
+            assert os.environ.get("DEMO_SECRET") == "from-file", os.environ.get("DEMO_SECRET")
+            assert config.get("DEMO_URL") == "http://x/y"
+            os.environ["DEMO_SECRET"] = "from-env"
+            assert config.get("DEMO_SECRET") == "from-env", "OS 环境变量应优先于配置文件"
+        finally:
+            os.environ.pop("DEMO_SECRET", None)
+            os.environ.pop("DEMO_URL", None)
+            os.environ.pop("MCP_CONFIG_FILE", None)
+            config._reset()
+    print("PASS  shared·config platform.env（文件加载 + env 优先）")
+
+
 if __name__ == "__main__":
     test_lower_common()
     test_middle_itops()
     test_gateway_approval_flow()
+    test_shared_config()
     print("\n全部冒烟测试通过 ✅")
