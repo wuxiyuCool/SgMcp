@@ -5,14 +5,11 @@ build-backend = "hatchling.build"
 [project]
 name = "mcp-gateway-server"
 version = "0.1.0"
-description = "【上层·审批】审批网关 MCP server：统一入口 / HITL 审批 / 审计 / 路由"
+description = "【上层·审批】审批网关 MCP server：统一入口 / 聚合器 / HITL 审批 / 审计 / 路由"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=2.2,<3",
     "mcp-shared>=0.1.0",
-    # 试点：local 执行器直连下层/中层业务逻辑（生产切换 HTTP 转发后可移除）
-    "mcp-itops-server>=0.1.0",
-    "mcp-common-server>=0.1.0",
 ]
 
 [project.scripts]
@@ -23,5 +20,3 @@ packages = ["src/mcp_gateway"]
 
 [tool.uv.sources]
 mcp-shared = { workspace = true }
-mcp-itops-server = { workspace = true }
-mcp-common-server = { workspace = true }

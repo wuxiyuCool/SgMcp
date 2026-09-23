@@ -45,6 +45,23 @@ $env:PYTHONPATH = ($srcPaths -join ";")
 $env:NO_PROXY = "*"
 $env:PYTHONIOENCODING = "utf-8"
 
+# 数据集路由注册表（业务名 → 租户/兜底 dsn_ref，Go 与 Python 两侧共用同一约定）：
+# dsn_ref 指向 DSN_<名称> 注册表；本机无真实库，测试走 simulate 模式验证路由与任务流。
+# _DOMAIN=域归属（领域查询工具按域限定枚举）、_DESC=中文说明（工具枚举描述用）
+$env:DATASET_ORDERS_DBTYPE = "pg"
+$env:DATASET_ORDERS_DSN_T1 = "order_t1_pg"
+$env:DATASET_ORDERS_DSN_DEFAULT = "order_pg"
+$env:DATASET_ORDERS_DOMAIN = "order"
+$env:DATASET_ORDERS_DESC = "订单数据（按月分表）"
+$env:DATASET_INCIDENTS_DBTYPE = "pg"
+$env:DATASET_INCIDENTS_DSN_DEFAULT = "itsm_pg"
+$env:DATASET_INCIDENTS_DOMAIN = "itops"
+$env:DATASET_INCIDENTS_DESC = "IT 运维事件单（工单流水）"
+$env:DATASET_ASSETS_DBTYPE = "pg"
+$env:DATASET_ASSETS_DSN_DEFAULT = "itsm_pg"
+$env:DATASET_ASSETS_DOMAIN = "itops"
+$env:DATASET_ASSETS_DESC = "CMDB 资产台账"
+
 # go_datahub 地址解析：-GodhUrl > OS 环境变量 > config/platform.env > 本机默认；写回环境供网关与测试集共用
 function Get-CfgValue([string]$file, [string]$key) {
     if (-not (Test-Path $file)) { return "" }
@@ -64,14 +81,8 @@ $godhIsLocal = $godh -match "^https?://(127\.0\.0\.1|localhost|\[?::1\]?)(:\d+)?
 
 Write-Host "==> 启动三层 server（HTTP）" -ForegroundColor Cyan
 $procs = @()
-foreach ($s in $servers) {
-    $procs += Start-Process -FilePath $py `
-        -ArgumentList @("-m", $s.Entry, "--transport", "http", "--port", "$($s.Port)") `
-        -PassThru -WindowStyle Hidden
-    Write-Host "    $($s.Entry) -> :$($s.Port) (PID $($procs[-1].Id))"
-}
 
-# 中层 Go 重活 server：
+# 中层 Go 重活 server 必须先于网关处理：网关启动时聚合器要拉它的 tools/list。
 # - 远端地址（-GodhUrl / MCP_GODATAHUB_URL 非本机）→ 不起停本地，只把地址交给测试集直测
 # - 本机默认 → 二进制不存在时自动 go build，无 Go 环境则跳过并让测试集 --skip-go
 $godhExe = Join-Path $ROOT "layers\business\go_datahub\bin\datahub-server.exe"
@@ -98,6 +109,14 @@ if (-not $godhIsLocal) {
 } else {
     $procs += Start-Process -FilePath $godhExe -ArgumentList @("-port", "9300") -PassThru -WindowStyle Hidden
     Write-Host "    go_datahub -> :9300 (PID $($procs[-1].Id))"
+}
+
+# Python 三层：下游在前、网关最后（网关聚合器启动时连下游拉 tools/list）
+foreach ($s in $servers) {
+    $procs += Start-Process -FilePath $py `
+        -ArgumentList @("-m", $s.Entry, "--transport", "http", "--port", "$($s.Port)") `
+        -PassThru -WindowStyle Hidden
+    Write-Host "    $($s.Entry) -> :$($s.Port) (PID $($procs[-1].Id))"
 }
 
 try {

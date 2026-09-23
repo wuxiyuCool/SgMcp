@@ -83,6 +83,27 @@ func DSNRefs() []string {
 	return out
 }
 
+// Keys 列出匹配前缀的配置键（文件 + OS 环境变量，供数据集路由等注册表枚举用）。
+func Keys(prefix string) []string {
+	load()
+	seen := map[string]bool{}
+	out := []string{}
+	for k := range fileV {
+		if strings.HasPrefix(k, prefix) && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	for _, kv := range os.Environ() {
+		k, _, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(k, prefix) && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 // ConfigPath 定位配置文件，找不到返回 ""。
 func ConfigPath() string {
 	if p := os.Getenv("GO_DATAHUB_CONFIG"); p != "" {
