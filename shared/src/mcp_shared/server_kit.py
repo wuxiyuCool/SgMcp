@@ -30,9 +30,14 @@ def run_server(mcp: Any, *, description: str, default_port: int) -> None:
         default=default_port,
         help="HTTP 监听端口（--transport http 时生效）",
     )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="HTTP 监听地址（--transport http 时生效）；服务器对外部署用 0.0.0.0",
+    )
     args = parser.parse_args()
 
     if args.transport == "http":
-        mcp.run(transport="streamable-http", host="127.0.0.1", port=args.port)
+        mcp.run(transport="streamable-http", host=args.host, port=args.port)
     else:
         mcp.run()
