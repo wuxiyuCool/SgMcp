@@ -109,6 +109,19 @@ def reject_request(request_id: str, comment: str | None = None) -> dict[str, Any
 
 
 @mcp.tool()
+def list_routes() -> list[dict[str, Any]]:
+    """列出网关可路由的全部下游工具（server / tool / 描述 / 是否需审批）。
+
+    调用 gateway_call 之前先用本工具确认真实存在的工具名与参数说明，
+    不要凭猜测直接调用（如创建 IT 工单的真实工具是 it_ops.create_incident）。
+    """
+    return [
+        {"server": r.server, "tool": r.tool, "summary": r.summary, "requires_approval": r.requires_approval}
+        for r in router.routes
+    ]
+
+
+@mcp.tool()
 def gateway_call(
     server: str,
     tool: str,
@@ -117,12 +130,15 @@ def gateway_call(
 ) -> dict[str, Any]:
     """统一入口：AI 客户端通过本工具调用任意注册的下游 server 工具。
 
+    - 不确定有哪些工具时，先调用 list_routes 查询（勿猜测工具名）。
     - 只读 / 无需审批的工具：立即路由执行。
     - 需审批的写工具：创建审批单挂起，返回审批单 ID，等待人工审批。
     """
     route = router.resolve(server, tool)
     if route is None:
-        raise ToolError(f"未注册的路由: {server}.{tool}")
+        same_server = sorted(r.tool for r in router.routes if r.server == server)
+        hint = f"该 server 可用工具: {same_server}" if same_server else "请先调用 list_routes 查看可用 server/tool"
+        raise ToolError(f"未注册的路由: {server}.{tool}。{hint}")
 
     if not route.requires_approval:
         result = router.execute(server, tool, arguments)

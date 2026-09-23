@@ -80,6 +80,7 @@ def suite_check(gw: str, itops: str, common: str, godh: str | None) -> None:
     def gateway_tools():
         names = client.list_tools(gw)
         assert "gateway_call" in names, f"网关缺少统一入口工具，实为 {names}"
+        assert "list_routes" in names, f"网关缺少工具发现入口 list_routes，实为 {names}"
         return f"{len(names)} 个工具: {', '.join(sorted(names))}"
 
     def itops_tools():

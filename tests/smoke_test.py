@@ -112,13 +112,23 @@ def test_gateway_approval_flow() -> None:
             assert d["executed"] is False
             print("PASS  网关·驳回后不执行")
 
-            # 5) 未注册路由：报 ToolError（is_error 结果）
+            # 5) 未注册路由：报 ToolError（is_error 结果），且错误信息引导发现真实工具
             r = await client.call_tool(
                 "gateway_call",
                 {"server": "nope", "tool": "x", "arguments": {}},
             )
             assert r.is_error
-            print("PASS  网关·未注册路由返回协议错误")
+            assert "list_routes" in str(r.content), "未注册路由应引导调用 list_routes"
+            print("PASS  网关·未注册路由返回协议错误（含发现引导）")
+
+            # 6) 工具发现：list_routes 返回完整路由清单（server.tool + 审批标记）
+            r = await client.call_tool("list_routes", {})
+            data = _payload(r)
+            items = data["result"] if isinstance(data, dict) and "result" in data else data
+            pairs = {(x["server"], x["tool"]) for x in items}
+            assert ("it_ops", "create_incident") in pairs, pairs
+            assert ("go_datahub", "submit_collect_job") in pairs, pairs
+            print(f"PASS  网关·list_routes 工具发现（{len(pairs)} 条路由）")
 
     asyncio.run(flow())
 
