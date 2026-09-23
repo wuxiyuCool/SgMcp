@@ -1,0 +1,17 @@
+[Unit]
+Description=SgMcp go-datahub heavy-duty MCP server (:9300)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@MCP_USER@
+WorkingDirectory=@APP_DIR@
+# 监听/令牌/DSN 全部读 @APP_DIR@/config/datahub.env（exe 同级的 config 目录）
+ExecStart=@APP_DIR@/datahub-server
+Restart=always
+RestartSec=3
+SyslogIdentifier=datahub-server
+
+[Install]
+WantedBy=multi-user.target

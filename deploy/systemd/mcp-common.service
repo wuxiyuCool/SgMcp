@@ -1,0 +1,19 @@
+[Unit]
+Description=SgMcp lower-layer common tools (:9100)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@MCP_USER@
+WorkingDirectory=@APP_DIR@
+Environment=NO_PROXY=*
+Environment=MCP_HOST=0.0.0.0
+Environment=MCP_PORT=9100
+ExecStart=@APP_DIR@/.venv/bin/python -m mcp_common_server.main --transport http --host ${MCP_HOST} --port ${MCP_PORT}
+Restart=always
+RestartSec=3
+SyslogIdentifier=mcp-common
+
+[Install]
+WantedBy=multi-user.target

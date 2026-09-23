@@ -1,0 +1,19 @@
+[Unit]
+Description=SgMcp middle-layer IT ops server (:9200)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@MCP_USER@
+WorkingDirectory=@APP_DIR@
+Environment=NO_PROXY=*
+Environment=MCP_HOST=0.0.0.0
+Environment=MCP_PORT=9200
+ExecStart=@APP_DIR@/.venv/bin/python -m mcp_itops.main --transport http --host ${MCP_HOST} --port ${MCP_PORT}
+Restart=always
+RestartSec=3
+SyslogIdentifier=mcp-itops
+
+[Install]
+WantedBy=multi-user.target

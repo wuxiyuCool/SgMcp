@@ -1,0 +1,22 @@
+[Unit]
+Description=SgMcp upper-layer approval gateway (:9000, unified entry)
+Documentation=file://@APP_DIR@/docs/develop-deploy.md
+After=network-online.target mcp-common.service mcp-itops.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@MCP_USER@
+WorkingDirectory=@APP_DIR@
+Environment=NO_PROXY=*
+Environment=MCP_HOST=0.0.0.0
+Environment=MCP_PORT=9000
+# 注入 MCP_GODATAHUB_URL / MCP_GODATAHUB_TOKEN（网关→Go 转发配置；文件不存在也不报错）
+EnvironmentFile=-@APP_DIR@/config/platform.env
+ExecStart=@APP_DIR@/.venv/bin/python -m mcp_gateway.main --transport http --host ${MCP_HOST} --port ${MCP_PORT}
+Restart=always
+RestartSec=3
+SyslogIdentifier=mcp-gateway
+
+[Install]
+WantedBy=multi-user.target

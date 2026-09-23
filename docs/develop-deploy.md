@@ -146,6 +146,23 @@ tar czf sgmcp-deploy-$(date +%Y%m%d).tar.gz -C $ST .
 
 ## 5. 部署流程
 
+### 5.0 systemd 守护（生产推荐）
+
+三个 Python server + Go server 均提供 unit 模板（`deploy/systemd/`），一键安装：
+
+```bash
+# 网关机（root）：
+bash deploy/systemd/install-units.sh /opt/mcp/sgmcp-deploy/app        # 开机自启 + 崩溃自动拉起
+systemctl status mcp-gateway mcp-itops mcp-common
+journalctl -u mcp-gateway -f              # 日志（替代 logs/*.log）
+# 改端口/监听：编辑 /etc/systemd/system/mcp-*.service 里 Environment= 后 systemctl daemon-reload && restart
+
+# Go 数据机：参照 mcp-gateway.service 手写同款（datahub-server.service 模板在 deploy/systemd/），
+# 或继续 nohup；unit 里只需指路径，监听/token/DSN 全由 config/datahub.env 控制。
+```
+
+安装脚本会自动停掉 `serversctl.sh` 拉起的旧进程避免端口冲突。`serversctl.sh` 保留用于无 root 场景与临时调试。
+
 ### 5.1 Linux 网关机（Python 三层）
 
 ```bash
