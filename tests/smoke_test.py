@@ -196,7 +196,19 @@ def test_gateway_aggregation_flow() -> None:
                 )
                 d = _payload(r)
                 assert d["executed"] is True and "INC-" in str(d["result"]), d
-                print("PASS  网关·gateway_call_kv 扁平参数入口（bool 推断+写工具直通）")
+                # 下划线别名（规避平台对参数值中 "." 的序列化缺陷）：itops_create_incident
+                r = await client.call_tool(
+                    "gateway_call_kv",
+                    {"server": "it_ops", "tool": "itops_create_incident", "params": "title=别名调用"},
+                )
+                d = _payload(r)
+                assert d["executed"] is True and "INC-" in str(d["result"]), d
+                # list_routes 应携带 tool_alias
+                r = await client.call_tool("list_routes", {})
+                items = _payload(r)
+                items = items["result"] if isinstance(items, dict) and set(items) == {"result"} else items
+                assert any(x["tool_alias"] == x["tool"].replace(".", "_") for x in items if "." in x["tool"])
+                print("PASS  网关·gateway_call_kv 扁平入口 + tool_alias 下划线别名")
 
                 # 5) 无需审批的写工具：经 HTTP 转发执行到 it_ops
                 r = await client.call_tool(

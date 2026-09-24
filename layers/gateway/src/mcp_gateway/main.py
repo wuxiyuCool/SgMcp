@@ -77,6 +77,7 @@ def _resolve_route(server: str, tool: str) -> ToolRoute | None:
     AI 平台常见错法（均应被救回而非报错重试）：
     - server 写成 "go-datahub"/"GO_DATAHUB" → 归一化匹配
     - tool 漏层级前缀："create_incident" → itops.create_incident；"list_dsn_refs" → data.list_dsn_refs
+    - tool 用下划线别名 "data_list_dsn_refs"（部分平台序列化参数值里的 "." 会损坏）→ 等价命中
     - tool 写成完整 "server.tool" 或带别的 server 前缀 → 按工具名全表定位
     """
     route = router.resolve(server, tool)
@@ -84,6 +85,7 @@ def _resolve_route(server: str, tool: str) -> ToolRoute | None:
         return route
     routes = router.routes
     sn, tn = _norm(server), _norm(tool)
+    tn_und = tn.replace(".", "_")
     # 1) server 归一化 + tool 精确
     for r in routes:
         if _norm(r.server) == sn and r.tool == tool:
@@ -91,6 +93,10 @@ def _resolve_route(server: str, tool: str) -> ToolRoute | None:
     # 2) server 归一化 + tool 补层级前缀（r.tool 形如 "itops.create_incident"，尾段相等即命中）
     for r in routes:
         if _norm(r.server) == sn and _norm(r.tool.rsplit(".", 1)[-1]) == tn:
+            return r
+    # 2b) 点号不敏感全等：data_list_dsn_refs ↔ data.list_dsn_refs（同 server 下命中）
+    for r in routes:
+        if _norm(r.server) == sn and _norm(r.tool).replace(".", "_") == tn_und:
             return r
     # 3) server 不可靠但 tool 全局唯一：按工具尾段全表找（多命中则放弃，避免歧义）
     tail_matches = [r for r in routes if _norm(r.tool.rsplit(".", 1)[-1]) == tn]
@@ -148,11 +154,15 @@ def list_routes() -> list[dict[str, Any]]:
     数据来自启动时（及最近一次 refresh_routes）从各下游 server 拉取的 tools/list。
     调用 gateway_call 之前先用本工具确认真实存在的工具名与参数说明，
     不要凭猜测直接调用（如创建 IT 工单的真实工具是 it_ops.create_incident）。
+
+    每条含 tool_alias 字段（点号换成下划线的别名，如 data_list_dsn_refs）——
+    若你的平台对参数值中的 "." 序列化有问题，请一律改用 tool_alias。
     """
     return [
         {
             "server": r.server,
             "tool": r.tool,
+            "tool_alias": r.tool.replace(".", "_"),
             "summary": r.summary,
             "input_schema": r.input_schema,
             "requires_approval": r.requires_approval,
@@ -214,6 +224,8 @@ def gateway_call(
       需请审批人调 list_pending_approvals 查看、approve_request(request_id) 放行后才会真正执行
 
     推荐流程：不确定时先 list_routes 查工具与入参 schema，再发起本调用。
+    tool 也可传 list_routes 返回的 tool_alias（下划线别名，如 data_list_dsn_refs），
+    规避部分平台对参数值中 "." 的序列化缺陷。
     若你的平台序列化嵌套 JSON 对象困难，改用 gateway_call_kv（参数扁平字符串，无嵌套）。
     """
     args_obj = _coerce_args(arguments)
