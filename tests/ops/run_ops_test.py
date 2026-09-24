@@ -126,7 +126,8 @@ def suite_check(gw: str, itops: str, common: str, godh: str | None) -> None:
             for expect in ("data_list_sources", "data_submit_collect_job", "data_get_job_status",
                            "data_db_ping", "data_list_dsn_refs", "data_list_tables",
                            "data_batch_import", "data_batch_query",
-                           "data_batch_process", "data_list_datasets", "data_query_dataset", "data_db_query_preview"):
+                           "data_batch_process", "data_list_datasets", "data_query_dataset", "data_db_query_preview",
+                           "data_hash_file", "data_file_stats", "data_convert_file"):
                 assert expect in names, f"go_datahub 缺少 {expect}"
             return f"{len(names)} 个工具（data.* 全局数据平台前缀）"
 

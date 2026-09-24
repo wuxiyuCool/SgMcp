@@ -24,7 +24,7 @@ SgMcp/
 │   │       └── approvals.py         #   HITL 审批闸门
 │   ├── common/                      # 【下层·通用工具】:9100
 │   │   └── src/mcp_common_server/
-│   │       └── tools.py             # ★ 通用工具写这里（now/echo/generate_id…）
+│   │       └── tools.py             # ★ 通用工具写这里（now/echo/hash_text/json_tool/datetime_convert…）
 │   ├── business/
 │   │   ├── it_ops/                  # 【中层·IT运维 Python】:9200
 │   │   │   └── src/mcp_itops/
@@ -38,6 +38,8 @@ SgMcp/
 │   │       ├── internal/
 │   │       │   ├── collector/       # ★ 采集器框架：Source 接口 + 内置采集器
 │   │       │   │   └── collector.go #   新数据源 = 实现 Collect() + Default() 注册一行
+│   │       │   ├── filetools/       # ★ 文件重工具：流式哈希/统计/CSV↔JSONL 转换
+│   │       │   │   └── filetools.go #   data_hash_file / data_file_stats / data_convert_file
 │   │       │   ├── dbhub/           #   多库驱动统一层（oracle/mysql/pg/mssql）+ 错误脱敏
 │   │       │   ├── jobs/            #   异步 job 注册表（submit→轮询模式）
 │   │       │   └── config/          #   Go 侧配置加载（datahub.env）

@@ -34,6 +34,7 @@ import (
 	"github.com/sg/mcp/go-datahub/internal/config"
 	"github.com/sg/mcp/go-datahub/internal/dbhub"
 	"github.com/sg/mcp/go-datahub/internal/dsrouting"
+	"github.com/sg/mcp/go-datahub/internal/filetools"
 	"github.com/sg/mcp/go-datahub/internal/internalapi"
 	"github.com/sg/mcp/go-datahub/internal/jobs"
 )
@@ -181,6 +182,30 @@ type queryDatasetOut struct {
 	Rows   []map[string]any `json:"rows,omitempty"`
 	Count  int              `json:"count,omitempty"`
 	Error  string           `json:"error,omitempty"`
+}
+
+// ---- 文件重工具（filetools）----
+
+type hashFileIn struct {
+	Path string `json:"path" jsonschema:"datahub-server 本机文件绝对路径"`
+	Algo string `json:"algo,omitempty" jsonschema:"哈希算法，可选 md5/sha1/sha256/sha512，默认 sha256"`
+}
+
+type hashFileOut struct {
+	Algo      string `json:"algo"`
+	Hex       string `json:"hex"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+type fileStatsIn struct {
+	Path         string `json:"path" jsonschema:"datahub-server 本机文件绝对路径"`
+	PreviewLines int    `json:"preview_lines,omitempty" jsonschema:"预览行数，默认 5，上限 50"`
+}
+
+type convertFileIn struct {
+	Src     string `json:"src" jsonschema:"源文件绝对路径（.csv/.jsonl/.ndjson，按扩展名自动识别方向）"`
+	Dst     string `json:"dst" jsonschema:"目标文件绝对路径（已存在会被覆盖）"`
+	MaxRows int64  `json:"max_rows,omitempty" jsonschema:"最多转换行数，留空或 0=全部"`
 }
 
 // datasetEnumDescription 构建期生成全量数据集枚举描述（带中文说明），随配置变化。
@@ -553,6 +578,54 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 			return nil, queryDatasetOut{OK: false, Routed: routed, Error: err.Error()}, nil
 		}
 		return nil, queryDatasetOut{OK: true, Routed: routed, Rows: rows, Count: len(rows)}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "data_hash_file",
+		Description: "流式计算本机文件哈希（任意大小文件，内存恒定）。参数：path=datahub-server 所在机器的文件绝对路径（必填）；" +
+			"algo=可选 md5/sha1/sha256/sha512，默认 sha256。返回：{algo, hex, size_bytes}。" +
+			"用于核对传输完整性、比对采集数据文件指纹。只读。",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+		InputSchema: toolInput[hashFileIn](),
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in hashFileIn) (*mcp.CallToolResult, hashFileOut, error) {
+		hexSum, size, err := filetools.HashFile(in.Path, in.Algo)
+		if err != nil {
+			return nil, hashFileOut{}, err
+		}
+		algo := strings.ToLower(in.Algo)
+		if algo == "" {
+			algo = "sha256"
+		}
+		return nil, hashFileOut{Algo: algo, Hex: hexSum, SizeBytes: size}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "data_file_stats",
+		Description: "统计本机文件：大小/总行数/编码/修改时间/前 N 行预览（大文件流式扫描）。参数：path=文件绝对路径（必填）；" +
+			"preview_lines=默认 5 上限 50。返回 encoding 枚举 ascii/utf-8/utf-8-bom/non-utf8(可能为GBK)/binary，" +
+			"binary 文件预览为空。取数据前先调它确认编码与规模（GBK 需转码再采集）。只读。",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+		InputSchema: toolInput[fileStatsIn](),
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in fileStatsIn) (*mcp.CallToolResult, filetools.Stats, error) {
+		st, err := filetools.FileStats(in.Path, in.PreviewLines)
+		if err != nil {
+			return nil, filetools.Stats{}, err
+		}
+		return nil, *st, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "data_convert_file",
+		Description: "CSV↔JSONL 流式互转（GB 级可行，原子写：先 .tmp 再改名）。参数：src=源文件绝对路径（.csv/.jsonl/.ndjson，方向按扩展名自动判断）；" +
+			"dst=目标文件绝对路径（已存在会被覆盖）；max_rows=可选截断。返回：{src,dst,from,to,rows_converted,truncated}。" +
+			"CSV 首行为表头；JSONL 转 CSV 以首行键集为列、后续行未知列忽略。",
+		InputSchema: toolInput[convertFileIn](),
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in convertFileIn) (*mcp.CallToolResult, filetools.ConvertResult, error) {
+		res, err := filetools.ConvertFile(in.Src, in.Dst, "", in.MaxRows)
+		if err != nil {
+			return nil, filetools.ConvertResult{}, err
+		}
+		return nil, *res, nil
 	})
 
 	streamable := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
