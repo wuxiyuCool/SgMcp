@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -52,6 +51,17 @@ func callStructured[T any](t *testing.T, sess *mcp.ClientSession, tool string, a
 	return out
 }
 
+// contentText 提取工具错误里的可读文本（Content 是接口切片，需取 TextContent.Text）。
+func contentText(res *mcp.CallToolResult) string {
+	var sb strings.Builder
+	for _, c := range res.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			sb.WriteString(tc.Text)
+		}
+	}
+	return sb.String()
+}
+
 func TestToolsRegistered(t *testing.T) {
 	sess := connectInMemory(t)
 	res, err := sess.ListTools(context.Background(), nil)
@@ -66,7 +76,7 @@ func TestToolsRegistered(t *testing.T) {
 	for _, want := range []string{
 		"data.list_sources", "data.submit_collect_job", "data.get_job_status",
 		"data.list_jobs", "data.cancel_job", "data.db_ping", "data.list_dsn_refs",
-		"data.list_tables", "data.batch_import", "data.batch_query",
+		"data.list_tables", "data.batch_import", "data.batch_query", "data.db_query_preview",
 	} {
 		if !names[want] {
 			t.Errorf("缺少工具: %s", want)
@@ -154,7 +164,7 @@ func TestDbPingDsnValidation(t *testing.T) {
 	if !res.IsError {
 		t.Fatal("未知 dsn_ref 竟然成功")
 	}
-	text := fmt.Sprint(res.Content)
+	text := contentText(res)
 	if strings.Contains(text, "://") {
 		t.Fatalf("错误信息疑似泄露连接串: %s", text)
 	}
@@ -242,7 +252,7 @@ func TestBatchImportValidation(t *testing.T) {
 	if !res.IsError {
 		t.Fatal("未知 dsn_ref 竟然成功")
 	}
-	if strings.Contains(fmt.Sprint(res.Content), "://") {
+	if strings.Contains(contentText(res), "://") {
 		t.Fatalf("错误信息疑似泄露连接串: %s", res.Content)
 	}
 
@@ -382,5 +392,33 @@ func TestListTablesFailureIsStructured(t *testing.T) {
 	}
 	if out.Error == "" {
 		t.Fatal("失败应带可读错误")
+	}
+}
+
+func TestDbQueryPreviewGuards(t *testing.T) {
+	sess := connectInMemory(t)
+
+	// 非 SELECT 必须拒绝
+	res, err := sess.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "data.db_query_preview",
+		Arguments: map[string]any{"dsn": "postgres://u:p@127.0.0.1:1/db", "sql": "DELETE FROM t"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || !strings.Contains(contentText(res), "SELECT") {
+		t.Fatalf("非 SELECT 应被拒绝: %s", contentText(res))
+	}
+
+	// 未知 dsn_ref → 可读错误且不泄露连接串
+	res, err = sess.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "data.db_query_preview",
+		Arguments: map[string]any{"dsn_ref": "no_such", "sql": "SELECT 1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || strings.Contains(contentText(res), "://") {
+		t.Fatalf("未知 dsn_ref 处理异常: %s", contentText(res))
 	}
 }

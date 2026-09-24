@@ -157,8 +157,7 @@ systemctl status mcp-gateway mcp-itops mcp-common
 journalctl -u mcp-gateway -f              # 日志（替代 logs/*.log）
 # 改端口/监听：编辑 /etc/systemd/system/mcp-*.service 里 Environment= 后 systemctl daemon-reload && restart
 
-# Go 数据机：参照 mcp-gateway.service 手写同款（datahub-server.service 模板在 deploy/systemd/），
-# 或继续 nohup；unit 里只需指路径，监听/token/DSN 全由 config/datahub.env 控制。
+# Go 数据机：bash deploy/systemd/install-datahub-unit.sh /opt/datahub（详见 §5.2）
 ```
 
 安装脚本会自动停掉 `serversctl.sh` 拉起的旧进程避免端口冲突。`serversctl.sh` 保留用于无 root 场景与临时调试。
@@ -194,22 +193,33 @@ firewall-cmd --add-port=9000/tcp --permanent && firewall-cmd --reload
 
 ### 5.2 Go 数据机（独立服务器）
 
-只需两样文件：`bin-linux/datahub-server`（或 .exe）+ `config/datahub.env`：
+推荐 systemd 守护，一键脚本（离线包内 `deploy/systemd/install-datahub-unit.sh`）：
 
 ```bash
-# 目录布局：任意目录下保持  datahub-server 与 config/datahub.env 同层或 config 在上级
-./datahub-server                 # 自动读 config/datahub.env（exe 位置向上找 6 级）
+# 1) 摆放两样东西：
+mkdir -p /opt/datahub/config
+cp <包>/sgmcp-deploy/app/layers/business/go_datahub/bin-linux/datahub-server /opt/datahub/
+chmod +x /opt/datahub/datahub-server
+cp <包>/sgmcp-deploy/app/layers/business/go_datahub/config/datahub.env.example /opt/datahub/config/datahub.env
+
+# 2) 填配置（datahub.env 关键项）：
+#    GO_DATAHUB_ADDR=0.0.0.0
+#    GO_DATAHUB_TOKEN=<与网关机 MCP_GODATAHUB_TOKEN 一致>
+#    DSN_ORCL_ERP=oracle://...   DSN_ORCL_WMS=oracle://...   （同类型可配任意多个源，类型自动推断）
+#    DSN_MSSQL_FIN=sqlserver://...?database=finance
+
+# 3) 安装守护（root）：
+bash <包>/sgmcp-deploy/app/deploy/systemd/install-datahub-unit.sh /opt/datahub
+
+# 4) 验证：
+systemctl status datahub-server
+journalctl -u datahub-server -f
+ss -tlnp | grep 9300
+firewall-cmd --add-port=9300/tcp --permanent && firewall-cmd --reload   # 建议只放行网关机 IP
 ```
 
-`datahub.env` 关键项：
-```ini
-GO_DATAHUB_ADDR=0.0.0.0
-GO_DATAHUB_PORT=9300
-GO_DATAHUB_TOKEN=<与网关机 MCP_GODATAHUB_TOKEN 一致>
-DSN_ORDER_PG=postgres://user:pass@10.x.x.x:5432/orders?sslmode=disable
-DSN_WMS_MSSQL=sqlserver://user:pass@10.x.x.x:1433?database=wms
-```
-防火墙只放行网关机 IP 访问 9300。
+unit 只注入路径/用户；监听、token、DSN 全由 `config/datahub.env` 控制，改完 `systemctl restart datahub-server` 即生效。
+临时试跑：`cd /opt/datahub && ./datahub-server`（前台，自动向上找 config）。
 
 ### 5.3 AI 客户端接入
 

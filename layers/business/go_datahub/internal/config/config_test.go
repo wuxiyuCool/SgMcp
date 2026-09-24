@@ -35,13 +35,16 @@ func TestFileAndEnvPrecedence(t *testing.T) {
 		t.Error("未知 ref 不应命中")
 	}
 
-	refs := DSNRefs()
-	found := map[string]bool{}
+	refs := DSNRefList()
+	found := map[string]string{}
 	for _, r := range refs {
-		found[r] = true
+		found[r.Name] = r.Type
 	}
-	if !found["order_pg"] || !found["wms_mssql"] {
-		t.Errorf("DSNRefs 不全: %v", refs)
+	if found["order_pg"] != "pg" {
+		t.Errorf("order_pg 类型推断失败: %+v", refs)
+	}
+	if found["wms_mssql"] != "mssql" {
+		t.Errorf("wms_mssql 引号剥离或类型推断失败: %+v", refs)
 	}
 }
 

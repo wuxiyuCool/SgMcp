@@ -14,8 +14,11 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+
+	"github.com/sg/mcp/go-datahub/internal/dbhub"
 )
 
 var (
@@ -54,32 +57,47 @@ func DSN(ref string) (string, bool) {
 	return v, v != ""
 }
 
-// DSNRefs 列出已配置的 DSN 名称（不含值，供工具返回给调用方浏览）。
+// DSNRef 一个已登记数据源（名称 + 由连接串推断的类型）。
+type DSNRef struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+// DSNRefs 只回名称列表（dsrouting/internalapi 等调用点用；带类型清单用 DSNRefList）。
 func DSNRefs() []string {
+	list := DSNRefList()
+	out := make([]string, len(list))
+	for i, r := range list {
+		out[i] = r.Name
+	}
+	return out
+}
+
+// DSNRefList 列出所有已配置数据源（文件 + OS 环境变量，只回名称与类型不回值）。
+func DSNRefList() []DSNRef {
 	load()
-	out := []string{}
-	for k := range fileV {
-		if strings.HasPrefix(k, "DSN_") {
-			out = append(out, strings.ToLower(strings.TrimPrefix(k, "DSN_")))
+	seen := map[string]string{}
+	collect := func(key, val string) {
+		if !strings.HasPrefix(key, "DSN_") {
+			return
+		}
+		name := strings.ToLower(strings.TrimPrefix(key, "DSN_"))
+		if _, dup := seen[name]; !dup {
+			seen[name] = dbhub.InferKind(val)
 		}
 	}
-	// OS 环境变量里的 DSN_ 也纳入
+	for k, v := range fileV {
+		collect(k, v)
+	}
 	for _, kv := range os.Environ() {
-		k, _, _ := strings.Cut(kv, "=")
-		if strings.HasPrefix(k, "DSN_") {
-			name := strings.ToLower(strings.TrimPrefix(k, "DSN_"))
-			found := false
-			for _, o := range out {
-				if o == name {
-					found = true
-					break
-				}
-			}
-			if !found {
-				out = append(out, name)
-			}
-		}
+		k, v, _ := strings.Cut(kv, "=")
+		collect(k, v)
 	}
+	out := make([]DSNRef, 0, len(seen))
+	for name, typ := range seen {
+		out = append(out, DSNRef{Name: name, Type: typ})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 

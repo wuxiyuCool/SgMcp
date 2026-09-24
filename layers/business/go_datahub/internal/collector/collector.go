@@ -14,6 +14,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sg/mcp/go-datahub/internal/config"
@@ -249,26 +250,36 @@ type DbQuerySource struct{}
 func (DbQuerySource) Name() string { return "db_query" }
 func (DbQuerySource) Kind() string { return "database" }
 func (DbQuerySource) Description() string {
-	return fmt.Sprintf("对源库执行 SELECT 并流式采集（params: db_type=%v, dsn_ref=配置文件中 DSN_<名称> 的引用名（推荐，密码不经网络）或 dsn=裸连接串, sql=必填且须以 SELECT 开头, max_rows=可选上限）", dbhub.Kinds())
+	return "对源库执行 SELECT 并流式采集（params: dsn_ref=配置文件中数据源名（推荐，类型自动推断，见 list_dsn_refs）或 dsn=裸连接串, db_type=可选覆盖（oracle/mysql/pg/mssql）, sql=必填且须以 SELECT 开头, max_rows=可选上限）"
 }
 
-// resolveDSN 优先取 dsn_ref（连接串存服务端配置文件，密码不经 MCP 消息/审计日志流转）。
-func resolveDSN(p Params) (string, error) {
-	if ref, err := strParam(p, "dsn_ref"); err == nil && ref != "" {
-		if dsn, ok := config.DSN(ref); ok {
-			return dsn, nil
+// ResolveSource 解析数据源：优先 dsn_ref（连接串存服务端配置，密码不经网络），
+// db_type 缺省时按 DSN scheme 自动推断，支持同类型多数据源。
+func ResolveSource(p Params) (kind, dsn string, err error) {
+	kind, _ = strParam(p, "db_type")
+	if ref, rerr := strParam(p, "dsn_ref"); rerr == nil && ref != "" {
+		d, ok := config.DSN(ref)
+		if !ok {
+			return "", "", fmt.Errorf("配置中不存在 DSN 引用: %s（已配置: %v）", ref, config.DSNRefList())
 		}
-		return "", fmt.Errorf("配置中不存在 DSN 引用: %s（已配置: %v）", ref, config.DSNRefs())
+		dsn = d
+	} else {
+		d, derr := strParam(p, "dsn")
+		if derr != nil {
+			return "", "", fmt.Errorf("dsn_ref 与 dsn 至少提供一个")
+		}
+		dsn = d
 	}
-	return strParam(p, "dsn")
+	if kind == "" {
+		if kind = dbhub.InferKind(dsn); kind == "" {
+			return "", "", fmt.Errorf("无法从 DSN 推断数据库类型，请显式传 db_type（可选 %v）", dbhub.Kinds())
+		}
+	}
+	return kind, dsn, nil
 }
 
 func (DbQuerySource) Collect(ctx context.Context, p Params, emit func(Record) error) error {
-	kind, err := strParam(p, "db_type")
-	if err != nil {
-		return err
-	}
-	dsn, err := resolveDSN(p)
+	kind, dsn, err := ResolveSource(p)
 	if err != nil {
 		return err
 	}
@@ -332,4 +343,64 @@ func Default() *Registry {
 		HttpSource{},
 		DbQuerySource{},
 	)
+}
+
+// Preview 同步小查询（"看数据"场景；大批量搬运仍走 job）。
+// 只允许单条 SELECT；最多返回 limit 行，truncated 标识是否被截断。
+func Preview(ctx context.Context, p Params, limit int) (kind string, cols []string, rows []Record, truncated bool, err error) {
+	kind, dsn, err := ResolveSource(p)
+	if err != nil {
+		return "", nil, nil, false, err
+	}
+	query, err := strParam(p, "sql")
+	if err != nil {
+		return "", nil, nil, false, err
+	}
+	if len(query) < 6 || !strings.EqualFold(query[:6], "SELECT") {
+		return "", nil, nil, false, fmt.Errorf("sql 参数只允许 SELECT 查询")
+	}
+	db, err := dbhub.Open(kind, dsn)
+	if err != nil {
+		return kind, nil, nil, false, dbhub.Scrub(err, dsn)
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	rs, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return kind, nil, nil, false, dbhub.Scrub(err, dsn)
+	}
+	defer rs.Close()
+
+	cols, err = rs.Columns()
+	if err != nil {
+		return kind, nil, nil, false, err
+	}
+	rows = []Record{}
+	for rs.Next() {
+		if len(rows) >= limit {
+			truncated = true
+			break
+		}
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rs.Scan(ptrs...); err != nil {
+			return kind, cols, rows, truncated, dbhub.Scrub(err, dsn)
+		}
+		rec := Record{}
+		for i, c := range cols {
+			// []byte 统一转字符串，避免 JSON 序列化成 base64
+			if b, ok := vals[i].([]byte); ok {
+				rec[c] = string(b)
+			} else {
+				rec[c] = vals[i]
+			}
+		}
+		rows = append(rows, rec)
+	}
+	return kind, cols, rows, truncated, rs.Err()
 }

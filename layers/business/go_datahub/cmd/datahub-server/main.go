@@ -68,9 +68,9 @@ type listJobsOut struct {
 	Jobs []jobs.Job `json:"jobs"`
 }
 
-// DBTargetIn 是「指定一个库」的公共入参：db_type + dsn/dsn_ref 二选一。
+// DBTargetIn 是「指定一个库」的公共入参：db_type 可省略（按 DSN 连接串自动推断）+ dsn/dsn_ref 二选一。
 type DBTargetIn struct {
-	DBType string `json:"db_type" jsonschema:"数据库类型：oracle/mysql/pg/mssql"`
+	DBType string `json:"db_type,omitempty" jsonschema:"数据库类型 oracle/mysql/pg/mssql；用 dsn_ref 时可省略（自动按连接串推断）"`
 	DSN    string `json:"dsn,omitempty" jsonschema:"连接串（与 dsn_ref 二选一；推荐优先 dsn_ref 避免密码经网络传输）"`
 	DSNRef string `json:"dsn_ref,omitempty" jsonschema:"配置文件 DSN_<名称> 的引用名，如 order_pg（优先于 dsn），可用 data.list_dsn_refs 查看"`
 }
@@ -122,6 +122,21 @@ type batchQueryOut struct {
 	Rows  []map[string]any `json:"rows,omitempty"`
 	Count int              `json:"count,omitempty"`
 	Error string           `json:"error,omitempty"`
+}
+
+// dbQueryPreviewIn：任意单条 SELECT（JOIN/聚合场景；单表条件查询优先 data.batch_query）。
+type dbQueryPreviewIn struct {
+	DBTargetIn
+	SQL   string `json:"sql" jsonschema:"单条 SELECT 语句"`
+	Limit int    `json:"limit,omitempty" jsonschema:"返回行数上限，默认 50，最大 500"`
+}
+
+type dbQueryPreviewOut struct {
+	Kind      string             `json:"kind"`
+	Columns   []string           `json:"columns"`
+	Rows      []collector.Record `json:"rows"`
+	Returned  int                `json:"returned"`
+	Truncated bool               `json:"truncated"`
 }
 
 // batchProcessIn 对应架构示例：AI 调 data.batch_process(dataset_id=业务名,
@@ -201,6 +216,21 @@ func resolveDSN(in DBTargetIn) (string, error) {
 	return "", fmt.Errorf("dsn 与 dsn_ref 至少提供一个")
 }
 
+// resolveTarget 在 resolveDSN 基础上补 db_type：缺省按连接串 scheme 推断，支持同类型多数据源。
+func resolveTarget(in DBTargetIn) (kind, dsn string, err error) {
+	dsn, err = resolveDSN(in)
+	if err != nil {
+		return "", "", err
+	}
+	kind = in.DBType
+	if kind == "" {
+		if kind = dbhub.InferKind(dsn); kind == "" {
+			return "", "", fmt.Errorf("无法推断数据库类型，请显式传 db_type（可选 %v）", dbhub.Kinds())
+		}
+	}
+	return kind, dsn, nil
+}
+
 // ---------------------------------------------------------------------------
 
 func buildServer() (*mcp.Server, *http.ServeMux) {
@@ -278,11 +308,11 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 		Description: fmt.Sprintf("数据库连通性探测并返回版本。支持: %v；推荐用 dsn_ref 引用服务端配置，免传密码", dbhub.Kinds()),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in DBTargetIn) (*mcp.CallToolResult, dbPingOut, error) {
-		dsn, err := resolveDSN(in)
+		kind, dsn, err := resolveTarget(in)
 		if err != nil {
 			return nil, dbPingOut{}, err
 		}
-		v, ms, err := dbhub.Ping(ctx, in.DBType, dsn)
+		v, ms, err := dbhub.Ping(ctx, kind, dsn)
 		if err != nil {
 			return nil, dbPingOut{OK: false, Error: err.Error()}, nil
 		}
@@ -302,11 +332,11 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 		Description: "列出目标库中的用户表（排除系统 schema）。库操作前先用本工具确认目标表存在。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in DBTargetIn) (*mcp.CallToolResult, listTablesOut, error) {
-		dsn, err := resolveDSN(in)
+		kind, dsn, err := resolveTarget(in)
 		if err != nil {
 			return nil, listTablesOut{}, err
 		}
-		tables, err := dbhub.ListTables(ctx, in.DBType, dsn)
+		tables, err := dbhub.ListTables(ctx, kind, dsn)
 		if err != nil {
 			return nil, listTablesOut{OK: false, Error: err.Error()}, nil
 		}
@@ -317,11 +347,11 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 		Name:        "data.batch_import",
 		Description: "事务批量写入目标表：行数组（键即列名），列名白名单校验、值全部参数绑定；返回实际写入行数。单次上限 50000 行。",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in batchImportIn) (*mcp.CallToolResult, batchImportOut, error) {
-		dsn, err := resolveDSN(in.DBTargetIn)
+		kind, dsn, err := resolveTarget(in.DBTargetIn)
 		if err != nil {
 			return nil, batchImportOut{}, err
 		}
-		imported, err := dbhub.BatchImport(ctx, in.DBType, dsn, in.Table, in.Rows)
+		imported, err := dbhub.BatchImport(ctx, kind, dsn, in.Table, in.Rows)
 		if err != nil {
 			// 参数类错误（表名/行数非法）上抛为可读工具错误；库侧失败转结构化结果
 			if isParamError(err) {
@@ -337,11 +367,11 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 		Description: "条件查询目标表（等值过滤 + 行数上限，防全表拖库）：列名白名单、值参数绑定。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in batchQueryIn) (*mcp.CallToolResult, batchQueryOut, error) {
-		dsn, err := resolveDSN(in.DBTargetIn)
+		kind, dsn, err := resolveTarget(in.DBTargetIn)
 		if err != nil {
 			return nil, batchQueryOut{}, err
 		}
-		rows, err := dbhub.BatchQuery(ctx, in.DBType, dsn, in.Table, in.Filters, in.Limit)
+		rows, err := dbhub.BatchQuery(ctx, kind, dsn, in.Table, in.Filters, in.Limit)
 		if err != nil {
 			if isParamError(err) {
 				return nil, batchQueryOut{}, err
@@ -349,6 +379,35 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 			return nil, batchQueryOut{OK: false, Error: err.Error()}, nil
 		}
 		return nil, batchQueryOut{OK: true, Rows: rows, Count: len(rows)}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "data.db_query_preview",
+		Description: "同步小查询：对数据源执行任意单条 SELECT（含 JOIN/聚合）并直接返回行数据（默认 50 行，上限 500）。单表条件查询优先 data.batch_query；大批量搬运用 data.submit_collect_job。",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in dbQueryPreviewIn) (*mcp.CallToolResult, dbQueryPreviewOut, error) {
+		limit := in.Limit
+		if limit <= 0 {
+			limit = 50
+		}
+		if limit > 500 {
+			limit = 500
+		}
+		params := collector.Params{"sql": in.SQL}
+		if in.DSNRef != "" {
+			params["dsn_ref"] = in.DSNRef
+		}
+		if in.DSN != "" {
+			params["dsn"] = in.DSN
+		}
+		if in.DBType != "" {
+			params["db_type"] = in.DBType
+		}
+		kind, cols, rows, truncated, err := collector.Preview(ctx, params, limit)
+		if err != nil {
+			return nil, dbQueryPreviewOut{}, err
+		}
+		return nil, dbQueryPreviewOut{Kind: kind, Columns: cols, Rows: rows, Returned: len(rows), Truncated: truncated}, nil
 	})
 
 	mcp.AddTool(server, &mcp.Tool{

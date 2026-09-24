@@ -36,6 +36,23 @@ func Kinds() []string {
 	return out
 }
 
+// InferKind 从 DSN 形态推断数据库类型（oracle/pg/mssql 自带 scheme；
+// user:pass@tcp(...) 形态为 mysql）。无法判定返回空串，由调用方要求显式 db_type。
+func InferKind(dsn string) string {
+	switch {
+	case strings.HasPrefix(dsn, "oracle://"):
+		return "oracle"
+	case strings.HasPrefix(dsn, "postgres://"), strings.HasPrefix(dsn, "postgresql://"):
+		return "pg"
+	case strings.HasPrefix(dsn, "sqlserver://"):
+		return "mssql"
+	case strings.Contains(dsn, "@tcp("):
+		return "mysql"
+	default:
+		return ""
+	}
+}
+
 // Open 按类型打开连接池（调用方负责 Close / 复用）。
 func Open(kind, dsn string) (*sql.DB, error) {
 	k, ok := kinds[kind]
