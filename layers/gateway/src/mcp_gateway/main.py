@@ -51,13 +51,25 @@ aggregator = Aggregator(router)
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def list_pending_approvals() -> list[dict[str, Any]]:
-    """列出所有待审批事项（审批人视角）。"""
+    """列出所有待审批事项（审批人视角）。
+
+    返回每条审批单：id（"apr_" 前缀，传给 approve_request/reject_request）、
+    title、source_server、tool_name、tool_args（即将执行的原始入参）、requested_by。
+    """
     return [r.model_dump(mode="json") for r in gate.list(status="pending")]
 
 
 @mcp.tool()
 def approve_request(request_id: str, comment: str | None = None) -> dict[str, Any]:
-    """批准一条待审批事项。批准后网关会把该调用执行到下游 server。"""
+    """批准一条待审批事项并立即执行到下游。
+
+    参数：
+    - request_id: 来自 gateway_call 返回值或 list_pending_approvals，形如 "apr_6a19736d88d2"
+    - comment: 可选审批意见
+
+    返回：{"request_id", "status": "approved", "executed": true, "result": <下游执行结果>}
+    注意：每个 request_id 只能决策一次，重复决策会报错。
+    """
     try:
         req = gate.decide(request_id, ApprovalAction.APPROVE, by="approver", comment=comment)
     except (LookupError, ValueError) as e:
@@ -123,11 +135,30 @@ def gateway_call(
     arguments: dict[str, Any],
     requested_by: str = "agent",
 ) -> dict[str, Any]:
-    """统一入口：AI 客户端通过本工具调用任意聚合到的下游 server 工具。
+    """统一入口：经网关调用任意已聚合的下游工具。
 
-    - 不确定有哪些工具时，先调用 list_routes 查询（勿猜测工具名）。
-    - 只读 / 无需审批的工具：立即路由转发执行。
-    - 需审批的写工具：创建审批单挂起，返回审批单 ID，等待人工审批。
+    参数要求（三个必填项缺一不可，格式错误会被直接拒绝）：
+    - server: 下游服务名，取值必须是 list_routes 结果中的 server 字段
+    - tool:   工具名，必须与 list_routes 结果中的 tool 字段一字不差
+      （例：建 IT 工单是 server="it_ops", tool="create_incident"；
+        不存在 create_ticket 这种名字，勿凭猜测调用）
+    - arguments: JSON 对象（不是字符串！）。目标工具无需入参时必须传 {}
+    - requested_by: 可选，发起人标识，用于审计
+
+    调用示例——创建高优工单：
+      {"server": "it_ops", "tool": "create_incident",
+       "arguments": {"title": "打印机故障", "priority": "high"}}
+
+    调用示例——Go 数据源清单（无入参）：
+      {"server": "go_datahub", "tool": "data.list_dsn_refs", "arguments": {}}
+
+    返回结构：
+    - 免审批:   {"approved": true, "executed": true, "result": <下游返回值>}
+    - 需审批:   {"approved": false, "executed": false, "request_id": "apr_xxx",
+                "message": ...}  ← 此时目标操作【尚未执行】！
+      需请审批人调 list_pending_approvals 查看、approve_request(request_id) 放行后才会真正执行
+
+    推荐流程：不确定时先 list_routes 查工具与入参 schema，再发起本调用。
     """
     route = router.resolve(server, tool)
     if route is None:

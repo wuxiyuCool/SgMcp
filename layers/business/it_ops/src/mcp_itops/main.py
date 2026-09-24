@@ -77,11 +77,20 @@ def _call_heavy_internal(path: str, json_body: dict[str, Any] | None = None,
 @mcp.tool(name="itops.create_incident")
 def create_incident(title: str, priority: str = "medium", reporter: str = "agent",
                     channel: str = "local", tenant_id: str = "default") -> dict[str, Any]:
-    """创建一条 IT 运维工单。priority: low/medium/high/critical。
+    """创建一条 IT 运维工单，返回含 id 的工单对象。
 
-    channel: local=内置内存库（默认）；sql=按数据集路由写库（需 DATASET_INCIDENTS_*
-    路由配置，工单落在 incidents 表）；api=调外部 ITSM 系统 REST API
-    （需 MCP_ITSM_API_URL 配置）。
+    参数：
+    - title: 工单标题（必填），如 "3楼打印机卡纸"
+    - priority: 枚举 low/medium/high/critical，默认 medium（其他值报错）
+    - reporter: 报障人标识，默认 agent
+    - channel: 落地通道枚举 local/sql/api，默认 local
+      local=内置内存库（零依赖；注意服务重启后数据清空，ID 不可跨重启引用）；
+      sql=按数据集路由写库（需 DATASET_INCIDENTS_* 配置，工单落 incidents 表，持久化）；
+      api=调外部 ITSM 系统 REST（需 MCP_ITSM_API_URL 配置）
+    - tenant_id: 租户标识，默认 default（仅 sql 通道参与路由）
+
+    返回示例：{"id": "INC-0205B08E", "title": ..., "status": "new", "priority": ...}
+    后续用返回的 id 调 itops.update_incident_status 流转状态。
     """
     if priority not in {"low", "medium", "high", "critical"}:
         raise ValueError(f"非法优先级: {priority}")
@@ -169,7 +178,16 @@ def _call_external_itsm(method: str, path: str, json_body: dict[str, Any] | None
 
 @mcp.tool(name="itops.update_incident_status")
 def update_incident_status(incident_id: str, status: str) -> dict[str, Any]:
-    """更新工单状态。示例写操作。"""
+    """流转工单状态，返回更新后的完整工单对象。
+
+    参数：
+    - incident_id: 必须是 create_incident 返回的真实 id（形如 "INC-0205B08E"）。
+      勿凭空编造、勿引用服务重启前的旧 ID（local 通道为内存存储，重启即清空）；
+      不确定时先用 itops.list_incidents 查现有工单
+    - status: 枚举 new/open/in_progress/resolved/closed
+
+    工单不存在时返回可读错误"工单不存在: xxx"。
+    """
     rec = store.update_incident_status(incident_id, status)
     if rec is None:
         raise LookupError(f"工单不存在: {incident_id}")
@@ -178,7 +196,14 @@ def update_incident_status(incident_id: str, status: str) -> dict[str, Any]:
 
 @mcp.tool(name="itops.create_change")
 def create_change(title: str, change_type: str = "standard", implementer: str = "ops", risk: str = "low") -> dict[str, Any]:
-    """创建变更单。**注意**：本工具属于高风险写操作，生产环境中应由上层网关审批后放行。"""
+    """创建变更单，返回含 id（形如 "CHG-4B36C912"）的对象。
+
+    参数：title=变更描述；change_type=standard/emergency（标准/紧急）；
+    implementer=实施人；risk=low/medium/high。
+
+    ⚠️ 高风险写操作：经网关 gateway_call 调用时会被挂起为审批单（返回
+    request_id="apr_xxx" 且尚未执行），需审批人 approve_request 后才真正创建。
+    """
     rec = store.create_change(title=title, change_type=change_type, implementer=implementer, risk=risk)
     rec["approval_required"] = True  # 交由上层审批的标记
     return rec
@@ -195,13 +220,18 @@ def get_change(change_id: str) -> dict[str, Any]:
 
 @mcp.tool(name="itops.register_asset")
 def register_asset(name: str, asset_type: str, owner: str) -> dict[str, Any]:
-    """登记一台 IT 资产（录入 CMDB）。asset_type: laptop/server/network/software。"""
+    """登记一台 IT 资产（录入 CMDB），返回含 id（形如 "AST-5C332490"）的对象。
+
+    参数：name=资产名（如 "srv-ops-01"）；
+    asset_type=枚举 laptop/server/network/software；owner=负责人。
+    """
     return store.create_asset(name=name, asset_type=asset_type, owner=owner)
 
 
 @mcp.tool(name="itops.list_assets")
 def list_assets(asset_type: str | None = None) -> list[dict[str, Any]]:
-    """查询资产清单，可按类型过滤。"""
+    """查询资产清单（对象数组）。asset_type 可选过滤：laptop/server/network/software，
+    留空或传 null 返回全部。"""
     return store.list_assets(asset_type=asset_type)
 
 

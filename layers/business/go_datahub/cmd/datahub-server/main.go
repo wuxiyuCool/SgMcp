@@ -252,8 +252,14 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "data.submit_collect_job",
-		Description: "提交一个异步批量采集任务，立即返回 job_id；大规模采集由此发起，不阻塞调用。",
+		Name: "data.submit_collect_job",
+		Description: "提交异步批量采集任务，立即返回 job_id（形如 \"job-4189f7c72a30a804\"），不阻塞调用。" +
+			"参数：source=采集器名（必填，先用 data.list_sources 查可用名及其 params 说明）；" +
+			"params=对象，各采集器定义不同，例：synthetic 用 {\"rows\":100000,\"batch_pause_ms\":0}，" +
+			"db_query 用 {\"dsn_ref\":\"orcl_erp\",\"sql\":\"SELECT ...\",\"max_rows\":50000}，" +
+			"csv 用 {\"path\":\"/data/x.csv\"}。" +
+			"提交后用 data.get_job_status 轮询（status 走完 pending→running→completed/failed 即结束）。" +
+			"经网关调用时本工具需人工审批，返回 request_id 而非 job_id 表示尚未执行。",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in submitIn) (*mcp.CallToolResult, submitOut, error) {
 		if _, ok := cols.Get(in.Source); !ok {
 			return nil, submitOut{}, fmt.Errorf("未知采集器: %s（用 data.list_sources 查看可用）", in.Source)
@@ -269,8 +275,10 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "data.get_job_status",
-		Description: "查询采集任务状态与已采集行数（rows 随进度增长）。只读。",
+		Name: "data.get_job_status",
+		Description: "查询采集任务状态。参数：job_id=data.submit_collect_job 返回值（形如 \"job-xxx\"）。" +
+			"返回：status 枚举 pending/running/completed/failed/cancelled；rows=已采集行数（running 期间持续增长）；" +
+			"failed 时看 error 字段。轮询建议：间隔 1~2 秒直到 status 不再是 pending/running。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in jobIn) (*mcp.CallToolResult, jobs.Job, error) {
 		job, ok := reg.Get(in.JobID)
@@ -281,8 +289,9 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "data.list_jobs",
-		Description: "列出采集任务，可按状态过滤。只读。",
+		Name: "data.list_jobs",
+		Description: "列出近期采集任务。参数：status=可选过滤（pending/running/completed/failed/cancelled，留空为全部）；" +
+			"limit=最多条数默认 20。忘记 job_id 时用它找回。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in listJobsIn) (*mcp.CallToolResult, listJobsOut, error) {
 		limit := in.Limit
@@ -293,8 +302,9 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "data.cancel_job",
-		Description: "中止一个运行中的采集任务。",
+		Name: "data.cancel_job",
+		Description: "中止运行中的采集任务。参数：job_id。仅 pending/running 可取消；" +
+			"已结束的任务返回\"任务已结束，无法取消\"错误。",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in jobIn) (*mcp.CallToolResult, cancelOut, error) {
 		if err := reg.Cancel(in.JobID); err != nil {
 			return nil, cancelOut{}, err
@@ -304,8 +314,10 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "data.db_ping",
-		Description: fmt.Sprintf("数据库连通性探测并返回版本。支持: %v；推荐用 dsn_ref 引用服务端配置，免传密码", dbhub.Kinds()),
+		Name: "data.db_ping",
+		Description: fmt.Sprintf("数据库连通性探测并返回版本。参数：dsn_ref=数据源名（推荐，见 data.list_dsn_refs）或 dsn=裸连接串；"+
+			"db_type 可省略（自动按连接串推断，可选 %v）。返回：{ok, version, latency_ms} 或 {ok:false, error=脱敏后的失败原因}。"+
+			"操作数据源前建议先 ping 确认连通。只读。", dbhub.Kinds()),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in DBTargetIn) (*mcp.CallToolResult, dbPingOut, error) {
 		kind, dsn, err := resolveTarget(in)
@@ -320,8 +332,10 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "data.list_dsn_refs",
-		Description: "列出服务端配置文件（config/datahub.env）中已登记的 DSN 引用名（只回名称，不回连接串）。只读。",
+		Name: "data.list_dsn_refs",
+		Description: "列出服务端已登记的数据源（无参数）。返回 refs=[{name, type}]——name 即其他工具的 dsn_ref 取值，" +
+			"type 为自动推断的库类型（oracle/mysql/pg/mssql）；config_found=false 表示服务端未放配置文件。" +
+			"只回名称不回连接串。访问任何数据库前先调本工具了解可用数据源。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, listDsnOut, error) {
 		return nil, listDsnOut{Refs: config.DSNRefs(), ConfigFound: config.ConfigPath() != ""}, nil
