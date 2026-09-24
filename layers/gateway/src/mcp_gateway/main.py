@@ -49,6 +49,24 @@ aggregator = Aggregator(router)
 # ---------------------------------------------------------------------------
 # 向 AI 客户端暴露的工具
 # ---------------------------------------------------------------------------
+def _coerce_args(arguments: dict[str, Any] | str | None) -> dict[str, Any]:
+    """入参宽容化：部分 AI 平台会把 arguments 序列化成 JSON 字符串传输，统一转回 dict。"""
+    if arguments is None or arguments == "":
+        return {}
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        import json
+        try:
+            parsed = json.loads(arguments)
+        except ValueError as e:
+            raise ToolError(f"arguments 不是合法 JSON：{e}；原始值: {arguments!r}") from e
+        if not isinstance(parsed, dict):
+            raise ToolError(f"arguments 解析后应为对象，实为 {type(parsed).__name__}")
+        return parsed
+    raise ToolError(f"arguments 类型不支持: {type(arguments).__name__}")
+
+
 @mcp.tool()
 def list_pending_approvals() -> list[dict[str, Any]]:
     """列出所有待审批事项（审批人视角）。
@@ -132,24 +150,29 @@ def refresh_routes() -> dict[str, Any]:
 def gateway_call(
     server: str,
     tool: str,
-    arguments: dict[str, Any],
+    arguments: dict[str, Any] | str = "",
     requested_by: str = "agent",
 ) -> dict[str, Any]:
     """统一入口：经网关调用任意已聚合的下游工具。
 
-    参数要求（三个必填项缺一不可，格式错误会被直接拒绝）：
+    参数要求：
     - server: 下游服务名，取值必须是 list_routes 结果中的 server 字段
     - tool:   工具名，必须与 list_routes 结果中的 tool 字段一字不差
       （例：建 IT 工单是 server="it_ops", tool="create_incident"；
         不存在 create_ticket 这种名字，勿凭猜测调用）
-    - arguments: JSON 对象（不是字符串！）。目标工具无需入参时必须传 {}
+    - arguments: 目标工具的入参对象，如 {"title": "打印机故障", "priority": "high"}；
+      无入参的工具传 {} 或省略。也兼容 JSON 字符串形式（"{...}"），平台传输把对象
+      转成字符串也不会失败
     - requested_by: 可选，发起人标识，用于审计
 
     调用示例——创建高优工单：
       {"server": "it_ops", "tool": "create_incident",
        "arguments": {"title": "打印机故障", "priority": "high"}}
 
-    调用示例——Go 数据源清单（无入参）：
+    示例——查当前时间：
+      {"server": "common-tools", "tool": "now", "arguments": {"timezone_name": "Asia/Shanghai"}}
+
+    示例——Go 数据源清单（无入参）：
       {"server": "go_datahub", "tool": "data.list_dsn_refs", "arguments": {}}
 
     返回结构：
@@ -160,6 +183,7 @@ def gateway_call(
 
     推荐流程：不确定时先 list_routes 查工具与入参 schema，再发起本调用。
     """
+    args_obj = _coerce_args(arguments)
     route = router.resolve(server, tool)
     if route is None:
         same_server = sorted(r.tool for r in router.routes if r.server == server)
@@ -173,13 +197,13 @@ def gateway_call(
         raise ToolError(f"未注册的路由: {server}.{tool}。{hint}")
 
     if not route.requires_approval:
-        result = router.execute(server, tool, arguments)
+        result = router.execute(server, tool, args_obj)
         return {"approved": True, "executed": True, "result": result}
 
     req = gate.request(
         source_server=server,
         tool_name=tool,
-        tool_args=arguments,
+        tool_args=args_obj,
         requested_by=requested_by,
         title=route.summary,
         description=f"工具 {server}.{tool} 需要审批后方可执行",

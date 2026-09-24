@@ -153,6 +153,16 @@ def test_gateway_aggregation_flow() -> None:
                 assert d["approved"] is True and d["executed"] is True and d["result"] == "ping"
                 print("PASS  网关·只读工具直接放行（HTTP 转发）")
 
+                # 4b) arguments 以 JSON 字符串传输（部分 AI 平台会序列化嵌套对象）→ 容错生效
+                r = await client.call_tool(
+                    "gateway_call",
+                    {"server": "common-tools", "tool": "echo",
+                     "arguments": '{"message": "str-args"}'},
+                )
+                d = _payload(r)
+                assert d["executed"] is True and d["result"] == "str-args", d
+                print("PASS  网关·arguments 兼容 JSON 字符串形式")
+
                 # 5) 无需审批的写工具：经 HTTP 转发执行到 it_ops
                 r = await client.call_tool(
                     "gateway_call",
