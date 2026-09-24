@@ -182,7 +182,7 @@ def refresh_routes() -> dict[str, Any]:
 def gateway_call(
     server: str,
     tool: str,
-    arguments: dict[str, Any] | str = "",
+    arguments: Any = None,
     requested_by: str = "agent",
 ) -> dict[str, Any]:
     """统一入口：经网关调用任意已聚合的下游工具。
@@ -214,6 +214,7 @@ def gateway_call(
       需请审批人调 list_pending_approvals 查看、approve_request(request_id) 放行后才会真正执行
 
     推荐流程：不确定时先 list_routes 查工具与入参 schema，再发起本调用。
+    若你的平台序列化嵌套 JSON 对象困难，改用 gateway_call_kv（参数扁平字符串，无嵌套）。
     """
     args_obj = _coerce_args(arguments)
     route = _resolve_route(server, tool)
@@ -227,7 +228,11 @@ def gateway_call(
                 "若下游刚上线，先调用 refresh_routes 重新拉取工具表"
             )
         raise ToolError(f"未注册的路由: {server}.{tool}。{hint}")
+    return _dispatch(route, args_obj, requested_by)
 
+
+def _dispatch(route: ToolRoute, args_obj: dict[str, Any], requested_by: str) -> dict[str, Any]:
+    """已解析路由 + 规范化入参 → 立即执行或挂审批。gateway_call / gateway_call_kv 共用。"""
     if not route.requires_approval:
         result = router.execute(route.server, route.tool, args_obj)
         return {"approved": True, "executed": True, "result": result}
@@ -238,7 +243,7 @@ def gateway_call(
         tool_args=args_obj,
         requested_by=requested_by,
         title=route.summary,
-        description=f"工具 {server}.{tool} 需要审批后方可执行",
+        description=f"工具 {route.server}.{route.tool} 需要审批后方可执行",
     )
     return {
         "approved": False,
@@ -246,6 +251,71 @@ def gateway_call(
         "request_id": req.id,
         "message": f"已创建审批单 {req.id}，请使用 approve_request / reject_request 处理",
     }
+
+
+@mcp.tool()
+def gateway_call_kv(
+    server: str,
+    tool: str,
+    params: str = "",
+    requested_by: str = "agent",
+) -> dict[str, Any]:
+    """统一入口（扁平参数版）：与 gateway_call 等价，但入参用 "k=v;k2=v2" 字符串，
+    顶层不出现嵌套 JSON 对象——供序列化嵌套 JSON 困难的 AI 平台使用，优先推荐本平台调用。
+
+    参数：
+    - server / tool: 同 gateway_call（脏名自动归一）
+    - params: 分号分隔的 key=value，值自动识别 int/float/bool，其余按字符串。例：
+        params="title=打印机故障;priority=high"
+        params="dsn_ref=orcl_erp;sql=SELECT 1 FROM dual"
+        params="timezone_name=Asia/Shanghai"
+      无入参的工具留空 ""。
+    - 限制：入参本身是对象/数组的工具（data.submit_collect_job 的 params、
+      data.batch_import 的 rows、query_dataset 的 filters）请改用 gateway_call。
+
+    返回结构与 gateway_call 相同（需审批时返回 request_id 且操作尚未执行）。
+    """
+    args_obj = _parse_kv_params(params)
+    route = _resolve_route(server, tool)
+    if route is None:
+        same_server = sorted(r.tool for r in router.routes if r.server == server)
+        hint = f"该 server 可用工具: {same_server}" if same_server else "请先调用 list_routes 查询"
+        raise ToolError(f"未注册的路由: {server}.{tool}。{hint}")
+    return _dispatch(route, args_obj, requested_by)
+
+
+def _parse_kv_params(params: str | dict | None) -> dict[str, Any]:
+    """解析 "k=v;k2=v2"；值类型推断；兼容平台实际发来 JSON 对象/字符串的情况。"""
+    if params is None or params == "":
+        return {}
+    if isinstance(params, dict):
+        return params
+    if not isinstance(params, str):
+        raise ToolError(f"params 类型不支持: {type(params).__name__}")
+    if params.lstrip().startswith("{"):
+        return _coerce_args(params)
+    out: dict[str, Any] = {}
+    for pair in params.replace("；", ";").split(";"):
+        pair = pair.strip()
+        if not pair:
+            continue
+        k, sep, v = pair.partition("=")
+        if not sep:
+            raise ToolError(f"params 片段缺少 '='：{pair!r}（格式应为 k=v;k2=v2）")
+        v = v.strip()
+        if v.lower() in ("true", "false"):
+            out[k.strip()] = v.lower() == "true"
+        elif v.lower() in ("none", "null"):
+            out[k.strip()] = None
+        else:
+            try:
+                out[k.strip()] = int(v)
+            except ValueError:
+                try:
+                    out[k.strip()] = float(v)
+                except ValueError:
+                    out[k.strip()] = v
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -178,6 +178,21 @@ def test_gateway_aggregation_flow() -> None:
                 assert d["executed"] is True and "INC-" in str(d["result"]), d
                 print("PASS  网关·server/tool 宽容解析（归一化+补层级前缀）")
 
+                # 4d) 扁平参数入口 gateway_call_kv：无嵌套 JSON，值类型推断
+                r = await client.call_tool(
+                    "gateway_call_kv",
+                    {"server": "common-tools", "tool": "echo", "params": "message=kv-args;uppercase=true"},
+                )
+                d = _payload(r)
+                assert d["executed"] is True and d["result"] == "KV-ARGS", d
+                r = await client.call_tool(
+                    "gateway_call_kv",
+                    {"server": "it_ops", "tool": "create_incident", "params": "title=kv入口工单;priority=high"},
+                )
+                d = _payload(r)
+                assert d["executed"] is True and "INC-" in str(d["result"]), d
+                print("PASS  网关·gateway_call_kv 扁平参数入口（bool 推断+写工具直通）")
+
                 # 5) 无需审批的写工具：经 HTTP 转发执行到 it_ops
                 r = await client.call_tool(
                     "gateway_call",
