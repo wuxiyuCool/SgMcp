@@ -36,9 +36,9 @@ DEFAULT_DOWNSTREAMS = (
     "it_ops=http://127.0.0.1:9200/mcp,common-tools=http://127.0.0.1:9100/mcp"
 )
 
-# 默认需审批工具（工具名带层级前缀：itops.*=领域工具 / data.*=全局数据平台；
-# 可用 MCP_APPROVAL_TOOLS 覆盖）
-DEFAULT_APPROVAL_TOOLS = frozenset({"itops.create_change", "data.submit_collect_job"})
+# 默认需审批工具（工具名带层级前缀：itops_=领域工具 / data_=全局数据平台；
+# 匹配时点号会先归一为下划线，兼容旧写法；可用 MCP_APPROVAL_TOOLS 覆盖）
+DEFAULT_APPROVAL_TOOLS = frozenset({"itops_create_change", "data_submit_collect_job"})
 
 
 @dataclass
@@ -64,11 +64,16 @@ class SyncReport:
 
 
 def requires_approval(tool: str) -> bool:
-    """审批策略：MCP_APPROVAL_TOOLS 显式指定则完全以其为准，否则用默认集合。"""
+    """审批策略：MCP_APPROVAL_TOOLS 显式指定则完全以其为准，否则用默认集合。
+
+    比对前把点号归一为下划线（部分平台序列化参数值中的 "." 会损坏，
+    全平台工具名已改用下划线前缀；此处兼容历史点号写法）。
+    """
+    canon = tool.replace(".", "_")
     raw = os.environ.get("MCP_APPROVAL_TOOLS")
     if raw is not None:
-        return tool in {t.strip() for t in raw.split(",") if t.strip()}
-    return tool in DEFAULT_APPROVAL_TOOLS
+        return canon in {t.strip().replace(".", "_") for t in raw.split(",") if t.strip()}
+    return canon in DEFAULT_APPROVAL_TOOLS
 
 
 def downstream_specs_from_env() -> list[DownstreamSpec]:

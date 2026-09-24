@@ -86,11 +86,11 @@ def suite_check(gw: str, itops: str, common: str, godh: str | None) -> None:
     def itops_tools():
         names = client.list_tools(itops)
         # 第 1 层·领域工具（itops.* 前缀）+ 第 2 层·领域通用查询
-        for expect in ("itops.create_incident", "itops.list_incidents",
-                       "itops.create_change", "itops.register_asset",
-                       "itops.export_assets_to_warehouse", "itops.query_warehouse_assets",
-                       "itops.batch_process", "itops.list_datasets",
-                       "itops.query_dataset", "itops.list_data_tables"):
+        for expect in ("itops_create_incident", "itops_list_incidents",
+                       "itops_create_change", "itops_register_asset",
+                       "itops_export_assets_to_warehouse", "itops_query_warehouse_assets",
+                       "itops_batch_process", "itops_list_datasets",
+                       "itops_query_dataset", "itops_list_data_tables"):
             assert expect in names, f"it_ops 缺少 {expect}"
         return f"{len(names)} 个工具（itops.* 领域前缀）"
 
@@ -123,10 +123,10 @@ def suite_check(gw: str, itops: str, common: str, godh: str | None) -> None:
         def godh_tools():
             names = client.list_tools(godh, headers=GODH_HEADERS)
             # 架构约定：重活层对 AI 暴露的工具统一 data. 前缀
-            for expect in ("data.list_sources", "data.submit_collect_job", "data.get_job_status",
-                           "data.db_ping", "data.list_dsn_refs", "data.list_tables",
-                           "data.batch_import", "data.batch_query",
-                           "data.batch_process", "data.list_datasets", "data.query_dataset", "data.db_query_preview"):
+            for expect in ("data_list_sources", "data_submit_collect_job", "data_get_job_status",
+                           "data_db_ping", "data_list_dsn_refs", "data_list_tables",
+                           "data_batch_import", "data_batch_query",
+                           "data_batch_process", "data_list_datasets", "data_query_dataset", "data_db_query_preview"):
                 assert expect in names, f"go_datahub 缺少 {expect}"
             return f"{len(names)} 个工具（data.* 全局数据平台前缀）"
 
@@ -173,24 +173,24 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
 
     # it_ops 直连（绕过网关，验证中层自身可用）
     def itops_create_incident():
-        r = client.call(itops, "itops.create_incident", {"title": "运维测试工单", "priority": "high"})
+        r = client.call(itops, "itops_create_incident", {"title": "运维测试工单", "priority": "high"})
         assert r["id"].startswith("INC-"), r
         return f"{r['id']} status={r['status']}"
 
     def itops_status_flow():
-        created = client.call(itops, "itops.create_incident", {"title": "状态流转测试"})
+        created = client.call(itops, "itops_create_incident", {"title": "状态流转测试"})
         iid = created["id"]
-        updated = client.call(itops, "itops.update_incident_status", {"incident_id": iid, "status": "in_progress"})
+        updated = client.call(itops, "itops_update_incident_status", {"incident_id": iid, "status": "in_progress"})
         assert updated["status"] == "in_progress", updated
-        listing = client.call(itops, "itops.list_incidents", {"status": "in_progress"})
+        listing = client.call(itops, "itops_list_incidents", {"status": "in_progress"})
         ids = [i["id"] for i in listing] if isinstance(listing, list) else []
         assert iid in ids, f"过滤结果未包含 {iid}"
         return f"{iid} new → in_progress 并可按状态过滤"
 
     def itops_asset():
-        r = client.call(itops, "itops.register_asset", {"name": "srv-ops-01", "asset_type": "server", "owner": "ops"})
+        r = client.call(itops, "itops_register_asset", {"name": "srv-ops-01", "asset_type": "server", "owner": "ops"})
         assert r["id"].startswith("AST-"), r
-        listed = client.call(itops, "itops.list_assets", {"asset_type": "server"})
+        listed = client.call(itops, "itops_list_assets", {"asset_type": "server"})
         assert any(a["id"] == r["id"] for a in listed), "资产未出现在列表中"
         return f"{r['id']} 已登记并可查询"
 
@@ -209,7 +209,7 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
 
     def gw_itops_readonly():
         r = client.call(gw, "gateway_call", {
-            "server": "it_ops", "tool": "itops.list_incidents", "arguments": {},
+            "server": "it_ops", "tool": "itops_list_incidents", "arguments": {},
         })
         assert r["executed"] is True and isinstance(r["result"], list), r
         return f"经网关读取工单 {len(r['result'])} 条"
@@ -220,17 +220,17 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
     if godh:
         # go_datahub 直连：异步 job 全流程（提交 → 轮询 → 完成）
         def godh_job_flow():
-            srcs = client.call(godh, "data.list_sources", headers=GODH_HEADERS)
+            srcs = client.call(godh, "data_list_sources", headers=GODH_HEADERS)
             names = [s["name"] for s in srcs["sources"]]
             assert "synthetic" in names, names
-            sub = client.call(godh, "data.submit_collect_job", {
+            sub = client.call(godh, "data_submit_collect_job", {
                 "source": "synthetic", "params": {"rows": 2000, "batch_pause_ms": 0},
             }, headers=GODH_HEADERS)
             jid = sub["job_id"]
             assert jid.startswith("job-"), sub
             deadline = time.time() + 20
             while True:
-                st = client.call(godh, "data.get_job_status", {"job_id": jid}, headers=GODH_HEADERS)
+                st = client.call(godh, "data_get_job_status", {"job_id": jid}, headers=GODH_HEADERS)
                 if st["status"] in ("completed", "failed", "cancelled"):
                     break
                 if time.time() > deadline:
@@ -240,14 +240,14 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
             return f"{jid} 采集 2000 行完成"
 
         def godh_db_ping_error():
-            r = client.call(godh, "data.db_ping", {"db_type": "mysql", "dsn": "root:x@tcp(127.0.0.1:1)/none"},
+            r = client.call(godh, "data_db_ping", {"db_type": "mysql", "dsn": "root:x@tcp(127.0.0.1:1)/none"},
                             headers=GODH_HEADERS)
             assert r["ok"] is False and r["error"], r
             return "不可达 DSN 返回结构化 ok=false"
 
         def godh_dsn_ref_error_path():
             """未知 dsn_ref 必须是可读的工具错误，且不得泄露任何已配置连接串。"""
-            r = client.call_raw(godh, "data.db_ping", {"db_type": "pg", "dsn_ref": "no_such_ref"},
+            r = client.call_raw(godh, "data_db_ping", {"db_type": "pg", "dsn_ref": "no_such_ref"},
                                 headers=GODH_HEADERS)
             assert r.is_error, "未知 dsn_ref 竟然成功"
             text = str(r.content)
@@ -256,7 +256,7 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
 
         def gw_godh_readonly():
             r = client.call(gw, "gateway_call", {
-                "server": "go_datahub", "tool": "data.list_sources", "arguments": {},
+                "server": "go_datahub", "tool": "data_list_sources", "arguments": {},
             })
             assert r["executed"] is True and isinstance(r["result"], dict), r
             return "经网关 HTTP 转发读取 go_datahub 采集器清单"
@@ -264,27 +264,27 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
         # 库表操作（data.list_tables / batch_import / batch_query）：真库成功路径
         # 需要真实 DSN；此处验证「不可达库 → 结构化 ok=false 且不泄露连接串」
         def godh_list_tables_error():
-            r = client.call(godh, "data.list_tables",
+            r = client.call(godh, "data_list_tables",
                             {"db_type": "pg", "dsn": "postgres://u:p@127.0.0.1:1/none"},
                             headers=GODH_HEADERS)
             assert r["ok"] is False and r["error"], r
             assert "://" not in r["error"], "错误信息疑似泄露连接串"
-            return "data.list_tables 不可达库返回结构化 ok=false"
+            return "data_list_tables 不可达库返回结构化 ok=false"
 
         def godh_batch_import_param_error():
             """非法表名必须是可读工具错误（参数校验在连库之前）。"""
-            r = client.call_raw(godh, "data.batch_import", {
+            r = client.call_raw(godh, "data_batch_import", {
                 "db_type": "pg", "dsn": "postgres://u:p@127.0.0.1:1/none",
                 "table": "t; DROP TABLE x", "rows": [{"a": 1}],
             }, headers=GODH_HEADERS)
             assert r.is_error, "非法表名竟然成功"
-            return "data.batch_import 非法表名被白名单拦截"
+            return "data_batch_import 非法表名被白名单拦截"
 
         # 业务层内部 MCP 直调示例：经网关调 itops.export_assets_to_warehouse，
         # it_ops 内部再经 MCP 协议直连 go_datahub（gateway → it_ops → go_datahub 三跳）
         def gw_business_to_heavy():
             r = client.call_raw(gw, "gateway_call", {
-                "server": "it_ops", "tool": "itops.export_assets_to_warehouse",
+                "server": "it_ops", "tool": "itops_export_assets_to_warehouse",
                 "arguments": {"dsn_ref": "no_such_ref"},
             })
             # 未知 dsn_ref：重活层内部端点 400 → it_ops 转可读 ToolError → 网关 is_error
@@ -298,7 +298,7 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
         # 异步执行返回 task_id → 轮询完成
         def gw_heavy_batch_process_flow():
             sub = client.call(gw, "gateway_call", {
-                "server": "go_datahub", "tool": "data.batch_process",
+                "server": "go_datahub", "tool": "data_batch_process",
                 "arguments": {"dataset_id": "orders", "period": "2024-05",
                               "tenant_id": "t1", "rows": 100},
             })
@@ -310,7 +310,7 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
             st = {}
             while True:
                 st = client.call(gw, "gateway_call", {
-                    "server": "go_datahub", "tool": "data.get_job_status",
+                    "server": "go_datahub", "tool": "data_get_job_status",
                     "arguments": {"job_id": r["task_id"]},
                 })["result"]
                 if st["status"] in ("completed", "failed", "cancelled"):
@@ -326,7 +326,7 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
         # real 模式经内部 REST 下放重活层执行
         def gw_business_batch_process():
             r = client.call(gw, "gateway_call", {
-                "server": "it_ops", "tool": "itops.batch_process",
+                "server": "it_ops", "tool": "itops_batch_process",
                 "arguments": {"dataset_id": "orders", "period": "2024-05",
                               "tenant_id": "t1", "mode": "simulate"},
             })
@@ -335,7 +335,7 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
             assert d["routed"]["db"] == "order_t1_pg", r
             # real 模式：本机无真实库 → 重活层结构化 ok=false 转可读工具错误
             bad = client.call_raw(gw, "gateway_call", {
-                "server": "it_ops", "tool": "itops.batch_process",
+                "server": "it_ops", "tool": "itops_batch_process",
                 "arguments": {"dataset_id": "orders", "period": "2024-05",
                               "tenant_id": "t1", "mode": "real"},
             })
@@ -345,7 +345,7 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
         # 事件单 api 通道：未配置外部 ITSM → 可读错误（引导改用 local/sql）
         def gw_incident_api_channel_error():
             r = client.call_raw(gw, "gateway_call", {
-                "server": "it_ops", "tool": "itops.create_incident",
+                "server": "it_ops", "tool": "itops_create_incident",
                 "arguments": {"title": "API通道测试", "channel": "api"},
             })
             assert r.is_error, "未配置 ITSM 竟然成功"
@@ -355,14 +355,14 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
         # 数据集清单：AI 的批处理/查询前置发现入口（两侧清单一致 + 域归属/中文说明随行）
         def gw_list_datasets():
             r = client.call(gw, "gateway_call", {
-                "server": "go_datahub", "tool": "data.list_datasets", "arguments": {},
+                "server": "go_datahub", "tool": "data_list_datasets", "arguments": {},
             })
             infos = {d["dataset"]: d for d in r["result"]["datasets"]}
             assert {"orders", "incidents", "assets"} <= set(infos), r
             assert infos["orders"]["domain"] == "order" and infos["orders"]["desc"], r
             assert infos["incidents"]["domain"] == "itops", r
             r2 = client.call(gw, "gateway_call", {
-                "server": "it_ops", "tool": "itops.list_datasets", "arguments": {},
+                "server": "it_ops", "tool": "itops_list_datasets", "arguments": {},
             })
             names2 = {d["dataset"] for d in r2["result"]["datasets"]}
             assert names2 == set(infos), f"两侧路由清单应一致: {set(infos)} vs {names2}"
@@ -371,28 +371,28 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
         # 第 3 层·全局数据平台：data.query_dataset 全量数据集枚举（含 order 域）
         def gw_data_query_dataset():
             r = client.call_raw(gw, "gateway_call", {
-                "server": "go_datahub", "tool": "data.query_dataset",
+                "server": "go_datahub", "tool": "data_query_dataset",
                 "arguments": {"dataset_id": "incidents", "tenant_id": "default"},
             })
             # 本机无真实库 → 结构化 ok=false（路由成功，库不可达），错误脱敏
             assert r.is_error or "://" not in str(r.content), r
             d = client.call_raw(gw, "gateway_call", {
-                "server": "go_datahub", "tool": "data.query_dataset",
+                "server": "go_datahub", "tool": "data_query_dataset",
                 "arguments": {"dataset_id": "orders", "tenant_id": "t1", "period": "2024-05"},
             })
             assert d.is_error, "无真实库竟然查询成功"
             assert "://" not in str(d.content), "错误信息疑似泄露连接串"
-            return "data.query_dataset 路由解析可达（无库走结构化失败路径）"
+            return "data_query_dataset 路由解析可达（无库走结构化失败路径）"
 
         # 第 2 层·领域通用查询：itops.query_dataset 域限定（越域引导去第 3 层）
         def gw_itops_query_dataset_domain_guard():
             # 越域：orders 属 order 域 → 可读错误引导用 data.query_dataset
             r = client.call_raw(gw, "gateway_call", {
-                "server": "it_ops", "tool": "itops.query_dataset",
+                "server": "it_ops", "tool": "itops_query_dataset",
                 "arguments": {"dataset_id": "order"},  # 枚举外值，模拟越域调用
             })
             assert r.is_error, "越域数据集竟然成功"
-            return "itops.query_dataset 域校验拦截（枚举 + 越域引导）"
+            return "itops_query_dataset 域校验拦截（枚举 + 越域引导）"
 
         check("go_datahub 异步 job 全流程", godh_job_flow)
         check("go_datahub db_ping 失败路径", godh_db_ping_error)
@@ -401,12 +401,12 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
         check("go_datahub batch_import 表名白名单", godh_batch_import_param_error)
         check("网关 HTTP 转发到 go_datahub（只读）", gw_godh_readonly)
         check("business→heavy 内部 REST 直调链路", gw_business_to_heavy)
-        check("data.batch_process 业务名路由全流程", gw_heavy_batch_process_flow)
-        check("itops.batch_process Python 侧路由", gw_business_batch_process)
+        check("data_batch_process 业务名路由全流程", gw_heavy_batch_process_flow)
+        check("itops_batch_process Python 侧路由", gw_business_batch_process)
         check("事件单 api 通道未配置报可读错误", gw_incident_api_channel_error)
         check("数据集清单两侧一致（含域归属/说明）", gw_list_datasets)
-        check("data.query_dataset 全局细粒度查询", gw_data_query_dataset)
-        check("itops.query_dataset 领域枚举限定", gw_itops_query_dataset_domain_guard)
+        check("data_query_dataset 全局细粒度查询", gw_data_query_dataset)
+        check("itops_query_dataset 领域枚举限定", gw_itops_query_dataset_domain_guard)
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +421,7 @@ def suite_approve(gw: str, _itops: str, _common: str, godh: str | None = None) -
 
     def gw_change_pending():
         r = client.call(gw, "gateway_call", {
-            "server": "it_ops", "tool": "itops.create_change",
+            "server": "it_ops", "tool": "itops_create_change",
             "arguments": {"title": marker, "risk": "high"},
             "requested_by": "ops-test",
         })
@@ -453,7 +453,7 @@ def suite_approve(gw: str, _itops: str, _common: str, godh: str | None = None) -
 
     def gw_change_readable():
         r = client.call(gw, "gateway_call", {
-            "server": "it_ops", "tool": "itops.get_change",
+            "server": "it_ops", "tool": "itops_get_change",
             "arguments": {"change_id": pending["change_id"]},
         })
         assert r["result"]["title"] == marker, r
@@ -466,7 +466,7 @@ def suite_approve(gw: str, _itops: str, _common: str, godh: str | None = None) -
 
     def gw_reject_no_execute():
         r = client.call(gw, "gateway_call", {
-            "server": "it_ops", "tool": "itops.create_change", "arguments": {"title": f"{marker}-驳回"},
+            "server": "it_ops", "tool": "itops_create_change", "arguments": {"title": f"{marker}-驳回"},
         })
         rid = r["request_id"]
         d = client.call(gw, "reject_request", {"request_id": rid, "comment": "风险过高"})
@@ -488,7 +488,7 @@ def suite_approve(gw: str, _itops: str, _common: str, godh: str | None = None) -
         # 批量采集提交（Go 重活）经审批闸门：挂起 → 批准 → job 真正被创建
         def gw_godh_submit_approval():
             r = client.call(gw, "gateway_call", {
-                "server": "go_datahub", "tool": "data.submit_collect_job",
+                "server": "go_datahub", "tool": "data_submit_collect_job",
                 "arguments": {"source": "synthetic", "params": {"rows": 100}},
             })
             assert r["approved"] is False and r["executed"] is False, r
@@ -497,7 +497,7 @@ def suite_approve(gw: str, _itops: str, _common: str, godh: str | None = None) -
             job_id = d["result"]["job_id"]
             assert job_id.startswith("job-"), d
             st = client.call(gw, "gateway_call", {
-                "server": "go_datahub", "tool": "data.get_job_status", "arguments": {"job_id": job_id},
+                "server": "go_datahub", "tool": "data_get_job_status", "arguments": {"job_id": job_id},
             })
             assert st["result"]["status"] in ("pending", "running", "completed"), st
             return f"审批放行后 Go 侧创建任务 {job_id}"

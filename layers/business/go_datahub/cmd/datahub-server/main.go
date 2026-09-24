@@ -2,10 +2,10 @@
 //
 // 定位：与业务层（Python 轻活）分工，承担大批量数据采集与多数据库交互。
 // 对 AI 暴露的工具统一 data. 前缀（架构约定：data.xxx = 重活层）。
-// 长任务采用异步 job 模式：data.submit_collect_job 立即返回 job_id，
-// data.get_job_status 轮询进度，data.cancel_job 中止 —— 避免网关 HTTP 长连接超时。
+// 长任务采用异步 job 模式：data_submit_collect_job 立即返回 job_id，
+// data_get_job_status 轮询进度，data_cancel_job 中止 —— 避免网关 HTTP 长连接超时。
 //
-// 库表操作（data.list_tables / data.batch_import / data.batch_query）基于
+// 库表操作（data_list_tables / data_batch_import / data_batch_query）基于
 // 服务端 DSN 注册表（DSN_<名称>），值参数绑定、连接串不进 MCP 结果。
 // 业务层 Python 亦经 MCP 协议直连本 server 复用这些能力（不经网关）。
 //
@@ -45,7 +45,7 @@ type listSourcesOut struct {
 }
 
 type submitIn struct {
-	Source string         `json:"source" jsonschema:"采集器名称，见 data.list_sources"`
+	Source string         `json:"source" jsonschema:"采集器名称，见 data_list_sources"`
 	Params map[string]any `json:"params,omitempty" jsonschema:"采集参数，各采集器定义见其 description"`
 }
 
@@ -56,7 +56,7 @@ type submitOut struct {
 }
 
 type jobIn struct {
-	JobID string `json:"job_id" jsonschema:"data.submit_collect_job 返回的任务 ID"`
+	JobID string `json:"job_id" jsonschema:"data_submit_collect_job 返回的任务 ID"`
 }
 
 type listJobsIn struct {
@@ -72,7 +72,7 @@ type listJobsOut struct {
 type DBTargetIn struct {
 	DBType string `json:"db_type,omitempty" jsonschema:"数据库类型 oracle/mysql/pg/mssql；用 dsn_ref 时可省略（自动按连接串推断）"`
 	DSN    string `json:"dsn,omitempty" jsonschema:"连接串（与 dsn_ref 二选一；推荐优先 dsn_ref 避免密码经网络传输）"`
-	DSNRef string `json:"dsn_ref,omitempty" jsonschema:"配置文件 DSN_<名称> 的引用名，如 order_pg（优先于 dsn），可用 data.list_dsn_refs 查看"`
+	DSNRef string `json:"dsn_ref,omitempty" jsonschema:"配置文件 DSN_<名称> 的引用名，如 order_pg（优先于 dsn），可用 data_list_dsn_refs 查看"`
 }
 
 type dbPingOut struct {
@@ -100,7 +100,7 @@ type listTablesOut struct {
 
 type batchImportIn struct {
 	DBTargetIn
-	Table string           `json:"table" jsonschema:"目标表名，允许 [schema.]table 形态；可用 data.list_tables 查看"`
+	Table string           `json:"table" jsonschema:"目标表名，允许 [schema.]table 形态；可用 data_list_tables 查看"`
 	Rows  []map[string]any `json:"rows" jsonschema:"要写入的行（对象数组，键即列名）；单次上限 50000 行，更大量请分批"`
 }
 
@@ -124,7 +124,7 @@ type batchQueryOut struct {
 	Error string           `json:"error,omitempty"`
 }
 
-// dbQueryPreviewIn：任意单条 SELECT（JOIN/聚合场景；单表条件查询优先 data.batch_query）。
+// dbQueryPreviewIn：任意单条 SELECT（JOIN/聚合场景；单表条件查询优先 data_batch_query）。
 type dbQueryPreviewIn struct {
 	DBTargetIn
 	SQL   string `json:"sql" jsonschema:"单条 SELECT 语句"`
@@ -139,11 +139,11 @@ type dbQueryPreviewOut struct {
 	Truncated bool               `json:"truncated"`
 }
 
-// batchProcessIn 对应架构示例：AI 调 data.batch_process(dataset_id=业务名,
+// batchProcessIn 对应架构示例：AI 调 data_batch_process(dataset_id=业务名,
 // period=周期, tenant_id=租户) → 网关转发到 Go → 内部 routeDB/routeTable →
 // 异步执行 → 立即返回 task_id（AI 回复用户"任务已提交"）。
 type batchProcessIn struct {
-	DatasetID string `json:"dataset_id" jsonschema:"业务数据集名（不是表名），如 orders；可用 data.list_datasets 查看"`
+	DatasetID string `json:"dataset_id" jsonschema:"业务数据集名（不是表名），如 orders；可用 data_list_datasets 查看"`
 	Period    string `json:"period" jsonschema:"处理周期，格式 YYYY-MM（按月分表），如 2024-05"`
 	TenantID  string `json:"tenant_id" jsonschema:"租户 ID，用于按租户路由数据源，如 t1"`
 	Mode      string `json:"mode,omitempty" jsonschema:"simulate 演练（不触库，默认）；real 真实执行（连路由库统计目标表行数）"`
@@ -244,7 +244,7 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	cols := collector.Default()
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "data.list_sources",
+		Name:        "data_list_sources",
 		Description: "列出可用采集器（数据库/HTTP/文件/演示）及其参数说明。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, listSourcesOut, error) {
@@ -252,17 +252,17 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "data.submit_collect_job",
+		Name: "data_submit_collect_job",
 		Description: "提交异步批量采集任务，立即返回 job_id（形如 \"job-4189f7c72a30a804\"），不阻塞调用。" +
-			"参数：source=采集器名（必填，先用 data.list_sources 查可用名及其 params 说明）；" +
+			"参数：source=采集器名（必填，先用 data_list_sources 查可用名及其 params 说明）；" +
 			"params=对象，各采集器定义不同，例：synthetic 用 {\"rows\":100000,\"batch_pause_ms\":0}，" +
 			"db_query 用 {\"dsn_ref\":\"orcl_erp\",\"sql\":\"SELECT ...\",\"max_rows\":50000}，" +
 			"csv 用 {\"path\":\"/data/x.csv\"}。" +
-			"提交后用 data.get_job_status 轮询（status 走完 pending→running→completed/failed 即结束）。" +
+			"提交后用 data_get_job_status 轮询（status 走完 pending→running→completed/failed 即结束）。" +
 			"经网关调用时本工具需人工审批，返回 request_id 而非 job_id 表示尚未执行。",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in submitIn) (*mcp.CallToolResult, submitOut, error) {
 		if _, ok := cols.Get(in.Source); !ok {
-			return nil, submitOut{}, fmt.Errorf("未知采集器: %s（用 data.list_sources 查看可用）", in.Source)
+			return nil, submitOut{}, fmt.Errorf("未知采集器: %s（用 data_list_sources 查看可用）", in.Source)
 		}
 		params := in.Params
 		if params == nil {
@@ -275,8 +275,8 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "data.get_job_status",
-		Description: "查询采集任务状态。参数：job_id=data.submit_collect_job 返回值（形如 \"job-xxx\"）。" +
+		Name: "data_get_job_status",
+		Description: "查询采集任务状态。参数：job_id=data_submit_collect_job 返回值（形如 \"job-xxx\"）。" +
 			"返回：status 枚举 pending/running/completed/failed/cancelled；rows=已采集行数（running 期间持续增长）；" +
 			"failed 时看 error 字段。轮询建议：间隔 1~2 秒直到 status 不再是 pending/running。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
@@ -289,7 +289,7 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "data.list_jobs",
+		Name: "data_list_jobs",
 		Description: "列出近期采集任务。参数：status=可选过滤（pending/running/completed/failed/cancelled，留空为全部）；" +
 			"limit=最多条数默认 20。忘记 job_id 时用它找回。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
@@ -302,7 +302,7 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "data.cancel_job",
+		Name: "data_cancel_job",
 		Description: "中止运行中的采集任务。参数：job_id。仅 pending/running 可取消；" +
 			"已结束的任务返回\"任务已结束，无法取消\"错误。",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in jobIn) (*mcp.CallToolResult, cancelOut, error) {
@@ -314,8 +314,8 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "data.db_ping",
-		Description: fmt.Sprintf("数据库连通性探测并返回版本。参数：dsn_ref=数据源名（推荐，见 data.list_dsn_refs）或 dsn=裸连接串；"+
+		Name: "data_db_ping",
+		Description: fmt.Sprintf("数据库连通性探测并返回版本。参数：dsn_ref=数据源名（推荐，见 data_list_dsn_refs）或 dsn=裸连接串；"+
 			"db_type 可省略（自动按连接串推断，可选 %v）。返回：{ok, version, latency_ms} 或 {ok:false, error=脱敏后的失败原因}。"+
 			"操作数据源前建议先 ping 确认连通。只读。", dbhub.Kinds()),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
@@ -332,7 +332,7 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "data.list_dsn_refs",
+		Name: "data_list_dsn_refs",
 		Description: "列出服务端已登记的数据源（无参数）。返回 refs=[{name, type}]——name 即其他工具的 dsn_ref 取值，" +
 			"type 为自动推断的库类型（oracle/mysql/pg/mssql）；config_found=false 表示服务端未放配置文件。" +
 			"只回名称不回连接串。访问任何数据库前先调本工具了解可用数据源。只读。",
@@ -342,7 +342,7 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "data.list_tables",
+		Name:        "data_list_tables",
 		Description: "列出目标库中的用户表（排除系统 schema）。库操作前先用本工具确认目标表存在。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in DBTargetIn) (*mcp.CallToolResult, listTablesOut, error) {
@@ -358,7 +358,7 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "data.batch_import",
+		Name:        "data_batch_import",
 		Description: "事务批量写入目标表：行数组（键即列名），列名白名单校验、值全部参数绑定；返回实际写入行数。单次上限 50000 行。",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in batchImportIn) (*mcp.CallToolResult, batchImportOut, error) {
 		kind, dsn, err := resolveTarget(in.DBTargetIn)
@@ -377,7 +377,7 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "data.batch_query",
+		Name:        "data_batch_query",
 		Description: "条件查询目标表（等值过滤 + 行数上限，防全表拖库）：列名白名单、值参数绑定。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in batchQueryIn) (*mcp.CallToolResult, batchQueryOut, error) {
@@ -396,8 +396,8 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "data.db_query_preview",
-		Description: "同步小查询：对数据源执行任意单条 SELECT（含 JOIN/聚合）并直接返回行数据（默认 50 行，上限 500）。单表条件查询优先 data.batch_query；大批量搬运用 data.submit_collect_job。",
+		Name:        "data_db_query_preview",
+		Description: "同步小查询：对数据源执行任意单条 SELECT（含 JOIN/聚合）并直接返回行数据（默认 50 行，上限 500）。单表条件查询优先 data_batch_query；大批量搬运用 data_submit_collect_job。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in dbQueryPreviewIn) (*mcp.CallToolResult, dbQueryPreviewOut, error) {
 		limit := in.Limit
@@ -425,8 +425,8 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "data.batch_process",
-		Description: "按业务数据集名批量处理数据（内部按租户路由库、按月分表，异步执行立即返回 task_id，用 data.get_job_status 轮询）。",
+		Name:        "data_batch_process",
+		Description: "按业务数据集名批量处理数据（内部按租户路由库、按月分表，异步执行立即返回 task_id，用 data_get_job_status 轮询）。",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in batchProcessIn) (*mcp.CallToolResult, batchProcessOut, error) {
 		// 路由失败立即报错（fail fast），不产生僵尸任务
 		dbType, dbRef, err := dsrouting.RouteDB(in.DatasetID, in.TenantID)
@@ -466,7 +466,7 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "data.list_datasets",
+		Name:        "data_list_datasets",
 		Description: "列出已配置的业务数据集及其路由规则（租户 → dsn_ref、按月分表）。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, listDatasetsOut, error) {
@@ -474,10 +474,10 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "data.query_dataset",
+		Name: "data_query_dataset",
 		Description: "按业务数据集名做细粒度查询（第 3 层·全局数据平台，dataset_id 全量枚举：" +
 			datasetEnumDescription() +
-			"）。领域工具查不到的不常用数据集也在此查询；大批量处理用 data.batch_process。",
+			"）。领域工具查不到的不常用数据集也在此查询；大批量处理用 data_batch_process。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in queryDatasetIn) (*mcp.CallToolResult, queryDatasetOut, error) {
 		dbType, dbRef, err := dsrouting.RouteDB(in.DatasetID, in.TenantID)

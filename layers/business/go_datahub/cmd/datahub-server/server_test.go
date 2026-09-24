@@ -74,9 +74,9 @@ func TestToolsRegistered(t *testing.T) {
 	}
 	// 架构约定：重活层对 AI 暴露的工具统一 data. 前缀
 	for _, want := range []string{
-		"data.list_sources", "data.submit_collect_job", "data.get_job_status",
-		"data.list_jobs", "data.cancel_job", "data.db_ping", "data.list_dsn_refs",
-		"data.list_tables", "data.batch_import", "data.batch_query", "data.db_query_preview",
+		"data_list_sources", "data_submit_collect_job", "data_get_job_status",
+		"data_list_jobs", "data_cancel_job", "data_db_ping", "data_list_dsn_refs",
+		"data_list_tables", "data_batch_import", "data_batch_query", "data_db_query_preview",
 	} {
 		if !names[want] {
 			t.Errorf("缺少工具: %s", want)
@@ -90,7 +90,7 @@ func TestListSources(t *testing.T) {
 		Sources []struct {
 			Name string `json:"name"`
 		} `json:"sources"`
-	}](t, sess, "data.list_sources", nil)
+	}](t, sess, "data_list_sources", nil)
 	if len(out.Sources) < 4 {
 		t.Fatalf("采集器数量异常: %d", len(out.Sources))
 	}
@@ -101,7 +101,7 @@ func TestJobLifecycle(t *testing.T) {
 	sub := callStructured[struct {
 		JobID  string `json:"job_id"`
 		Status string `json:"status"`
-	}](t, sess, "data.submit_collect_job", map[string]any{
+	}](t, sess, "data_submit_collect_job", map[string]any{
 		"source": "synthetic",
 		"params": map[string]any{"rows": 300, "batch_pause_ms": 1},
 	})
@@ -112,7 +112,7 @@ func TestJobLifecycle(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	var last jobView
 	for time.Now().Before(deadline) {
-		last = callStructured[jobView](t, sess, "data.get_job_status", map[string]any{"job_id": sub.JobID})
+		last = callStructured[jobView](t, sess, "data_get_job_status", map[string]any{"job_id": sub.JobID})
 		if last.Status == "completed" || last.Status == "failed" {
 			break
 		}
@@ -129,7 +129,7 @@ func TestJobLifecycle(t *testing.T) {
 func TestUnknownSourceIsToolError(t *testing.T) {
 	sess := connectInMemory(t)
 	res, err := sess.CallTool(context.Background(), &mcp.CallToolParams{
-		Name:      "data.submit_collect_job",
+		Name:      "data_submit_collect_job",
 		Arguments: map[string]any{"source": "nope"},
 	})
 	if err != nil {
@@ -145,7 +145,7 @@ func TestDbPingDsnValidation(t *testing.T) {
 
 	// dsn 与 dsn_ref 都缺 → tool error
 	res, err := sess.CallTool(context.Background(), &mcp.CallToolParams{
-		Name: "data.db_ping", Arguments: map[string]any{"db_type": "pg"},
+		Name: "data_db_ping", Arguments: map[string]any{"db_type": "pg"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -156,7 +156,7 @@ func TestDbPingDsnValidation(t *testing.T) {
 
 	// 未知 dsn_ref → 错误信息只列名称，不含任何连接串
 	res, err = sess.CallTool(context.Background(), &mcp.CallToolParams{
-		Name: "data.db_ping", Arguments: map[string]any{"db_type": "pg", "dsn_ref": "no_such_ref"},
+		Name: "data_db_ping", Arguments: map[string]any{"db_type": "pg", "dsn_ref": "no_such_ref"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -179,7 +179,7 @@ func TestListDsnRefs(t *testing.T) {
 	out := callStructured[struct {
 		Refs        []string `json:"refs"`
 		ConfigFound bool     `json:"config_found"`
-	}](t, sess, "data.list_dsn_refs", nil)
+	}](t, sess, "data_list_dsn_refs", nil)
 	found := false
 	for _, r := range out.Refs {
 		if r == "demo_pg" {
@@ -197,7 +197,7 @@ func TestListDsnRefs(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 库表操作（data.list_tables / data.batch_import / data.batch_query）
+// 库表操作（data_list_tables / data_batch_import / data_batch_query）
 // 真库成功路径需要真实 DSN；本组用例覆盖参数校验与失败路径（任意环境可跑）。
 // ---------------------------------------------------------------------------
 
@@ -228,7 +228,7 @@ func TestBatchImportValidation(t *testing.T) {
 	sess := connectInMemory(t)
 
 	// 空 rows → tool error
-	res := callRaw(t, sess, "data.batch_import", map[string]any{
+	res := callRaw(t, sess, "data_batch_import", map[string]any{
 		"db_type": "pg", "dsn": "postgres://u:p@127.0.0.1:1/none", "table": "t", "rows": []any{},
 	})
 	if !res.IsError {
@@ -236,7 +236,7 @@ func TestBatchImportValidation(t *testing.T) {
 	}
 
 	// 非法表名（注入特征）→ tool error，且不执行任何库操作
-	res = callRaw(t, sess, "data.batch_import", map[string]any{
+	res = callRaw(t, sess, "data_batch_import", map[string]any{
 		"db_type": "pg", "dsn": "postgres://u:p@127.0.0.1:1/none",
 		"table": "t; DROP TABLE x", "rows": []any{map[string]any{"a": 1}},
 	})
@@ -245,7 +245,7 @@ func TestBatchImportValidation(t *testing.T) {
 	}
 
 	// 未知 dsn_ref → tool error，错误信息不泄露连接串
-	res = callRaw(t, sess, "data.batch_import", map[string]any{
+	res = callRaw(t, sess, "data_batch_import", map[string]any{
 		"db_type": "pg", "dsn_ref": "no_such_ref", "table": "t",
 		"rows": []any{map[string]any{"a": 1}},
 	})
@@ -257,7 +257,7 @@ func TestBatchImportValidation(t *testing.T) {
 	}
 
 	// 不可达库 → 结构化 ok=false（不抛异常），错误信息已脱敏
-	out := callStructured[batchImportView](t, sess, "data.batch_import", map[string]any{
+	out := callStructured[batchImportView](t, sess, "data_batch_import", map[string]any{
 		"db_type": "pg", "dsn": "postgres://u:secret@127.0.0.1:1/none", "table": "t",
 		"rows": []any{map[string]any{"a": 1}},
 	})
@@ -276,7 +276,7 @@ func TestBatchQueryValidation(t *testing.T) {
 	sess := connectInMemory(t)
 
 	// 非法列名（注入特征）→ tool error
-	res := callRaw(t, sess, "data.batch_query", map[string]any{
+	res := callRaw(t, sess, "data_batch_query", map[string]any{
 		"db_type": "pg", "dsn": "postgres://u:p@127.0.0.1:1/none", "table": "t",
 		"filters": map[string]any{"a; DROP TABLE x": "1"},
 	})
@@ -285,7 +285,7 @@ func TestBatchQueryValidation(t *testing.T) {
 	}
 
 	// 不可达库 → 结构化 ok=false
-	out := callStructured[batchQueryView](t, sess, "data.batch_query", map[string]any{
+	out := callStructured[batchQueryView](t, sess, "data_batch_query", map[string]any{
 		"db_type": "pg", "dsn": "postgres://u:p@127.0.0.1:1/none", "table": "t",
 	})
 	if out.OK {
@@ -297,7 +297,7 @@ func TestBatchQueryValidation(t *testing.T) {
 }
 
 func TestBatchProcessFlow(t *testing.T) {
-	// 架构示例全流程：data.batch_process(orders, 2024-05, t1) → task_id → 轮询完成
+	// 架构示例全流程：data_batch_process(orders, 2024-05, t1) → task_id → 轮询完成
 	t.Setenv("DATASET_ORDERS_DBTYPE", "pg")
 	t.Setenv("DATASET_ORDERS_DSN_T1", "order_t1_pg")
 	t.Setenv("DATASET_ORDERS_DSN_DEFAULT", "order_pg")
@@ -310,7 +310,7 @@ func TestBatchProcessFlow(t *testing.T) {
 		Status    string         `json:"status"`
 		DatasetID string         `json:"dataset_id"`
 		Routed    map[string]any `json:"routed"`
-	}](t, sess, "data.batch_process", map[string]any{
+	}](t, sess, "data_batch_process", map[string]any{
 		"dataset_id": "orders", "period": "2024-05", "tenant_id": "t1", "rows": 100,
 	})
 	if !strings.HasPrefix(sub.TaskID, "job-") {
@@ -331,7 +331,7 @@ func TestBatchProcessFlow(t *testing.T) {
 		res := callStructured[struct {
 			jobView
 			Message string `json:"message"`
-		}](t, sess, "data.get_job_status", map[string]any{"job_id": sub.TaskID})
+		}](t, sess, "data_get_job_status", map[string]any{"job_id": sub.TaskID})
 		last, msg = res.jobView, res.Message
 		if last.Status == "completed" || last.Status == "failed" {
 			break
@@ -350,7 +350,7 @@ func TestBatchProcessUnconfiguredDatasetIsToolError(t *testing.T) {
 	config.Reload()
 	t.Cleanup(config.Reload)
 	sess := connectInMemory(t)
-	res := callRaw(t, sess, "data.batch_process", map[string]any{
+	res := callRaw(t, sess, "data_batch_process", map[string]any{
 		"dataset_id": "no_such_ds", "period": "2024-05", "tenant_id": "t1",
 	})
 	if !res.IsError {
@@ -367,7 +367,7 @@ func TestListDatasetsTool(t *testing.T) {
 		Datasets []struct {
 			Dataset string `json:"dataset"`
 		} `json:"datasets"`
-	}](t, sess, "data.list_datasets", nil)
+	}](t, sess, "data_list_datasets", nil)
 	found := false
 	for _, d := range out.Datasets {
 		if d.Dataset == "orders" {
@@ -375,7 +375,7 @@ func TestListDatasetsTool(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("data.list_datasets 未返回 orders: %+v", out)
+		t.Fatalf("data_list_datasets 未返回 orders: %+v", out)
 	}
 }
 
@@ -384,7 +384,7 @@ func TestListTablesFailureIsStructured(t *testing.T) {
 	out := callStructured[struct {
 		OK    bool   `json:"ok"`
 		Error string `json:"error"`
-	}](t, sess, "data.list_tables", map[string]any{
+	}](t, sess, "data_list_tables", map[string]any{
 		"db_type": "pg", "dsn": "postgres://u:p@127.0.0.1:1/none",
 	})
 	if out.OK {
@@ -400,7 +400,7 @@ func TestDbQueryPreviewGuards(t *testing.T) {
 
 	// 非 SELECT 必须拒绝
 	res, err := sess.CallTool(context.Background(), &mcp.CallToolParams{
-		Name:      "data.db_query_preview",
+		Name:      "data_db_query_preview",
 		Arguments: map[string]any{"dsn": "postgres://u:p@127.0.0.1:1/db", "sql": "DELETE FROM t"},
 	})
 	if err != nil {
@@ -412,7 +412,7 @@ func TestDbQueryPreviewGuards(t *testing.T) {
 
 	// 未知 dsn_ref → 可读错误且不泄露连接串
 	res, err = sess.CallTool(context.Background(), &mcp.CallToolParams{
-		Name:      "data.db_query_preview",
+		Name:      "data_db_query_preview",
 		Arguments: map[string]any{"dsn_ref": "no_such", "sql": "SELECT 1"},
 	})
 	if err != nil {

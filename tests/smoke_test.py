@@ -80,10 +80,10 @@ def test_lower_common() -> None:
 def test_middle_itops() -> None:
     from mcp_itops import main as itops
 
-    r = asyncio.run(_call(itops.mcp, "itops.create_incident", {"title": "服务器宕机", "priority": "high"}))
+    r = asyncio.run(_call(itops.mcp, "itops_create_incident", {"title": "服务器宕机", "priority": "high"}))
     assert not r.is_error and "INC-" in r.content[0].text
 
-    r = asyncio.run(_call(itops.mcp, "itops.list_incidents", {}))
+    r = asyncio.run(_call(itops.mcp, "itops_list_incidents", {}))
     assert not r.is_error
     print("PASS  中层·it_ops（协议级，itops.* 前缀）")
 
@@ -203,17 +203,19 @@ def test_gateway_aggregation_flow() -> None:
                 )
                 d = _payload(r)
                 assert d["executed"] is True and "INC-" in str(d["result"]), d
-                # list_routes 应携带 tool_alias
+                # list_routes：工具名一律无点号（规避平台 "." 序列化缺陷）+ 携带 tool_alias
                 r = await client.call_tool("list_routes", {})
                 items = _payload(r)
                 items = items["result"] if isinstance(items, dict) and set(items) == {"result"} else items
-                assert any(x["tool_alias"] == x["tool"].replace(".", "_") for x in items if "." in x["tool"])
+                assert all("." not in x["tool"] for x in items), [x["tool"] for x in items if "." in x["tool"]]
+                assert all(x["tool_alias"] == x["tool"] for x in items)
+                assert any(x["tool"].startswith("itops_") for x in items)
                 print("PASS  网关·gateway_call_kv 扁平入口 + tool_alias 下划线别名")
 
                 # 5) 无需审批的写工具：经 HTTP 转发执行到 it_ops
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "it_ops", "tool": "itops.create_incident",
+                    {"server": "it_ops", "tool": "itops_create_incident",
                      "arguments": {"title": "聚合器冒烟", "priority": "high"}},
                 )
                 d = _payload(r)
@@ -223,7 +225,7 @@ def test_gateway_aggregation_flow() -> None:
                 # 6) 高风险写操作：挂起，创建审批单，不执行
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "it_ops", "tool": "itops.create_change", "arguments": {"title": "升级库", "risk": "high"}},
+                    {"server": "it_ops", "tool": "itops_create_change", "arguments": {"title": "升级库", "risk": "high"}},
                 )
                 d = _payload(r)
                 assert d["approved"] is False and d["executed"] is False
@@ -239,7 +241,7 @@ def test_gateway_aggregation_flow() -> None:
                 # 8) 驳回：不执行
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "it_ops", "tool": "itops.create_change", "arguments": {"title": "再试一次"}},
+                    {"server": "it_ops", "tool": "itops_create_change", "arguments": {"title": "再试一次"}},
                 )
                 rid2 = _payload(r)["request_id"]
                 r = await client.call_tool("reject_request", {"request_id": rid2, "comment": "风险过高"})

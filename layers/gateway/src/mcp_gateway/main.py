@@ -86,21 +86,38 @@ def _resolve_route(server: str, tool: str) -> ToolRoute | None:
     routes = router.routes
     sn, tn = _norm(server), _norm(tool)
     tn_und = tn.replace(".", "_")
-    # 1) server 归一化 + tool 精确
+
+    def full_forms(r: ToolRoute) -> set[str]:
+        """全名可接受形态：原名、归一化、点号↔下划线互换。"""
+        n = _norm(r.tool)
+        return {r.tool, n, n.replace(".", "_"), n.replace("_", ".")}
+
+    def tail_forms(r: ToolRoute) -> set[str]:
+        """剥层级前缀后的尾段形态（仅剥已知层级前缀 itops_/data_ 或点号前缀，
+        防止 generate_id 这类普通名被误剥成 id 造成误匹配）。"""
+        out = {r.tool}
+        for sep in (".",):
+            if sep in r.tool:
+                out.add(r.tool.rsplit(sep, 1)[-1])
+        for known in ("itops_", "data_"):
+            if r.tool.startswith(known):
+                out.add(r.tool[len(known):])
+        return {_norm(t) for t in out}
+
+    # 1) server 归一化 + tool 全名（含点号/下划线互换）
     for r in routes:
-        if _norm(r.server) == sn and r.tool == tool:
+        if _norm(r.server) == sn and (tool in full_forms(r) or tn in full_forms(r) or tn_und in full_forms(r)):
             return r
-    # 2) server 归一化 + tool 补层级前缀（r.tool 形如 "itops.create_incident"，尾段相等即命中）
+    # 2) server 归一化 + tool 漏层级前缀（create_incident → itops_create_incident）
     for r in routes:
-        if _norm(r.server) == sn and _norm(r.tool.rsplit(".", 1)[-1]) == tn:
+        if _norm(r.server) == sn and (tn in tail_forms(r) or tn_und in tail_forms(r)):
             return r
-    # 2b) 点号不敏感全等：data_list_dsn_refs ↔ data.list_dsn_refs（同 server 下命中）
-    for r in routes:
-        if _norm(r.server) == sn and _norm(r.tool).replace(".", "_") == tn_und:
-            return r
-    # 3) server 不可靠但 tool 全局唯一：按工具尾段全表找（多命中则放弃，避免歧义）
-    tail_matches = [r for r in routes if _norm(r.tool.rsplit(".", 1)[-1]) == tn]
-    if len(tail_matches) == 1:
+    # 3) server 不可靠但 tool 全局唯一：按全名/尾段形态全表找（多命中不同工具则放弃，避免歧义）
+    tail_matches = [r for r in routes
+                    if tool in full_forms(r) or tn in full_forms(r) or tn_und in full_forms(r)
+                    or tn in tail_forms(r) or tn_und in tail_forms(r)]
+    uniq = {r.tool for r in tail_matches}
+    if len(uniq) == 1:
         return tail_matches[0]
     return None
 
@@ -200,8 +217,8 @@ def gateway_call(
     参数要求：
     - server: 下游服务名，取值必须是 list_routes 结果中的 server 字段
     - tool:   工具名，必须与 list_routes 结果中的 tool 字段一字不差
-      （例：建 IT 工单是 server="it_ops", tool="create_incident"；
-        不存在 create_ticket 这种名字，勿凭猜测调用）
+      （例：建 IT 工单是 server="it_ops", tool="itops_create_incident"；
+        不存在 create_ticket 这种名字，勿凭猜测调用；工具名一律下划线前缀、不含点号）
     - arguments: 目标工具的入参对象，如 {"title": "打印机故障", "priority": "high"}；
       无入参的工具传 {} 或省略。也兼容 JSON 字符串形式（"{...}"），平台传输把对象
       转成字符串也不会失败
@@ -215,7 +232,7 @@ def gateway_call(
       {"server": "common-tools", "tool": "now", "arguments": {"timezone_name": "Asia/Shanghai"}}
 
     示例——Go 数据源清单（无入参）：
-      {"server": "go_datahub", "tool": "data.list_dsn_refs", "arguments": {}}
+      {"server": "go_datahub", "tool": "data_list_dsn_refs", "arguments": {}}
 
     返回结构：
     - 免审批:   {"approved": true, "executed": true, "result": <下游返回值>}
@@ -282,8 +299,8 @@ def gateway_call_kv(
         params="dsn_ref=orcl_erp;sql=SELECT 1 FROM dual"
         params="timezone_name=Asia/Shanghai"
       无入参的工具留空 ""。
-    - 限制：入参本身是对象/数组的工具（data.submit_collect_job 的 params、
-      data.batch_import 的 rows、query_dataset 的 filters）请改用 gateway_call。
+    - 限制：入参本身是对象/数组的工具（data_submit_collect_job 的 params、
+      data_batch_import 的 rows、data_query_dataset 的 filters）请改用 gateway_call。
 
     返回结构与 gateway_call 相同（需审批时返回 request_id 且操作尚未执行）。
     """

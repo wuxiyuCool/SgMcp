@@ -1,11 +1,11 @@
 """【中层·IT运维】IT 运维系统 MCP server（试点，业务层 Python）。
 
 架构约定（见 docs/architecture.md「三层工具粒度体系」）：
-- 第 1 层·领域工具（粗粒度，AI 优先用）：本域常用操作，统一 ``itops.`` 领域前缀
+- 第 1 层·领域工具（粗粒度，AI 优先用）：本域常用操作，统一 ``itops_`` 领域前缀
   （制造域将来为 ``mfg.*`` 等），经上层网关聚合，AI 只连网关。
-- 第 2 层·领域通用查询（中粒度）：``itops.query_dataset``——dataset_id 用 Literal
+- 第 2 层·领域通用查询（中粒度）：``itops_query_dataset``——dataset_id 用 Literal
   枚举限定**本域数据集**（带中文说明）；领域通用工具查不到的不常用数据集由此查询，
-  配套 ``itops.list_data_tables`` 发现数据表。
+  配套 ``itops_list_data_tables`` 发现数据表。
 - 第 3 层·全局数据平台（细粒度，Go MCP）：``data.query_dataset``（全量数据集枚举）、
   ``data.list_datasets``、``data.batch_process`` 批量处理——越域数据引导去第 3 层。
 - 重活层 Go server 是**双端点**设计：``/mcp`` 给网关聚合暴露给 AI；
@@ -70,11 +70,11 @@ def _call_heavy_internal(path: str, json_body: dict[str, Any] | None = None,
 
 
 # ---------------------------------------------------------------------------
-# IT 运维业务工具（对 AI 暴露，itops.* 前缀）
+# IT 运维业务工具（对 AI 暴露，itops_* 前缀）
 # 事件单支持三种落地通道：local=本地 SQLite 持久化（零外部依赖）；sql=经业务名路由写入
 # 数据库（内部直调重活层 batch/import|query）；api=调外部 ITSM 系统 REST API。
 # ---------------------------------------------------------------------------
-@mcp.tool(name="itops.create_incident")
+@mcp.tool(name="itops_create_incident")
 def create_incident(title: str, priority: str = "medium", reporter: str = "agent",
                     channel: str = "local", tenant_id: str = "default") -> dict[str, Any]:
     """创建一条 IT 运维工单，返回含 id 的工单对象。
@@ -90,7 +90,7 @@ def create_incident(title: str, priority: str = "medium", reporter: str = "agent
     - tenant_id: 租户标识，默认 default（仅 sql 通道参与路由）
 
     返回示例：{"id": "INC-0205B08E", "title": ..., "status": "new", "priority": ...}
-    后续用返回的 id 调 itops.update_incident_status 流转状态。
+    后续用返回的 id 调 itops_update_incident_status 流转状态。
     """
     if priority not in {"low", "medium", "high", "critical"}:
         raise ValueError(f"非法优先级: {priority}")
@@ -109,7 +109,7 @@ def create_incident(title: str, priority: str = "medium", reporter: str = "agent
     raise ValueError(f"channel 只支持 local/sql/api: {channel!r}")
 
 
-@mcp.tool(name="itops.list_incidents")
+@mcp.tool(name="itops_list_incidents")
 def list_incidents(status: str | None = None, channel: str = "local",
                    tenant_id: str = "default", limit: int = 100) -> list[dict[str, Any]]:
     """查询工单列表，可按状态过滤（new/open/in_progress/resolved/closed）。
@@ -176,13 +176,13 @@ def _call_external_itsm(method: str, path: str, json_body: dict[str, Any] | None
         raise ToolError(f"外部 ITSM API 返回非 JSON 响应: {resp.text[:200]}") from e
 
 
-@mcp.tool(name="itops.update_incident_status")
+@mcp.tool(name="itops_update_incident_status")
 def update_incident_status(incident_id: str, status: str) -> dict[str, Any]:
     """流转工单状态，返回更新后的完整工单对象。
 
     参数：
     - incident_id: 必须是 create_incident 返回的真实 id（形如 "INC-0205B08E"）。
-      勿凭空编造；不确定时先用 itops.list_incidents 查现有工单（数据持久化，历史 ID 依然有效）
+      勿凭空编造；不确定时先用 itops_list_incidents 查现有工单（数据持久化，历史 ID 依然有效）
     - status: 枚举 new/open/in_progress/resolved/closed
 
     工单不存在时返回可读错误"工单不存在: xxx"。
@@ -193,7 +193,7 @@ def update_incident_status(incident_id: str, status: str) -> dict[str, Any]:
     return rec
 
 
-@mcp.tool(name="itops.create_change")
+@mcp.tool(name="itops_create_change")
 def create_change(title: str, change_type: str = "standard", implementer: str = "ops", risk: str = "low") -> dict[str, Any]:
     """创建变更单，返回含 id（形如 "CHG-4B36C912"）的对象。
 
@@ -208,7 +208,7 @@ def create_change(title: str, change_type: str = "standard", implementer: str = 
     return rec
 
 
-@mcp.tool(name="itops.get_change")
+@mcp.tool(name="itops_get_change")
 def get_change(change_id: str) -> dict[str, Any]:
     """查询变更单详情。"""
     rec = store.get_change(change_id)
@@ -217,7 +217,7 @@ def get_change(change_id: str) -> dict[str, Any]:
     return rec
 
 
-@mcp.tool(name="itops.register_asset")
+@mcp.tool(name="itops_register_asset")
 def register_asset(name: str, asset_type: str, owner: str) -> dict[str, Any]:
     """登记一台 IT 资产（录入 CMDB），返回含 id（形如 "AST-5C332490"）的对象。
 
@@ -227,7 +227,7 @@ def register_asset(name: str, asset_type: str, owner: str) -> dict[str, Any]:
     return store.create_asset(name=name, asset_type=asset_type, owner=owner)
 
 
-@mcp.tool(name="itops.list_assets")
+@mcp.tool(name="itops_list_assets")
 def list_assets(asset_type: str | None = None) -> list[dict[str, Any]]:
     """查询资产清单（对象数组）。asset_type 可选过滤：laptop/server/network/software，
     留空或传 null 返回全部。"""
@@ -237,13 +237,13 @@ def list_assets(asset_type: str | None = None) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # 内部调用示例：业务层经内部 REST 直调 Go 重活的库表能力
 # ---------------------------------------------------------------------------
-@mcp.tool(name="itops.export_assets_to_warehouse")
+@mcp.tool(name="itops_export_assets_to_warehouse")
 def export_assets_to_warehouse(dsn_ref: str, table: str = "cmdb_assets", asset_type: str | None = None) -> dict[str, Any]:
     """把 CMDB 资产批量归档到数据仓库（大批量写库属重活，内部直调 go_datahub
     的 /internal/v1/batch/import，不经网关、不暴露给 AI）。
 
     dsn_ref 为重活层 config/datahub.env 里登记的 DSN 引用名（如 warehouse_pg），
-    可用 heavy.list_dsn_refs 查看；table 需已存在（可用 heavy.list_tables 确认）。
+    可用 data_list_dsn_refs 查看；table 需已存在（可用 data_list_tables 确认）。
     """
     rows = store.list_assets(asset_type=asset_type)
     if not rows:
@@ -257,7 +257,7 @@ def export_assets_to_warehouse(dsn_ref: str, table: str = "cmdb_assets", asset_t
     return {"ok": True, "exported": result.get("imported", len(rows))}
 
 
-@mcp.tool(name="itops.query_warehouse_assets")
+@mcp.tool(name="itops_query_warehouse_assets")
 def query_warehouse_assets(dsn_ref: str, table: str = "cmdb_assets", asset_type: str | None = None, limit: int = 100) -> dict[str, Any]:
     """查询已归档到数据仓库的资产（内部直调 go_datahub 的
     /internal/v1/batch/query，等值过滤 + 行数上限，防全表拖库）。
@@ -276,14 +276,14 @@ def query_warehouse_assets(dsn_ref: str, table: str = "cmdb_assets", asset_type:
 
 
 # ---------------------------------------------------------------------------
-# 批处理示例（Python 侧实现，与 Go 侧 heavy.batch_process 同一套业务名路由约定）：
+# 批处理示例（Python 侧实现，与 Go 侧 data_batch_process 同一套业务名路由约定）：
 # 业务 Python 负责轻编排（路由解析 + 任务登记），重活下放重活层内部 REST 执行
 # ---------------------------------------------------------------------------
-@mcp.tool(name="itops.batch_process")
+@mcp.tool(name="itops_batch_process")
 def batch_process(dataset_id: str, period: str, tenant_id: str, mode: str = "simulate") -> dict[str, Any]:
     """按业务数据集名批量处理数据（Python 侧路由实现）。
 
-    与 heavy.batch_process 共用同一套 env 路由约定（DATASET_*）：本工具在业务层
+    与 data_batch_process 共用同一套 env 路由约定（DATASET_*）：本工具在业务层
     完成业务名 → 租户数据源 / 按月分表的路由解析；mode=simulate 本地演练完成，
     mode=real 经内部 REST 直调重活层 /internal/v1/batch/process 真实执行
     （重活下放，不经网关、不暴露给 AI）。
@@ -311,7 +311,7 @@ def batch_process(dataset_id: str, period: str, tenant_id: str, mode: str = "sim
     raise ValueError(f"mode 只支持 simulate/real: {mode!r}")
 
 
-@mcp.tool(name="itops.list_datasets")
+@mcp.tool(name="itops_list_datasets")
 def business_list_datasets() -> dict[str, Any]:
     """列出已配置的业务数据集及其路由规则（租户 → dsn_ref、按月分表）。
 
@@ -324,11 +324,11 @@ def business_list_datasets() -> dict[str, Any]:
 # 第 2 层·领域通用查询（中粒度）：本域数据集枚举限定 + 配套表发现
 # ---------------------------------------------------------------------------
 # it_ops 域的数据集枚举（新增本域数据集时在此登记 + 配 DATASET_<NAME>_* 路由）。
-# 中文说明写在 Literal 描述里；更细的发现用 itops.list_data_tables。
+# 中文说明写在 Literal 描述里；更细的发现用 itops_list_data_tables。
 ITOPS_DOMAIN = "itops"
 
 
-@mcp.tool(name="itops.query_dataset")
+@mcp.tool(name="itops_query_dataset")
 def query_dataset(
     dataset_id: Literal["incidents", "assets"],
     tenant_id: str = "default",
@@ -356,10 +356,10 @@ def query_dataset(
     }
 
 
-@mcp.tool(name="itops.list_data_tables")
+@mcp.tool(name="itops_list_data_tables")
 def list_data_tables(dataset_id: Literal["incidents", "assets"], tenant_id: str = "default") -> dict[str, Any]:
     """列出一个本域数据集路由库中的数据表（查询前的发现入口：先看表存在、再用
-    itops.query_dataset 查询；越域数据集用 data.list_datasets / data.query_dataset）。
+    itops_query_dataset 查询；越域数据集用 data.list_datasets / data.query_dataset）。
     """
     _guard_domain(dataset_id)
     db_type, dsn_ref = route_db(dataset_id, tenant_id)
