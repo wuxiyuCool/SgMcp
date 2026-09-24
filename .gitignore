@@ -26,6 +26,8 @@ run/
 
 # Go 构建产物
 layers/business/go_datahub/bin/
+# 例外：dist/ 入库发布 Linux 二进制，供服务器 git pull 直接更新
+!layers/business/go_datahub/dist/
 
 # 敏感配置统一入口（真实 .env 不进库，只保留 .example 模板）
 **/config/*.env
