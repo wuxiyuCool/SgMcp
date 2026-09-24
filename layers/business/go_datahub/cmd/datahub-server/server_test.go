@@ -100,7 +100,7 @@ func TestListSources(t *testing.T) {
 func TestHallucinatedExtraArgTolerated(t *testing.T) {
 	sess := connectInMemory(t)
 	res, err := sess.CallTool(context.Background(), &mcp.CallToolParams{
-		Name: "data_list_sources",
+		Name:      "data_list_sources",
 		Arguments: map[string]any{"action": "list", "junk": map[string]any{"x": 1}},
 	})
 	if err != nil {
@@ -108,6 +108,28 @@ func TestHallucinatedExtraArgTolerated(t *testing.T) {
 	}
 	if res.IsError {
 		t.Fatalf("幻觉多余字段应被忽略而非拒绝: %v", res.Content)
+	}
+}
+
+// AI 可见 schema 必须隐藏 dsn（防幻觉拼接残缺连接串），只留 dsn_ref。
+func TestDSNHiddenFromAISchema(t *testing.T) {
+	sess := connectInMemory(t)
+	res, err := sess.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range res.Tools {
+		switch tool.Name {
+		case "data_db_ping", "data_list_tables", "data_batch_import", "data_batch_query", "data_db_query_preview":
+			schema, _ := tool.InputSchema.(map[string]any)
+			props, _ := schema["properties"].(map[string]any)
+			if _, bad := props["dsn"]; bad {
+				t.Errorf("%s schema 不应暴露 dsn 字段", tool.Name)
+			}
+			if _, ok := props["dsn_ref"]; !ok {
+				t.Errorf("%s schema 应含 dsn_ref 字段", tool.Name)
+			}
+		}
 	}
 }
 

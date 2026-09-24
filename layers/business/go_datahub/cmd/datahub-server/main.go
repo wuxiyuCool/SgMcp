@@ -255,6 +255,17 @@ func toolInput[T any]() map[string]any {
 	return m
 }
 
+// toolInputDB 在 toolInput 基础上从 schema 中摘除 dsn 字段：
+// AI 可见入参只保留 dsn_ref——模型幻觉拼接残缺连接串（如漏端口）是失败高发区，
+// 值参数本身仍保留在 Go 结构体中，供内部 REST/受信调用直传。
+func toolInputDB[T any]() map[string]any {
+	m := toolInput[T]()
+	if props, ok := m["properties"].(map[string]any); ok {
+		delete(props, "dsn")
+	}
+	return m
+}
+
 func buildServer() (*mcp.Server, *http.ServeMux) {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "go-datahub",
@@ -342,11 +353,11 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "data_db_ping",
-		Description: fmt.Sprintf("数据库连通性探测并返回版本。参数：dsn_ref=数据源名（推荐，见 data_list_dsn_refs）或 dsn=裸连接串；"+
+		Description: fmt.Sprintf("数据库连通性探测并返回版本。参数：dsn_ref=数据源名（必填，见 data_list_dsn_refs；出于安全不开放直传连接串）；"+
 			"db_type 可省略（自动按连接串推断，可选 %v）。返回：{ok, version, latency_ms} 或 {ok:false, error=脱敏后的失败原因}。"+
 			"操作数据源前建议先 ping 确认连通。只读。", dbhub.Kinds()),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
-		InputSchema: toolInput[DBTargetIn](),
+		InputSchema: toolInputDB[DBTargetIn](),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in DBTargetIn) (*mcp.CallToolResult, dbPingOut, error) {
 		kind, dsn, err := resolveTarget(in)
 		if err != nil {
@@ -374,7 +385,7 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 		Name:        "data_list_tables",
 		Description: "列出目标库中的用户表（排除系统 schema）。库操作前先用本工具确认目标表存在。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
-		InputSchema: toolInput[DBTargetIn](),
+		InputSchema: toolInputDB[DBTargetIn](),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in DBTargetIn) (*mcp.CallToolResult, listTablesOut, error) {
 		kind, dsn, err := resolveTarget(in)
 		if err != nil {
@@ -390,7 +401,7 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "data_batch_import",
 		Description: "事务批量写入目标表：行数组（键即列名），列名白名单校验、值全部参数绑定；返回实际写入行数。单次上限 50000 行。",
-		InputSchema: toolInput[batchImportIn](),
+		InputSchema: toolInputDB[batchImportIn](),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in batchImportIn) (*mcp.CallToolResult, batchImportOut, error) {
 		kind, dsn, err := resolveTarget(in.DBTargetIn)
 		if err != nil {
@@ -411,7 +422,7 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 		Name:        "data_batch_query",
 		Description: "条件查询目标表（等值过滤 + 行数上限，防全表拖库）：列名白名单、值参数绑定。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
-		InputSchema: toolInput[batchQueryIn](),
+		InputSchema: toolInputDB[batchQueryIn](),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in batchQueryIn) (*mcp.CallToolResult, batchQueryOut, error) {
 		kind, dsn, err := resolveTarget(in.DBTargetIn)
 		if err != nil {
@@ -431,7 +442,7 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 		Name:        "data_db_query_preview",
 		Description: "同步小查询：对数据源执行任意单条 SELECT（含 JOIN/聚合）并直接返回行数据（默认 50 行，上限 500）。单表条件查询优先 data_batch_query；大批量搬运用 data_submit_collect_job。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
-		InputSchema: toolInput[dbQueryPreviewIn](),
+		InputSchema: toolInputDB[dbQueryPreviewIn](),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in dbQueryPreviewIn) (*mcp.CallToolResult, dbQueryPreviewOut, error) {
 		limit := in.Limit
 		if limit <= 0 {
