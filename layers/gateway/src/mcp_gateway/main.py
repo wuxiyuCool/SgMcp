@@ -208,6 +208,87 @@ def list_downstreams() -> list[dict[str, Any]]:
     return aggregator.downstream_status()
 
 
+_TYPE_PLACEHOLDER: dict[str, Any] = {"integer": 1, "number": 1.5, "boolean": True, "string": "示例值"}
+
+
+def _schema_params(r: ToolRoute) -> dict[str, Any]:
+    """入参 schema 摘要：每个参数的类型/必填/一行描述。"""
+    schema = r.input_schema or {}
+    props = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+    out: dict[str, Any] = {}
+    for k, p in props.items():
+        ptype = p.get("type") if isinstance(p, dict) else None
+        if isinstance(ptype, list):
+            ptype = "/".join(ptype)
+        desc = ((p.get("description") if isinstance(p, dict) else "") or "").strip().splitlines()
+        out[k] = {
+            "type": ptype or "any",
+            "required": k in required,
+            "desc": desc[0][:120] if desc else "",
+        }
+    return out
+
+
+@mcp.tool()
+def list_tool_catalog() -> list[dict[str, Any]]:
+    """全平台工具目录（调用视角说明书）：每个工具在哪个下游 MCP server、如何从上层网关传递调用下来。
+
+    调用链：AI 客户端 → 本网关（顶层统一入口）选 route_* 域路由工具或 gateway_call
+    → 网关按路由表经 Streamable HTTP 转发 → 工具所在下游 MCP server（见各组 endpoint）
+    → 下游执行工具并原路返回。
+
+    返回按 MCP server 分组，每组含：
+    - mcp_server / endpoint：工具所在的下游 MCP 服务名与其 MCP 地址（网关转发目标）
+    - route_tool：该域对上暴露的聚合路由工具名（method 传组内工具名即可调用）
+    - call_chain：一条调用的完整传递路径描述
+    - tools[]：逐工具 {tool, in_mcp=所在MCP, summary, params(类型/必填/说明),
+      requires_approval, example=可直接套用的 route 调用入参}
+
+    想知道"某个工具是谁提供的、参数含义、该走哪个入口"时调本工具，比 list_routes 更可读。
+    """
+    by_server: dict[str, list[ToolRoute]] = {}
+    for r in router.routes:
+        by_server.setdefault(r.server, []).append(r)
+
+    catalog: list[dict[str, Any]] = []
+    for server, routes in sorted(by_server.items()):
+        endpoint = next((r.endpoint for r in routes if r.endpoint), None)
+        route_tool = _route_tool_name(server)
+        tools = []
+        for r in sorted(routes, key=lambda x: x.tool):
+            params = _schema_params(r)
+            required_names = [k for k, v in params.items() if v["required"]]
+            if params and all(v["type"] in _TYPE_PLACEHOLDER for v in params.values()):
+                example_params = {k: _TYPE_PLACEHOLDER[v["type"]] for k, v in params.items()}
+            elif params:
+                # 含对象/数组等复杂参数：kv 摆不平，给最小示例并注明完整形态走 gateway_call
+                example_params = {k: "<见params>" for k in params}
+            else:
+                example_params = {}
+            tools.append({
+                "tool": r.tool,
+                "in_mcp": server,
+                "summary": r.summary,
+                "params": params,
+                "required": required_names,
+                "requires_approval": r.requires_approval,
+                "example": {"method": r.tool, "params": example_params},
+            })
+        catalog.append({
+            "mcp_server": server,
+            "endpoint": endpoint,
+            "route_tool": route_tool,
+            "call_chain": (
+                f"AI→网关(:9000)→{route_tool}(method=工具名, params=入参)"
+                f"→Streamable HTTP 转发→{server}({endpoint})→执行并原路返回"
+            ),
+            "tool_count": len(routes),
+            "tools": tools,
+        })
+    return catalog
+
+
 @mcp.tool()
 def refresh_routes() -> dict[str, Any]:
     """重新连接各下游 server 拉取 tools/list，刷新网关路由表并重建 route_* 聚合路由工具。

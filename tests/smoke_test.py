@@ -241,6 +241,25 @@ def test_gateway_aggregation_flow() -> None:
                 assert r.is_error and "no_such" in str(r.content)
                 print("PASS  网关·route_* 聚合路由工具（枚举一致+kv 入参+审批闸门+错误引导）")
 
+                # 4f) list_tool_catalog：全目录（工具在哪个 MCP + 上层如何传递调用）
+                r = await client.call_tool("list_tool_catalog", {})
+                groups = _payload(r)
+                groups = groups["result"] if isinstance(groups, dict) and set(groups) == {"result"} else groups
+                gmap = {g["mcp_server"]: g for g in groups}
+                assert set(gmap) == {"it_ops", "common-tools"}, gmap.keys()
+                for srv, g in gmap.items():
+                    assert g["endpoint"] and g["route_tool"] in gw_tools, f"{srv} 目录组缺 endpoint/route_tool"
+                    assert {t["tool"] for t in g["tools"]} == (
+                        await _list_tools(itops.mcp) if srv == "it_ops" else await _list_tools(common.mcp)
+                    ), f"{srv} 目录与下游工具表不一致"
+                    assert "Streamable HTTP 转发" in g["call_chain"]
+                    for t in g["tools"]:
+                        assert t["in_mcp"] == srv and "method" in t["example"], t
+                echo_entry = next(t for t in gmap["common-tools"]["tools"] if t["tool"] == "echo")
+                assert echo_entry["params"]["message"]["required"] is True
+                assert echo_entry["params"]["uppercase"]["type"] == "boolean"
+                print("PASS  网关·list_tool_catalog（MCP 归属 + 调用链 + 参数说明书）")
+
                 # 5) 无需审批的写工具：经 HTTP 转发执行到 it_ops
                 r = await client.call_tool(
                     "gateway_call",

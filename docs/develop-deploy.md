@@ -134,6 +134,7 @@ mcp.AddTool(server, &mcp.Tool{
 | `route_it_ops` / `route_common_tools` / `route_go_datahub` | **日常调用主入口**：一个下游域一个路由工具。`method` 参数是枚举（自动列出该域全部可调用方法），`params` 传该方法入参（对象 / JSON 字符串 / 扁平 `k=v;k2=v2` 串均可）。工具描述逐方法标注 `参数(*必填)` 与 `【需审批】` |
 | `gateway_call` | 跨域通用入口（server+tool+arguments；arguments 同支持三形态，原 `gateway_call_kv` 已并入） |
 | `list_routes` | 全量路由明细（server/tool/入参 schema/审批标记） |
+| `list_tool_catalog` | 工具目录说明书：按 MCP server 分组，逐工具标注所在下游（in_mcp/endpoint）、参数类型与必填、`route_*` 可直接套用的调用示例，及「AI→网关→route_*→HTTP 转发→下游」的完整传递链 |
 | `refresh_routes` / `list_downstreams` | 运行时补拉工具表并**重建 route_* 枚举** / 诊断下游清单 |
 | `list_pending_approvals` / `approve_request` / `reject_request` | HITL 审批三件套 |
 
