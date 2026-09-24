@@ -163,6 +163,21 @@ def test_gateway_aggregation_flow() -> None:
                 assert d["executed"] is True and d["result"] == "str-args", d
                 print("PASS  网关·arguments 兼容 JSON 字符串形式")
 
+                # 4c) 路由宽容解析：脏 server（大小写/连字符）与漏层级前缀的 tool 都能救回
+                r = await client.call_tool(
+                    "gateway_call",
+                    {"server": "Common-Tools", "tool": "echo", "arguments": {"message": "sloppy"}},
+                )
+                assert _payload(r)["result"] == "sloppy"
+                r = await client.call_tool(
+                    "gateway_call",
+                    {"server": "it_ops", "tool": "create_incident",
+                     "arguments": {"title": "漏前缀容错"}},
+                )
+                d = _payload(r)
+                assert d["executed"] is True and "INC-" in str(d["result"]), d
+                print("PASS  网关·server/tool 宽容解析（归一化+补层级前缀）")
+
                 # 5) 无需审批的写工具：经 HTTP 转发执行到 it_ops
                 r = await client.call_tool(
                     "gateway_call",

@@ -29,7 +29,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from mcp_gateway.aggregator import Aggregator
 from mcp_gateway.approvals import gate
-from mcp_gateway.routing import Router
+from mcp_gateway.routing import Router, ToolRoute
 from mcp_shared.approval import ApprovalAction
 from mcp_shared.config import load_platform_env
 
@@ -65,6 +65,38 @@ def _coerce_args(arguments: dict[str, Any] | str | None) -> dict[str, Any]:
             raise ToolError(f"arguments 解析后应为对象，实为 {type(parsed).__name__}")
         return parsed
     raise ToolError(f"arguments 类型不支持: {type(arguments).__name__}")
+
+
+def _norm(s: str) -> str:
+    return s.strip().lower().replace("-", "_")
+
+
+def _resolve_route(server: str, tool: str) -> ToolRoute | None:
+    """路由宽容解析：精确匹配优先，其次归一化大小写/连字符、补/剥工具层级前缀。
+
+    AI 平台常见错法（均应被救回而非报错重试）：
+    - server 写成 "go-datahub"/"GO_DATAHUB" → 归一化匹配
+    - tool 漏层级前缀："create_incident" → itops.create_incident；"list_dsn_refs" → data.list_dsn_refs
+    - tool 写成完整 "server.tool" 或带别的 server 前缀 → 按工具名全表定位
+    """
+    route = router.resolve(server, tool)
+    if route is not None:
+        return route
+    routes = router.routes
+    sn, tn = _norm(server), _norm(tool)
+    # 1) server 归一化 + tool 精确
+    for r in routes:
+        if _norm(r.server) == sn and r.tool == tool:
+            return r
+    # 2) server 归一化 + tool 补层级前缀（r.tool 形如 "itops.create_incident"，尾段相等即命中）
+    for r in routes:
+        if _norm(r.server) == sn and _norm(r.tool.rsplit(".", 1)[-1]) == tn:
+            return r
+    # 3) server 不可靠但 tool 全局唯一：按工具尾段全表找（多命中则放弃，避免歧义）
+    tail_matches = [r for r in routes if _norm(r.tool.rsplit(".", 1)[-1]) == tn]
+    if len(tail_matches) == 1:
+        return tail_matches[0]
+    return None
 
 
 @mcp.tool()
@@ -184,7 +216,7 @@ def gateway_call(
     推荐流程：不确定时先 list_routes 查工具与入参 schema，再发起本调用。
     """
     args_obj = _coerce_args(arguments)
-    route = router.resolve(server, tool)
+    route = _resolve_route(server, tool)
     if route is None:
         same_server = sorted(r.tool for r in router.routes if r.server == server)
         if same_server:
@@ -197,12 +229,12 @@ def gateway_call(
         raise ToolError(f"未注册的路由: {server}.{tool}。{hint}")
 
     if not route.requires_approval:
-        result = router.execute(server, tool, args_obj)
+        result = router.execute(route.server, route.tool, args_obj)
         return {"approved": True, "executed": True, "result": result}
 
     req = gate.request(
-        source_server=server,
-        tool_name=tool,
+        source_server=route.server,   # 存规范名（宽容解析可能救回了脏 server/tool 写法）
+        tool_name=route.tool,
         tool_args=args_obj,
         requested_by=requested_by,
         title=route.summary,
