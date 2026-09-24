@@ -183,23 +183,23 @@ def test_gateway_aggregation_flow() -> None:
                 assert d["executed"] is True and "INC-" in str(d["result"]), d
                 print("PASS  网关·server/tool 宽容解析（归一化+补层级前缀）")
 
-                # 4d) 扁平参数入口 gateway_call_kv：无嵌套 JSON，值类型推断
+                # 4d) 入口精简：gateway_call 直接吃扁平 kv 串（原 gateway_call_kv 已并入）
                 r = await client.call_tool(
-                    "gateway_call_kv",
-                    {"server": "common-tools", "tool": "echo", "params": "message=kv-args;uppercase=true"},
+                    "gateway_call",
+                    {"server": "common-tools", "tool": "echo", "arguments": "message=kv-args;uppercase=true"},
                 )
                 d = _payload(r)
                 assert d["executed"] is True and d["result"] == "KV-ARGS", d
                 r = await client.call_tool(
-                    "gateway_call_kv",
-                    {"server": "it_ops", "tool": "create_incident", "params": "title=kv入口工单;priority=high"},
+                    "gateway_call",
+                    {"server": "it_ops", "tool": "create_incident", "arguments": "title=kv入口工单;priority=high"},
                 )
                 d = _payload(r)
                 assert d["executed"] is True and "INC-" in str(d["result"]), d
                 # 下划线别名（规避平台对参数值中 "." 的序列化缺陷）：itops_create_incident
                 r = await client.call_tool(
-                    "gateway_call_kv",
-                    {"server": "it_ops", "tool": "itops_create_incident", "params": "title=别名调用"},
+                    "gateway_call",
+                    {"server": "it_ops", "tool": "itops_create_incident", "arguments": "title=别名调用"},
                 )
                 d = _payload(r)
                 assert d["executed"] is True and "INC-" in str(d["result"]), d
@@ -210,7 +210,36 @@ def test_gateway_aggregation_flow() -> None:
                 assert all("." not in x["tool"] for x in items), [x["tool"] for x in items if "." in x["tool"]]
                 assert all(x["tool_alias"] == x["tool"] for x in items)
                 assert any(x["tool"].startswith("itops_") for x in items)
-                print("PASS  网关·gateway_call_kv 扁平入口 + tool_alias 下划线别名")
+                print("PASS  网关·gateway_call 统一入口（对象/JSON/扁平 kv 三形态）+ 别名")
+
+                # 4e) 聚合路由工具 route_*：每 server 一个入口，method 枚举 == 该 server 全部工具
+                r = await client.list_tools()
+                gw_tools = {t.name: t for t in r.tools}
+                assert "gateway_call_kv" not in gw_tools, "重复入口 gateway_call_kv 应已摘除"
+                route_names = {n for n in gw_tools if n.startswith("route_")}
+                assert route_names == {"route_it_ops", "route_common_tools"}, route_names
+                itops_tools = await _list_tools(itops.mcp)
+                enum_itops = set(gw_tools["route_it_ops"].input_schema["properties"]["method"]["enum"])
+                assert enum_itops == itops_tools, f"枚举与下游不一致: {enum_itops ^ itops_tools}"
+                assert "itops_create_change" in gw_tools["route_it_ops"].description, "描述须列出审批方法"
+                # 经 route 工具直接调用（kv 扁平串入参）
+                r = await client.call_tool(
+                    "route_common_tools", {"method": "echo", "params": "message=route-fn;uppercase=true"}
+                )
+                d = _payload(r)
+                assert d["executed"] is True and d["result"] == "ROUTE-FN", d
+                # 经 route 工具触发审批闸门
+                r = await client.call_tool(
+                    "route_it_ops", {"method": "itops_create_change", "params": {"title": "route审批", "risk": "high"}}
+                )
+                d = _payload(r)
+                assert d["approved"] is False and d["executed"] is False and d["request_id"].startswith("apr_"), d
+                r = await client.call_tool("reject_request", {"request_id": d["request_id"]})
+                assert _payload(r)["executed"] is False
+                # 非法 method：可读错误并列出枚举
+                r = await client.call_tool("route_common_tools", {"method": "no_such", "params": {}})
+                assert r.is_error and "no_such" in str(r.content)
+                print("PASS  网关·route_* 聚合路由工具（枚举一致+kv 入参+审批闸门+错误引导）")
 
                 # 5) 无需审批的写工具：经 HTTP 转发执行到 it_ops
                 r = await client.call_tool(

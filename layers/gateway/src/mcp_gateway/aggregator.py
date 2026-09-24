@@ -26,6 +26,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 from mcp_gateway.routing import Router, ToolRoute
 
@@ -104,11 +105,16 @@ def downstream_specs_from_env() -> list[DownstreamSpec]:
 
 
 class Aggregator:
-    """维护「连接下游 → 拉取 tools/list → 合并进路由表」的聚合器。"""
+    """维护「连接下游 → 拉取 tools/list → 合并进路由表」的聚合器。
+
+    `on_sync` 回调在每轮 sync 结束后调用（无论成败），供网关重建对 AI 暴露的
+    聚合路由工具（route_*）——工具枚举与描述必须跟随最新路由表。
+    """
 
     def __init__(self, router: Router, specs: list[DownstreamSpec] | None = None) -> None:
         self.router = router
         self.specs = specs if specs is not None else downstream_specs_from_env()
+        self.on_sync: Callable[[], None] | None = None
 
     # ---- 发现 ----
     async def _list_downstream(self, spec: DownstreamSpec) -> list:
@@ -167,6 +173,11 @@ class Aggregator:
                 "重试窗口耗尽，未聚合的下游: %s（网关继续启动，可稍后调用 refresh_routes 补拉）",
                 ", ".join(s.name for s in pending),
             )
+        if self.on_sync is not None:
+            try:
+                self.on_sync()
+            except Exception:  # noqa: BLE001 — 回调失败不影响聚合结果
+                logger.exception("on_sync 回调失败（route_* 工具可能未刷新）")
         return report
 
     # ---- 合并 ----

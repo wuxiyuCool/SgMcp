@@ -81,6 +81,11 @@ def suite_check(gw: str, itops: str, common: str, godh: str | None) -> None:
         names = client.list_tools(gw)
         assert "gateway_call" in names, f"网关缺少统一入口工具，实为 {names}"
         assert "list_routes" in names, f"网关缺少工具发现入口 list_routes，实为 {names}"
+        assert "gateway_call_kv" not in names, "重复入口 gateway_call_kv 应已并入 gateway_call"
+        # 聚合暴露模型：每 server 一个 route_* 工具（method 枚举），不逐个展示下游工具
+        routes = {n for n in names if n.startswith("route_")}
+        assert {"route_it_ops", "route_common_tools"} <= routes, f"缺少聚合路由工具: {routes}"
+        assert not (set(names) & set(client.list_tools(itops))), "下游工具不应逐个出现在网关 tools/list"
         return f"{len(names)} 个工具: {', '.join(sorted(names))}"
 
     def itops_tools():

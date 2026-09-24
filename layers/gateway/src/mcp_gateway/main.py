@@ -3,8 +3,10 @@
 上层是全平台的统一入口，职责：
 1. **统一入口** —— AI 客户端只需连接网关，其余 server 对客户端完全透明。
 2. **聚合器** —— 启动时作为 MCP Client 连接各下游 server（中层 it_ops / go_datahub、
-   下层 common 等，见 aggregator.py），拉取 tools/list 合并成本地工具表；
-   下游清单由 MCP_DOWNSTREAMS 等环境变量配置，网关不硬编码任何业务工具。
+   下层 common 等，见 aggregator.py），拉取 tools/list 合并成路由表；
+   对 AI 不逐个展示下游工具，而是每个 server 收敛为一个 route_* 聚合路由工具
+   （method 枚举列出全部可调用方法）。下游清单由 MCP_DOWNSTREAMS 等环境变量
+   配置，网关不硬编码任何业务工具。
 3. **审批闸门（HITL）** —— 对策略标记「需审批」的写操作，先建立审批单，
    审批通过后才转发下游执行；未批准则不执行。
 4. **路由转发** —— AI 调工具时按「server + 工具名」把调用经 Streamable HTTP
@@ -22,7 +24,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -50,20 +52,31 @@ aggregator = Aggregator(router)
 # 向 AI 客户端暴露的工具
 # ---------------------------------------------------------------------------
 def _coerce_args(arguments: dict[str, Any] | str | None) -> dict[str, Any]:
-    """入参宽容化：部分 AI 平台会把 arguments 序列化成 JSON 字符串传输，统一转回 dict。"""
+    """入参宽容化：统一把各种平台传输形态转成 dict。
+
+    接受：dict / None / JSON 字符串（"{...}"）/ 扁平 kv 字符串（"k=v;k2=v2"，
+    供序列化嵌套 JSON 困难的平台直接使用——原 gateway_call_kv 的能力已并入）。
+    """
     if arguments is None or arguments == "":
         return {}
     if isinstance(arguments, dict):
         return arguments
     if isinstance(arguments, str):
         import json
-        try:
-            parsed = json.loads(arguments)
-        except ValueError as e:
-            raise ToolError(f"arguments 不是合法 JSON：{e}；原始值: {arguments!r}") from e
-        if not isinstance(parsed, dict):
-            raise ToolError(f"arguments 解析后应为对象，实为 {type(parsed).__name__}")
-        return parsed
+        if arguments.lstrip().startswith("{"):
+            try:
+                parsed = json.loads(arguments)
+            except ValueError as e:
+                raise ToolError(f"arguments 不是合法 JSON：{e}；原始值: {arguments!r}") from e
+            if not isinstance(parsed, dict):
+                raise ToolError(f"arguments 解析后应为对象，实为 {type(parsed).__name__}")
+            return parsed
+        if "=" in arguments:
+            return _parse_kv_params(arguments)
+        raise ToolError(
+            f"arguments 是无法理解的字符串: {arguments!r}"
+            "（对象请传 JSON 字符串 {{\"k\": ...}} 或扁平串 k=v;k2=v2）"
+        )
     raise ToolError(f"arguments 类型不支持: {type(arguments).__name__}")
 
 
@@ -166,11 +179,12 @@ def reject_request(request_id: str, comment: str | None = None) -> dict[str, Any
 
 @mcp.tool()
 def list_routes() -> list[dict[str, Any]]:
-    """列出网关聚合到的全部下游工具（server / 工具名 / 描述 / 入参 schema / 是否需审批）。
+    """列出网关聚合到的全部下游工具明细（server / 工具名 / 描述 / 入参 schema / 是否需审批）。
 
     数据来自启动时（及最近一次 refresh_routes）从各下游 server 拉取的 tools/list。
-    调用 gateway_call 之前先用本工具确认真实存在的工具名与参数说明，
-    不要凭猜测直接调用（如创建 IT 工单的真实工具是 it_ops.create_incident）。
+    日常调用请优先用各域的 route_* 聚合路由工具（method 枚举即本清单的工具名）；
+    本工具用于查看入参 schema 细节与排查 gateway_call 的未注册路由报错，
+    不要凭猜测直接调用（如创建 IT 工单的真实工具是 itops_create_incident）。
 
     每条含 tool_alias 字段（点号换成下划线的别名，如 data_list_dsn_refs）——
     若你的平台对参数值中的 "." 序列化有问题，请一律改用 tool_alias。
@@ -196,7 +210,7 @@ def list_downstreams() -> list[dict[str, Any]]:
 
 @mcp.tool()
 def refresh_routes() -> dict[str, Any]:
-    """重新连接各下游 server 拉取 tools/list，刷新网关本地工具表。
+    """重新连接各下游 server 拉取 tools/list，刷新网关路由表并重建 route_* 聚合路由工具。
 
     适用场景：某个下游在网关启动后才上线、下游新增/删除了工具。
     返回本轮聚合结果（各 server 成功拉到的工具数 / 失败原因）。
@@ -212,24 +226,32 @@ def gateway_call(
     arguments: Any = None,
     requested_by: str = "agent",
 ) -> dict[str, Any]:
-    """统一入口：经网关调用任意已聚合的下游工具。
+    """统一入口（跨域通用）：经网关调用任意已聚合的下游工具。
+
+    同一 server 下有多个方法要调用时，**优先用该域的 route_* 路由工具**
+    （method 枚举直接列出全部方法，无需猜 server/tool 字符串），本工具作为
+    跨域或动态场景的通用入口保留。
 
     参数要求：
     - server: 下游服务名，取值必须是 list_routes 结果中的 server 字段
     - tool:   工具名，必须与 list_routes 结果中的 tool 字段一字不差
-      （例：建 IT 工单是 server="it_ops", tool="itops_create_incident"；
-        不存在 create_ticket 这种名字，勿凭猜测调用；工具名一律下划线前缀、不含点号）
-    - arguments: 目标工具的入参对象，如 {"title": "打印机故障", "priority": "high"}；
-      无入参的工具传 {} 或省略。也兼容 JSON 字符串形式（"{...}"），平台传输把对象
-      转成字符串也不会失败
+      （例："itops_create_incident"；不存在 create_ticket 这种名字，勿凭猜测调用；
+        工具名一律下划线前缀、不含点号）
+    - arguments: 目标工具的入参，三种形态均可（自动识别）：
+        ① 对象 {"title": "打印机故障", "priority": "high"}
+        ② JSON 字符串 "{\"title\": ...}"（部分平台会把对象转成字符串，同样可用）
+        ③ 扁平串 "title=打印机故障;priority=high"（序列化嵌套 JSON 困难的平台直接用；
+           值自动识别 int/float/bool；入参本身是对象/数组的字段——如
+           data_submit_collect_job 的 params、data_batch_import 的 rows——请改用形态①）
+      无入参的工具传 {} 或省略
     - requested_by: 可选，发起人标识，用于审计
 
     调用示例——创建高优工单：
       {"server": "it_ops", "tool": "create_incident",
        "arguments": {"title": "打印机故障", "priority": "high"}}
 
-    示例——查当前时间：
-      {"server": "common-tools", "tool": "now", "arguments": {"timezone_name": "Asia/Shanghai"}}
+    示例——查当前时间（扁平串形态）：
+      {"server": "common-tools", "tool": "now", "arguments": "timezone_name=Asia/Shanghai"}
 
     示例——Go 数据源清单（无入参）：
       {"server": "go_datahub", "tool": "data_list_dsn_refs", "arguments": {}}
@@ -241,9 +263,6 @@ def gateway_call(
       需请审批人调 list_pending_approvals 查看、approve_request(request_id) 放行后才会真正执行
 
     推荐流程：不确定时先 list_routes 查工具与入参 schema，再发起本调用。
-    tool 也可传 list_routes 返回的 tool_alias（下划线别名，如 data_list_dsn_refs），
-    规避部分平台对参数值中 "." 的序列化缺陷。
-    若你的平台序列化嵌套 JSON 对象困难，改用 gateway_call_kv（参数扁平字符串，无嵌套）。
     """
     args_obj = _coerce_args(arguments)
     route = _resolve_route(server, tool)
@@ -261,7 +280,7 @@ def gateway_call(
 
 
 def _dispatch(route: ToolRoute, args_obj: dict[str, Any], requested_by: str) -> dict[str, Any]:
-    """已解析路由 + 规范化入参 → 立即执行或挂审批。gateway_call / gateway_call_kv 共用。"""
+    """已解析路由 + 规范化入参 → 立即执行或挂审批。gateway_call / route_* 工具共用。"""
     if not route.requires_approval:
         result = router.execute(route.server, route.tool, args_obj)
         return {"approved": True, "executed": True, "result": result}
@@ -282,35 +301,8 @@ def _dispatch(route: ToolRoute, args_obj: dict[str, Any], requested_by: str) -> 
     }
 
 
-@mcp.tool()
-def gateway_call_kv(
-    server: str,
-    tool: str,
-    params: str = "",
-    requested_by: str = "agent",
-) -> dict[str, Any]:
-    """统一入口（扁平参数版）：与 gateway_call 等价，但入参用 "k=v;k2=v2" 字符串，
-    顶层不出现嵌套 JSON 对象——供序列化嵌套 JSON 困难的 AI 平台使用，优先推荐本平台调用。
-
-    参数：
-    - server / tool: 同 gateway_call（脏名自动归一）
-    - params: 分号分隔的 key=value，值自动识别 int/float/bool，其余按字符串。例：
-        params="title=打印机故障;priority=high"
-        params="dsn_ref=orcl_erp;sql=SELECT 1 FROM dual"
-        params="timezone_name=Asia/Shanghai"
-      无入参的工具留空 ""。
-    - 限制：入参本身是对象/数组的工具（data_submit_collect_job 的 params、
-      data_batch_import 的 rows、data_query_dataset 的 filters）请改用 gateway_call。
-
-    返回结构与 gateway_call 相同（需审批时返回 request_id 且操作尚未执行）。
-    """
-    args_obj = _parse_kv_params(params)
-    route = _resolve_route(server, tool)
-    if route is None:
-        same_server = sorted(r.tool for r in router.routes if r.server == server)
-        hint = f"该 server 可用工具: {same_server}" if same_server else "请先调用 list_routes 查询"
-        raise ToolError(f"未注册的路由: {server}.{tool}。{hint}")
-    return _dispatch(route, args_obj, requested_by)
+# （原 gateway_call_kv 独立工具已并入 gateway_call 的 arguments 扁平串形态，
+#  避免同一能力出现两个重复入口）
 
 
 def _parse_kv_params(params: str | dict | None) -> dict[str, Any]:
@@ -345,6 +337,87 @@ def _parse_kv_params(params: str | dict | None) -> dict[str, Any]:
                 except ValueError:
                     out[k.strip()] = v
     return out
+
+
+# ---------------------------------------------------------------------------
+# 聚合路由工具（route_*）：每个下游 server 收敛为一个入口，
+# method 参数用枚举列出该域全部可调用方法，描述中标注各方法入参与审批要求。
+# 每轮 aggregator.sync()（启动 / refresh_routes）后整体重建，枚举跟随最新路由表。
+# ---------------------------------------------------------------------------
+
+_ROUTE_TOOLS: dict[str, str] = {}  # 已注册的 route 工具名 -> server 名
+
+
+def _route_tool_name(server: str) -> str:
+    return "route_" + _norm(server)
+
+
+def _method_signature(r: ToolRoute) -> str:
+    """由入参 schema 生成方法签名摘要，如 itops_create_incident(title*, priority, reporter)。"""
+    schema = r.input_schema or {}
+    props = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+    args = ", ".join(f"{k}*" if k in required else k for k in props)
+    return f"{r.tool}({args})" if args else f"{r.tool}()"
+
+
+def _make_route_fn(server: str, methods: list[str]):
+    literal = Literal[tuple(methods)]  # type: ignore[valid-type]
+
+    def route_fn(method, params: Any = None, requested_by: str = "agent") -> dict[str, Any]:
+        route = router.resolve(server, method) or _resolve_route(server, method)
+        if route is None:
+            raise ToolError(
+                f"{server} 域没有方法 {method!r}；当前可调用: {methods}。"
+                "若下游刚更新，请先调 refresh_routes 重建本路由工具"
+            )
+        return _dispatch(route, _coerce_args(params), requested_by)
+
+    route_fn.__name__ = _route_tool_name(server)
+    route_fn.__annotations__ = {
+        "method": literal,
+        "params": Any,
+        "requested_by": str,
+        "return": dict[str, Any],
+    }
+    return route_fn
+
+
+def rebuild_route_tools() -> list[str]:
+    """按当前路由表重建全部 route_* 工具（先摘旧的再注册新的，幂等）。"""
+    for name in list(_ROUTE_TOOLS):
+        try:
+            mcp.remove_tool(name)
+        except Exception:  # noqa: BLE001 — 名字已被外部摘除时容忍，保持映射自洽
+            pass
+        _ROUTE_TOOLS.pop(name, None)
+
+    by_server: dict[str, list[ToolRoute]] = {}
+    for r in router.routes:
+        by_server.setdefault(r.server, []).append(r)
+
+    for server, routes in sorted(by_server.items()):
+        routes.sort(key=lambda r: r.tool)
+        methods = [r.tool for r in routes]
+        lines = [
+            f"- {_method_signature(r)}{'【需审批】' if r.requires_approval else ''}：{r.summary}"
+            for r in routes
+        ]
+        description = (
+            f"调用下游服务 {server} 的聚合路由入口：method 从枚举中选目标方法，"
+            "params 传该方法入参——对象 {\"k\": v}、JSON 字符串、"
+            "或扁平串 \"k=v;k2=v2\"（值自动识别 int/bool）均可；无参方法留空。\n"
+            f"可调用方法（* 为必填参数，【需审批】的方法调用后只产生审批单、须 approve_request 才执行）：\n"
+            + "\n".join(lines)
+        )
+        name = _route_tool_name(server)
+        mcp.add_tool(_make_route_fn(server, methods), name=name, description=description)
+        _ROUTE_TOOLS[name] = server
+    logger.info("重建聚合路由工具: %s", sorted(_ROUTE_TOOLS))
+    return sorted(_ROUTE_TOOLS)
+
+
+aggregator.on_sync = rebuild_route_tools
 
 
 # ---------------------------------------------------------------------------

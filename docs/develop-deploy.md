@@ -19,7 +19,7 @@ SgMcp/
 ├── layers/
 │   ├── gateway/                     # 【上层·审批网关】唯一对外入口 :9000
 │   │   └── src/mcp_gateway/
-│   │       ├── main.py              # ★ 网关工具 + 路由注册表 _build_router()
+│   │       ├── main.py              # ★ 网关工具 + 聚合路由工具 route_*（动态重建）
 │   │       ├── routing.py           #   下游转发（HTTP/local）、ToolRoute 定义
 │   │       └── approvals.py         #   HITL 审批闸门
 │   ├── common/                      # 【下层·通用工具】:9100
@@ -47,13 +47,32 @@ SgMcp/
 │   │           └── datahub.env.example  # 监听/令牌/DSN_<名称> 注册表
 ├── tests/
 │   ├── smoke_test.py                # 协议级冒烟（内存 Client，不起网络）
-│   └── ops/run_ops_test.py          # 真实 HTTP 链路 26 项断言（可进 CI）
+│   └── ops/run_ops_test.py          # 真实 HTTP 链路 36 项断言（可进 CI）
 └── scripts/
     ├── setup.ps1 / run-demo.ps1 / ops-check.ps1      # Windows 开发
     └── serversctl.sh                                 # Linux 启停（start|stop|restart|status）
 ```
 
 ★ = 日常写业务代码的位置。
+
+### 1.1 当前对外方法清单（按域）
+
+AI 客户端只需记忆 3 个 route_* 工具（见 §2.5）；下列方法是各域 `method` 枚举取值。
+
+**common-tools（下层·轻活，14）**：`now` `timestamp` `echo` `slugify` `generate_id`
+`hash_text` `base64_codec` `uuid_generate` `random_string` `json_tool`
+`datetime_convert`（时区转换+偏移）`url_parse` `regex_find` `text_stats`
+
+**it_ops（中层·业务，13）**：`itops_create_incident` `itops_list_incidents` `itops_update_incident_status`
+`itops_create_change`【需审批】 `itops_get_change` `itops_register_asset` `itops_list_assets`
+`itops_export_assets_to_warehouse` `itops_query_warehouse_assets` `itops_batch_process`
+`itops_list_datasets` `itops_query_dataset` `itops_list_data_tables`
+
+**go_datahub（中层·重活，17）**：
+- 采集 job：`data_list_sources` `data_submit_collect_job`【需审批】 `data_get_job_status` `data_list_jobs` `data_cancel_job`
+- 数据库：`data_list_dsn_refs` `data_db_ping` `data_list_tables` `data_db_query_preview` `data_batch_query` `data_batch_import`
+- 业务路由：`data_list_datasets` `data_query_dataset` `data_batch_process`
+- 文件：`data_hash_file`（流式哈希）`data_file_stats`（大小/行数/编码/预览）`data_convert_file`（CSV↔JSONL 互转）
 
 ## 2. 编写 MCP 工具
 
@@ -96,16 +115,31 @@ mcp.AddTool(server, &mcp.Tool{
 - 工具参数用 `dsn_ref: "order_pg"` 引用（`list_dsn_refs` 可查已登记名称）
 - 驱动报错自动脱敏（`dbhub.Scrub`），密码不进 MCP 消息/审批单/日志
 
-### 2.4 新工具接入网关（必做）
+### 2.4 新工具接入网关（零注册，自动聚合）
 
-上层网关按「server+tool」白名单路由，在 `layers/gateway/src/mcp_gateway/main.py` 的 `_build_router()` 注册：
+网关内置**聚合器**：启动时作为 MCP Client 连接各下游 server 拉取 `tools/list`，
+自动合并进路由表——**新增工具不需要在网关注册任何东西**，重启下游 + 网关调
+`refresh_routes`（或重启网关）即生效。只需遵守命名约定：
 
-```python
-r.register(ToolRoute(server="it_ops", tool="my_tool", exec_kind="local",
-                     requires_approval=False, summary="我的工具"))
-# 写操作/高风险 → requires_approval=True（进 HITL 审批闸门）
-# 跨机 Go 路由 → exec_kind="http", endpoint=<MCP_GODATAHUB_URL>, headers=<token 头>
-```
+- 工具名**不含点号**，用层级前缀：`itops_*`（IT 运维域）/ `data_*`（Go 数据域）/ 无前缀（common）
+- 审批策略在环境变量 `MCP_APPROVAL_TOOLS`（逗号分隔工具名）配置；未设置用默认集合
+  （`itops_create_change` / `data_submit_collect_job`）
+
+### 2.5 AI 客户端暴露模型（route_* 聚合路由）
+
+网关**不把下游工具逐个展示**给 AI。AI 连接 `http://网关:9000/mcp` 后看到的工具：
+
+| 工具 | 作用 |
+| --- | --- |
+| `route_it_ops` / `route_common_tools` / `route_go_datahub` | **日常调用主入口**：一个下游域一个路由工具。`method` 参数是枚举（自动列出该域全部可调用方法），`params` 传该方法入参（对象 / JSON 字符串 / 扁平 `k=v;k2=v2` 串均可）。工具描述逐方法标注 `参数(*必填)` 与 `【需审批】` |
+| `gateway_call` | 跨域通用入口（server+tool+arguments；arguments 同支持三形态，原 `gateway_call_kv` 已并入） |
+| `list_routes` | 全量路由明细（server/tool/入参 schema/审批标记） |
+| `refresh_routes` / `list_downstreams` | 运行时补拉工具表并**重建 route_* 枚举** / 诊断下游清单 |
+| `list_pending_approvals` / `approve_request` / `reject_request` | HITL 审批三件套 |
+
+route_* 工具由 `aggregator.on_sync → rebuild_route_tools()` 在每轮聚合后整体重建，
+枚举始终与下游最新工具表一致。新增下游 server 时同样自动生成对应 route 工具，
+无需改网关代码。
 
 ## 3. 本地开发调试（Windows）
 
@@ -113,7 +147,7 @@ r.register(ToolRoute(server="it_ops", tool="my_tool", exec_kind="local",
 powershell -File scripts/setup.ps1        # 建 .venv + editable 安装（或 uv sync --all-packages，
                                           # 内网需 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/）
 powershell -File scripts/run-demo.ps1     # 一键起 common:9100 / itops:9200 / gateway:9000 (+本地 Go)
-powershell -File scripts/ops-check.ps1    # 一键自检：起服务→26 项断言→停服务（退出码可进 CI）
+powershell -File scripts/ops-check.ps1    # 一键自检：起服务→36 项断言→停服务（退出码可进 CI）
 python tests/smoke_test.py                # 改代码后的秒级协议冒烟
 cd layers/business/go_datahub; go test ./...   # Go 侧内存链路测试
 ```
@@ -244,7 +278,7 @@ unit 只注入路径/用户；监听、token、DSN 全由 `config/datahub.env` �
 | `unrecognized arguments: --host` | venv 里是旧 server_kit：覆盖源码（editable）或 force-reinstall mcp-shared |
 | 改了源码但服务器行为没变（离线安装） | wheel 是拷贝安装，需 `--force-reinstall` 重装对应包 |
 | Linux 报 `bad interpreter: /usr/bin/env bash^M` | .sh 被转成 CRLF：仓库已用 .gitattributes 强制 LF，重新导出即可 |
-| 网关调用报 `Error executing tool gateway_call` | 看 message：未注册路由→错误里已列出该 server 可用工具；AI 端应先调 **`list_routes`**（网关工具发现入口，返回全部 server/tool/审批标记） |
+| 网关调用报 `Error executing tool gateway_call` | 看 message：未注册路由→错误里已列出该 server 可用工具；AI 端应改用对应域的 **`route_*`** 工具（method 枚举不会猜错名），或先调 **`list_routes`** 确认 server/tool |
 | AI 客户端首两次 gateway_call 失败后成功 | 模型在猜工具名/参数形状；接入后先让它 `list_routes` 一次即可避免 |
 | Windows 终端中文乱码 | GBK 控制台显示问题，设 `PYTHONIOENCODING=utf-8`，不影响数据 |
 | Go 采集任务一直 pending/running | `get_job_status` 轮询；失败看 `error` 字段与 Go 进程日志 |
