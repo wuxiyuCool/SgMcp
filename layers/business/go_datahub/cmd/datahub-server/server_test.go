@@ -96,6 +96,21 @@ func TestListSources(t *testing.T) {
 	}
 }
 
+// AI 平台模型常在 arguments 里幻觉出多余键（如 "action"），必须被剥离忽略而非拒绝。
+func TestHallucinatedExtraArgTolerated(t *testing.T) {
+	sess := connectInMemory(t)
+	res, err := sess.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "data_list_sources",
+		Arguments: map[string]any{"action": "list", "junk": map[string]any{"x": 1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("幻觉多余字段应被忽略而非拒绝: %v", res.Content)
+	}
+}
+
 func TestJobLifecycle(t *testing.T) {
 	sess := connectInMemory(t)
 	sub := callStructured[struct {
