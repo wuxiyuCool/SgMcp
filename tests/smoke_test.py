@@ -38,6 +38,11 @@ for sub in (
 
 from mcp import Client  # noqa: E402
 
+# it_ops SQLite 隔离到系统临时目录（避免冒烟污染仓库）
+import tempfile  # noqa: E402
+
+os.environ.setdefault("MCP_ITOPS_DB", str(Path(tempfile.gettempdir()) / "sgmcp_smoke_itops.db"))
+
 
 async def _call(server_obj, tool: str, args: dict):
     async with Client(server_obj, raise_exceptions=True) as client:
@@ -309,10 +314,26 @@ def test_shared_dsrouting() -> None:
     print("PASS  shared·dsrouting 业务名路由（租户/兜底/按月分表）")
 
 
+def test_itops_persistence() -> None:
+    """SQLite store：写入后用"新进程"重开同一库文件，记录仍在（跨重启持久化）。"""
+    import sqlite3  # noqa: F401  确保 stdlib 可用
+    from mcp_itops.store import SqliteStore
+
+    db = os.environ["MCP_ITOPS_DB"]
+    s1 = SqliteStore(db)
+    rec = s1.create_incident(title="持久化验证", priority="low", reporter="smoke")
+    s1.update_incident_status(rec["id"], "in_progress")
+    s2 = SqliteStore(db)  # 模拟服务重启后的全新实例
+    found = [i for i in s2.list_incidents(status="in_progress") if i["id"] == rec["id"]]
+    assert found and found[0]["title"] == "持久化验证", found
+    print(f"PASS  it_ops·SQLite 跨重启持久化（{rec['id']} 重开库仍可查）")
+
+
 if __name__ == "__main__":
     test_lower_common()
     test_middle_itops()
     test_gateway_aggregation_flow()
+    test_itops_persistence()
     test_shared_config()
     test_shared_dsrouting()
     print("\n全部冒烟测试通过 ✅")

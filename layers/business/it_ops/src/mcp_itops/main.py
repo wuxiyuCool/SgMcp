@@ -71,7 +71,7 @@ def _call_heavy_internal(path: str, json_body: dict[str, Any] | None = None,
 
 # ---------------------------------------------------------------------------
 # IT 运维业务工具（对 AI 暴露，itops.* 前缀）
-# 事件单支持三种落地通道：local=内置内存库（零依赖演示）；sql=经业务名路由写入
+# 事件单支持三种落地通道：local=本地 SQLite 持久化（零外部依赖）；sql=经业务名路由写入
 # 数据库（内部直调重活层 batch/import|query）；api=调外部 ITSM 系统 REST API。
 # ---------------------------------------------------------------------------
 @mcp.tool(name="itops.create_incident")
@@ -84,7 +84,7 @@ def create_incident(title: str, priority: str = "medium", reporter: str = "agent
     - priority: 枚举 low/medium/high/critical，默认 medium（其他值报错）
     - reporter: 报障人标识，默认 agent
     - channel: 落地通道枚举 local/sql/api，默认 local
-      local=内置内存库（零依赖；注意服务重启后数据清空，ID 不可跨重启引用）；
+      local=本地 SQLite 持久化（默认，零外部依赖，数据跨服务重启保留，ID 可长期引用；库路径可用 MCP_ITOPS_DB 覆盖）；
       sql=按数据集路由写库（需 DATASET_INCIDENTS_* 配置，工单落 incidents 表，持久化）；
       api=调外部 ITSM 系统 REST（需 MCP_ITSM_API_URL 配置）
     - tenant_id: 租户标识，默认 default（仅 sql 通道参与路由）
@@ -114,7 +114,7 @@ def list_incidents(status: str | None = None, channel: str = "local",
                    tenant_id: str = "default", limit: int = 100) -> list[dict[str, Any]]:
     """查询工单列表，可按状态过滤（new/open/in_progress/resolved/closed）。
 
-    channel: local=内置内存库（默认）；sql=按数据集路由查库（incidents 表，
+    channel: local=本地 SQLite（默认，持久化）；sql=按数据集路由查库（incidents 表，
     等值过滤 + 行数上限）；api=调外部 ITSM 系统 REST API。
     注意：返回注解必须是精确的 list[dict]——Any 注解会让 SDK 把单元素列表
     塌缩成单个对象，破坏调用方的解包约定。
@@ -182,8 +182,7 @@ def update_incident_status(incident_id: str, status: str) -> dict[str, Any]:
 
     参数：
     - incident_id: 必须是 create_incident 返回的真实 id（形如 "INC-0205B08E"）。
-      勿凭空编造、勿引用服务重启前的旧 ID（local 通道为内存存储，重启即清空）；
-      不确定时先用 itops.list_incidents 查现有工单
+      勿凭空编造；不确定时先用 itops.list_incidents 查现有工单（数据持久化，历史 ID 依然有效）
     - status: 枚举 new/open/in_progress/resolved/closed
 
     工单不存在时返回可读错误"工单不存在: xxx"。

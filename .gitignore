@@ -21,6 +21,8 @@ venv/
 .workbuddy/
 
 # serversctl 运行时文件
+# it_ops SQLite 数据
+data/
 logs/
 run/
 
