@@ -20,17 +20,34 @@ from __future__ import annotations
 
 import os
 import uuid
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import httpx2
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import Field
 
 from mcp_itops.store import store
 from mcp_shared import run_server
 from mcp_shared.config import get as cfg
-from mcp_shared.dsrouting import list_datasets, route_db, route_table, table_of
+from mcp_shared.dsrouting import domain_datasets, list_datasets, route_db, route_table, table_of
+from mcp_shared.http_kit import call_id_hint
+from mcp_shared.limits import check_list_size, check_text
 from mcp_shared.mcp_client import bearer_headers
+
+# 内部 REST 调用超时（秒）：GET 快、POST 批量导入慢；不配超时会让 worker 线程悬死
+_GET_TIMEOUT = float(os.environ.get("MCP_ITOPS_GET_TIMEOUT", "30"))
+_POST_TIMEOUT = float(os.environ.get("MCP_ITOPS_POST_TIMEOUT", "120"))
+_MAX_LIMIT = 1000
+
+
+def _clamp_limit(limit: int) -> int:
+    """行数上限：AI 传 100000 也只会拿到 1000，避免把整库灌进对话上下文。"""
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        return 100
+    return max(1, min(n, _MAX_LIMIT))
 
 mcp = MCPServer("it-ops")
 
@@ -46,19 +63,25 @@ def _heavy_base() -> str:
 
 def _call_heavy_internal(path: str, json_body: dict[str, Any] | None = None,
                          params: dict[str, Any] | None = None) -> dict[str, Any]:
-    """业务层 → Go 重活的内部 HTTP 直调（POST/GET + Bearer，统一检查 ok 字段）。"""
+    """业务层 → Go 重活的内部 HTTP 直调（POST/GET + Bearer，统一检查 ok 字段）。
+
+    带上 X-Sg-Call-Id：网关转发时会写这个头，重活层日志据此可以把
+    「AI 的一次报错」跨三层对上（网关审计 → 业务日志 → Go 日志）。
+    """
     headers = bearer_headers(cfg("MCP_GODATAHUB_TOKEN")) or {}
+    if call_id_hint.get():
+        headers["X-Sg-Call-Id"] = call_id_hint.get()
     url = _heavy_base() + path
     try:
         if json_body is None:
-            resp = httpx2.get(url, params=params, headers=headers, timeout=30)
+            resp = httpx2.get(url, params=params, headers=headers, timeout=_GET_TIMEOUT)
         else:
             # 批量导入上限 5 万行，给足超时
-            resp = httpx2.post(url, json=json_body, headers=headers, timeout=120)
+            resp = httpx2.post(url, json=json_body, headers=headers, timeout=_POST_TIMEOUT)
     except httpx2.HTTPError as e:
         raise ToolError(
             f"内部调用重活层失败（{url}）：{type(e).__name__}: {e}。"
-            "请确认 go_datahub 已部署，或稍后重试。"
+            "请确认 go_datahub 已部署（data_list_dsn_refs 可探活），或稍后重试。"
         ) from e
     if resp.status_code >= 400:
         raise ToolError(f"内部调用重活层 {path} 失败 [{resp.status_code}]: {resp.text}")
@@ -76,7 +99,8 @@ def _call_heavy_internal(path: str, json_body: dict[str, Any] | None = None,
 # ---------------------------------------------------------------------------
 @mcp.tool(name="itops_create_incident")
 def create_incident(title: str, priority: str = "medium", reporter: str = "agent",
-                    channel: str = "local", tenant_id: str = "default") -> dict[str, Any]:
+                    channel: Literal["local", "sql", "api"] = "local",
+                    tenant_id: str = "default") -> dict[str, Any]:
     """创建一条 IT 运维工单，返回含 id 的工单对象。
 
     参数：
@@ -93,7 +117,9 @@ def create_incident(title: str, priority: str = "medium", reporter: str = "agent
     后续用返回的 id 调 itops_update_incident_status 流转状态。
     """
     if priority not in {"low", "medium", "high", "critical"}:
-        raise ValueError(f"非法优先级: {priority}")
+        raise ValueError(f"非法优先级: {priority}（可选 low/medium/high/critical）")
+    check_text(title, limit=500, what="title")
+    check_text(reporter, limit=100, what="reporter")
     if channel == "local":
         return store.create_incident(title=title, priority=priority, reporter=reporter)
     rec = store.create_incident(title=title, priority=priority, reporter=reporter)
@@ -110,7 +136,7 @@ def create_incident(title: str, priority: str = "medium", reporter: str = "agent
 
 
 @mcp.tool(name="itops_list_incidents")
-def list_incidents(status: str | None = None, channel: str = "local",
+def list_incidents(status: str | None = None, channel: Literal["local", "sql", "api"] = "local",
                    tenant_id: str = "default", limit: int = 100) -> list[dict[str, Any]]:
     """查询工单列表，可按状态过滤（new/open/in_progress/resolved/closed）。
 
@@ -123,6 +149,7 @@ def list_incidents(status: str | None = None, channel: str = "local",
         return store.list_incidents(status=status)
     if channel == "sql":
         db_type, dsn_ref = route_db("incidents", tenant_id)
+        limit = _clamp_limit(limit)
         filters = {"status": status} if status else {}
         result = _call_heavy_internal("/internal/v1/batch/query", json_body={
             "db_type": db_type, "dsn_ref": dsn_ref, "table": table_of("incidents"),
@@ -131,6 +158,7 @@ def list_incidents(status: str | None = None, channel: str = "local",
         rows = result.get("rows", [])
         return rows if isinstance(rows, list) else [rows]
     if channel == "api":
+        limit = _clamp_limit(limit)
         params = {"status": status} if status else {"limit": limit}
         data = _call_external_itsm("GET", "/incidents", params=params)
         # 外部 API 返回形态不可控，归一化成列表
@@ -177,7 +205,8 @@ def _call_external_itsm(method: str, path: str, json_body: dict[str, Any] | None
 
 
 @mcp.tool(name="itops_update_incident_status")
-def update_incident_status(incident_id: str, status: str) -> dict[str, Any]:
+def update_incident_status(incident_id: str,
+                           status: Literal["new", "open", "in_progress", "resolved", "closed"]) -> dict[str, Any]:
     """流转工单状态，返回更新后的完整工单对象。
 
     参数：
@@ -194,7 +223,9 @@ def update_incident_status(incident_id: str, status: str) -> dict[str, Any]:
 
 
 @mcp.tool(name="itops_create_change")
-def create_change(title: str, change_type: str = "standard", implementer: str = "ops", risk: str = "low") -> dict[str, Any]:
+def create_change(title: str, change_type: Literal["standard", "emergency"] = "standard",
+                  implementer: str = "ops",
+                  risk: Literal["low", "medium", "high"] = "low") -> dict[str, Any]:
     """创建变更单，返回含 id（形如 "CHG-4B36C912"）的对象。
 
     参数：title=变更描述；change_type=standard/emergency（标准/紧急）；
@@ -203,6 +234,7 @@ def create_change(title: str, change_type: str = "standard", implementer: str = 
     ⚠️ 高风险写操作：经网关 gateway_call 调用时会被挂起为审批单（返回
     request_id="apr_xxx" 且尚未执行），需审批人 approve_request 后才真正创建。
     """
+    check_text(title, limit=500, what="title")
     rec = store.create_change(title=title, change_type=change_type, implementer=implementer, risk=risk)
     rec["approval_required"] = True  # 交由上层审批的标记
     return rec
@@ -218,7 +250,8 @@ def get_change(change_id: str) -> dict[str, Any]:
 
 
 @mcp.tool(name="itops_register_asset")
-def register_asset(name: str, asset_type: str, owner: str) -> dict[str, Any]:
+def register_asset(name: str, asset_type: Literal["laptop", "server", "network", "software"],
+                   owner: str) -> dict[str, Any]:
     """登记一台 IT 资产（录入 CMDB），返回含 id（形如 "AST-5C332490"）的对象。
 
     参数：name=资产名（如 "srv-ops-01"）；
@@ -228,7 +261,7 @@ def register_asset(name: str, asset_type: str, owner: str) -> dict[str, Any]:
 
 
 @mcp.tool(name="itops_list_assets")
-def list_assets(asset_type: str | None = None) -> list[dict[str, Any]]:
+def list_assets(asset_type: Literal["laptop", "server", "network", "software"] | None = None) -> list[dict[str, Any]]:
     """查询资产清单（对象数组）。asset_type 可选过滤：laptop/server/network/software，
     留空或传 null 返回全部。"""
     return store.list_assets(asset_type=asset_type)
@@ -246,6 +279,7 @@ def export_assets_to_warehouse(dsn_ref: str, table: str = "cmdb_assets", asset_t
     可用 data_list_dsn_refs 查看；table 需已存在（可用 data_list_tables 确认）。
     """
     rows = store.list_assets(asset_type=asset_type)
+    check_list_size(rows, limit=50000, what="待归档资产行")
     if not rows:
         return {"ok": True, "exported": 0, "message": "无资产可归档"}
     result = _call_heavy_internal("/internal/v1/batch/import", json_body={
@@ -262,6 +296,7 @@ def query_warehouse_assets(dsn_ref: str, table: str = "cmdb_assets", asset_type:
     """查询已归档到数据仓库的资产（内部直调 go_datahub 的
     /internal/v1/batch/query，等值过滤 + 行数上限，防全表拖库）。
     """
+    limit = _clamp_limit(limit)
     filters: dict[str, Any] = {}
     if asset_type:
         filters["asset_type"] = asset_type
@@ -280,7 +315,8 @@ def query_warehouse_assets(dsn_ref: str, table: str = "cmdb_assets", asset_type:
 # 业务 Python 负责轻编排（路由解析 + 任务登记），重活下放重活层内部 REST 执行
 # ---------------------------------------------------------------------------
 @mcp.tool(name="itops_batch_process")
-def batch_process(dataset_id: str, period: str, tenant_id: str, mode: str = "simulate") -> dict[str, Any]:
+def batch_process(dataset_id: str, period: str, tenant_id: str = "default",
+                  mode: Literal["simulate", "real"] = "simulate") -> dict[str, Any]:
     """按业务数据集名批量处理数据（Python 侧路由实现）。
 
     与 data_batch_process 共用同一套 env 路由约定（DATASET_*）：本工具在业务层
@@ -321,16 +357,43 @@ def business_list_datasets() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 第 2 层·领域通用查询（中粒度）：本域数据集枚举限定 + 配套表发现
+# 第 2 层·领域通用查询（中粒度）：本域数据集枚举由配置驱动 + 配套表发现
 # ---------------------------------------------------------------------------
-# it_ops 域的数据集枚举（新增本域数据集时在此登记 + 配 DATASET_<NAME>_* 路由）。
-# 中文说明写在 Literal 描述里；更细的发现用 itops_list_data_tables。
+# it_ops 域的数据集枚举：优先取 DATASET_<名称>_DOMAIN=itops 的配置项（改配置即扩枚举，
+# 无需改代码）；未配置任何本域数据集时回退到内置示例（incidents / assets）。
 ITOPS_DOMAIN = "itops"
+
+
+def _domain_datasets() -> tuple[str, ...]:
+    names = tuple(domain_datasets(ITOPS_DOMAIN))
+    return names or ("incidents", "assets")
+
+
+_ITOPS_DATASET_ENUM = _domain_datasets()
+DatasetId = Literal[_ITOPS_DATASET_ENUM]  # type: ignore[valid-type]
+
+
+def _dataset_enum_doc() -> str:
+    """把数据集的中文说明/路由拼成参数描述（配置驱动，AI 看名知义）。"""
+    lines = []
+    for info in list_datasets():
+        if info["dataset"] not in _ITOPS_DATASET_ENUM:
+            continue
+        desc = info["desc"] or "（未配说明，见 DATASET_*_DESC）"
+        pairs = ", ".join(f"租户 {t}→{r}" for t, r in zip(info["tenants"], info["dsn_tenant_refs"]))
+        routes = pairs or f"default→{info['dsn_default'] or '（未配置）'}"
+        lines.append(f"{info['dataset']}={desc}；库 {info['db_type']}，路由 {routes}")
+    return "；".join(lines) or "本域数据集未配置（DATASET_*_DOMAIN=itops），调用会报未配置路由"
+
+
+# 必填参数带 Annotated 元数据才会进生成的 JSON Schema（可选参数的元数据会被 SDK 丢弃）
+DatasetIdDoc = Annotated[DatasetId, Field(description="本域数据集（说明由 DATASET_* 配置生成）："
+                                                      + _dataset_enum_doc())]
 
 
 @mcp.tool(name="itops_query_dataset")
 def query_dataset(
-    dataset_id: Literal["incidents", "assets"],
+    dataset_id: DatasetIdDoc,
     tenant_id: str = "default",
     period: str | None = None,
     filters: dict[str, Any] | None = None,
@@ -338,14 +401,16 @@ def query_dataset(
 ) -> dict[str, Any]:
     """按本域（IT 运维）数据集做通用查询（第 2 层·领域通用查询）。
 
-    dataset_id 枚举（中文说明）：incidents=IT 运维事件单（工单流水，固定表）；
-    assets=CMDB 资产台账（固定表）。本枚举之外的领域数据集（如订单）不在本工具
-    范围——请改用第 3 层全局数据平台 data.query_dataset（全量数据集枚举）。
-    period 仅周期数据集需要（按月分表 YYYY-MM）；本域数据集均为固定表，留空即可。
+    dataset_id 的本域枚举与中文说明见该参数描述（由 DATASET_* 配置动态生成）。
+    枚举之外的数据集（如订单）不在本工具范围——请改用第 3 层全局数据平台
+    data.query_dataset（全量数据集枚举）。
+    period 仅周期数据集需要（按月分表 YYYY-MM）；本域数据集多为固定表，留空即可。
+    tenant_id 传 default 表示按兜底路由查（default 是保留字，不作为租户名）。
     """
     _guard_domain(dataset_id)
     db_type, dsn_ref = route_db(dataset_id, tenant_id)
     table = route_table(dataset_id, period) if period else table_of(dataset_id)
+    limit = _clamp_limit(limit)
     result = _call_heavy_internal("/internal/v1/batch/query", json_body={
         "db_type": db_type, "dsn_ref": dsn_ref, "table": table,
         "filters": filters or {}, "limit": limit,
@@ -353,13 +418,16 @@ def query_dataset(
     return {
         "ok": True, "dataset_id": dataset_id, "routed": {"db": dsn_ref, "table": table},
         "count": result.get("count", 0), "rows": result.get("rows", []),
+        "limit": limit, "truncated": result.get("count", 0) >= limit,
     }
 
 
 @mcp.tool(name="itops_list_data_tables")
-def list_data_tables(dataset_id: Literal["incidents", "assets"], tenant_id: str = "default") -> dict[str, Any]:
+def list_data_tables(dataset_id: DatasetIdDoc, tenant_id: str = "default") -> dict[str, Any]:
     """列出一个本域数据集路由库中的数据表（查询前的发现入口：先看表存在、再用
     itops_query_dataset 查询；越域数据集用 data.list_datasets / data.query_dataset）。
+
+    tenant_id 传 default 表示按兜底路由解析。
     """
     _guard_domain(dataset_id)
     db_type, dsn_ref = route_db(dataset_id, tenant_id)

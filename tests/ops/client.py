@@ -52,10 +52,28 @@ def _unwrap(result: Any) -> Any:
     return data
 
 
+def auto_headers(url: str) -> dict[str, str] | None:
+    """未显式传 headers 时按目标地址自动选令牌（ops-check -Secure 全链路鉴权模式用）。
+
+    网关地址取 ``MCP_GATEWAY_TOKEN``，其余（下游/Go）取 ``MCP_SERVER_TOKEN``；
+    两个变量都没配就是 None，行为与不带鉴权的部署完全一致。
+    """
+    import os
+
+    gw_url = (os.environ.get("MCP_OPS_GATEWAY_URL") or "").rstrip("/")
+    token = None
+    if gw_url and url.rstrip("/") == gw_url:
+        token = os.environ.get("MCP_GATEWAY_TOKEN")
+    if not token:
+        token = os.environ.get("MCP_SERVER_TOKEN") or os.environ.get("MCP_GODATAHUB_TOKEN")
+    return {"Authorization": f"Bearer {token}"} if token else None
+
+
 def _make_client(url: str, raise_exceptions: bool, headers: dict[str, str] | None):
-    """构造 SDK Client；headers 非空时经自建 httpx2.AsyncClient 注入（远端 Go 带 token 直测用）。"""
+    """构造 SDK Client；headers 非空（或自动推断出令牌）时经自建 httpx2.AsyncClient 注入。"""
     from mcp import Client
 
+    headers = headers or auto_headers(url)
     if not headers:
         return Client(url, raise_exceptions=raise_exceptions, mode="legacy")
     import httpx2
@@ -105,3 +123,18 @@ def call_raw(url: str, tool: str, arguments: dict[str, Any] | None = None,
 def list_tools(url: str, headers: dict[str, str] | None = None) -> list[str]:
     """列出一个 server 暴露的工具名。"""
     return asyncio.run(_list_async(url, headers))
+
+
+
+def healthz(mcp_url: str, path: str = "/healthz",
+            headers: dict[str, str] | None = None) -> dict[str, Any]:
+    """读 server 的 HTTP 探活端点（Python 层 /healthz，Go 层 /internal/healthz）。
+
+    与 MCP 协议无关的裸 HTTP GET——负载均衡与巡检脚本用的就是它。
+    """
+    import httpx2
+
+    base = mcp_url[: mcp_url.rfind("/")] if "/mcp" in mcp_url else mcp_url.rstrip("/")
+    resp = httpx2.get(base + path, headers=headers or {}, timeout=10)
+    resp.raise_for_status()
+    return resp.json()

@@ -23,8 +23,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -91,8 +95,9 @@ type cancelOut struct {
 }
 
 type listDsnOut struct {
-	Refs        []string `json:"refs"`
-	ConfigFound bool     `json:"config_found"`
+	Refs        []config.DSNRef `json:"refs"`
+	ConfigFound bool            `json:"config_found"`
+	FileRoots   []string        `json:"file_roots,omitempty"` // 文件工具当前允许访问的根目录（排障用）
 }
 
 type listTablesOut struct {
@@ -291,7 +296,7 @@ func toolInputDB[T any]() map[string]any {
 	return m
 }
 
-func buildServer() (*mcp.Server, *http.ServeMux) {
+func buildServer() (*mcp.Server, *http.ServeMux, *jobs.Registry) {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "go-datahub",
 		Title:   "数据重活 MCP（Go）",
@@ -398,12 +403,14 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "data_list_dsn_refs",
 		Description: "列出服务端已登记的数据源（无参数）。返回 refs=[{name, type}]——name 即其他工具的 dsn_ref 取值，" +
-			"type 为自动推断的库类型（oracle/mysql/pg/mssql）；config_found=false 表示服务端未放配置文件。" +
-			"只回名称不回连接串。访问任何数据库前先调本工具了解可用数据源。只读。",
+			"type 为自动推断的库类型（oracle/mysql/pg/mssql，未识别为空串）；config_found=false 表示服务端未放配置文件；" +
+			"file_roots 为文件类工具（data_hash_file / data_file_stats / data_convert_file）当前允许的目录。" +
+			"只回名称与类型，不回连接串。访问任何数据库前先调本工具了解可用数据源。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 		InputSchema: toolInput[struct{}](),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, listDsnOut, error) {
-		return nil, listDsnOut{Refs: config.DSNRefs(), ConfigFound: config.ConfigPath() != ""}, nil
+		return nil, listDsnOut{Refs: config.DSNRefList(), ConfigFound: config.ConfigPath() != "",
+			FileRoots: filetools.FileRoots()}, nil
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -582,13 +589,18 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "data_hash_file",
-		Description: "流式计算本机文件哈希（任意大小文件，内存恒定）。参数：path=datahub-server 所在机器的文件绝对路径（必填）；" +
+		Description: "流式计算本机文件哈希（任意大小文件，内存恒定）。参数：path=datahub-server 所在机器的文件绝对路径（必填，" +
+			"必须落在允许的目录内，见 data_list_dsn_refs 的 file_roots）；" +
 			"algo=可选 md5/sha1/sha256/sha512，默认 sha256。返回：{algo, hex, size_bytes}。" +
 			"用于核对传输完整性、比对采集数据文件指纹。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 		InputSchema: toolInput[hashFileIn](),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in hashFileIn) (*mcp.CallToolResult, hashFileOut, error) {
-		hexSum, size, err := filetools.HashFile(in.Path, in.Algo)
+		p, err := filetools.CheckPath(in.Path, false)
+		if err != nil {
+			return nil, hashFileOut{}, err
+		}
+		hexSum, size, err := filetools.HashFile(p, in.Algo)
 		if err != nil {
 			return nil, hashFileOut{}, err
 		}
@@ -601,13 +613,17 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "data_file_stats",
-		Description: "统计本机文件：大小/总行数/编码/修改时间/前 N 行预览（大文件流式扫描）。参数：path=文件绝对路径（必填）；" +
-			"preview_lines=默认 5 上限 50。返回 encoding 枚举 ascii/utf-8/utf-8-bom/non-utf8(可能为GBK)/binary，" +
+		Description: "统计本机文件：大小/总行数/编码/修改时间/前 N 行预览（大文件流式扫描）。参数：path=文件绝对路径（必填，" +
+			"须在允许目录清单内）；preview_lines=默认 5 上限 50。返回 encoding 枚举 ascii/utf-8/utf-8-bom/non-utf8(可能为GBK)/binary，" +
 			"binary 文件预览为空。取数据前先调它确认编码与规模（GBK 需转码再采集）。只读。",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 		InputSchema: toolInput[fileStatsIn](),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in fileStatsIn) (*mcp.CallToolResult, filetools.Stats, error) {
-		st, err := filetools.FileStats(in.Path, in.PreviewLines)
+		p, err := filetools.CheckPath(in.Path, false)
+		if err != nil {
+			return nil, filetools.Stats{}, err
+		}
+		st, err := filetools.FileStats(p, in.PreviewLines)
 		if err != nil {
 			return nil, filetools.Stats{}, err
 		}
@@ -617,11 +633,23 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "data_convert_file",
 		Description: "CSV↔JSONL 流式互转（GB 级可行，原子写：先 .tmp 再改名）。参数：src=源文件绝对路径（.csv/.jsonl/.ndjson，方向按扩展名自动判断）；" +
-			"dst=目标文件绝对路径（已存在会被覆盖）；max_rows=可选截断。返回：{src,dst,from,to,rows_converted,truncated}。" +
+			"dst=目标文件绝对路径（已存在会被覆盖）；max_rows=可选截断。两个路径都必须在允许目录清单内（file_roots 见 data_list_dsn_refs），" +
+			"且不允许写 .env 配置文件。返回：{src,dst,from,to,rows_converted,truncated}。" +
 			"CSV 首行为表头；JSONL 转 CSV 以首行键集为列、后续行未知列忽略。",
 		InputSchema: toolInput[convertFileIn](),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in convertFileIn) (*mcp.CallToolResult, filetools.ConvertResult, error) {
-		res, err := filetools.ConvertFile(in.Src, in.Dst, "", in.MaxRows)
+		src, err := filetools.CheckPath(in.Src, false)
+		if err != nil {
+			return nil, filetools.ConvertResult{}, err
+		}
+		dst, err := filetools.CheckPath(in.Dst, true)
+		if err != nil {
+			return nil, filetools.ConvertResult{}, err
+		}
+		if src == dst {
+			return nil, filetools.ConvertResult{}, fmt.Errorf("src 与 dst 是同一个文件（%s），转换会毁掉源数据，请给不同路径", src)
+		}
+		res, err := filetools.ConvertFile(src, dst, "", in.MaxRows)
 		if err != nil {
 			return nil, filetools.ConvertResult{}, err
 		}
@@ -633,9 +661,17 @@ func buildServer() (*mcp.Server, *http.ServeMux) {
 	mux.Handle("/mcp", streamable)
 	// 双端点设计：/mcp 给网关聚合暴露给 AI；/internal/* 给业务 Python 服务间直调
 	// （HTTP+JSON，不经网关；与 /mcp 同端口同 Bearer 鉴权，共用 dbhub 核心实现）
-	internalapi.Register(mux)
-	return server, mux
+	internalapi.Register(mux, func() map[string]any {
+		jobs := reg.Stats()
+		jobs["version"] = version
+		jobs["pool"] = dbhub.PoolStats()
+		return jobs
+	})
+	return server, mux, reg
 }
+
+// version 构建期可用 -ldflags "-X main.version=..." 注入（发布产物与 /internal/healthz 对账）。
+var version = "0.3.0"
 
 // isParamError 区分「调用方参数用错了」（上抛为可读工具错误，引导修正）与
 // 「库侧执行失败」（转结构化 ok=false 结果，调用方可继续处理）。
@@ -668,18 +704,54 @@ func main() {
 	token := flag.String("token", config.Value("GO_DATAHUB_TOKEN"), "Bearer 令牌；非空时所有请求必须携带 Authorization: Bearer <token>（配置文件 GO_DATAHUB_TOKEN 或同名环境变量提供）")
 	flag.Parse()
 
-	_, mux := buildServer()
+	_, mux, _ := buildServer()
 	var handler http.Handler = mux
 	if *token != "" {
 		handler = bearerAuth(*token, mux)
 		log.Printf("[go-datahub] 已启用 Bearer 鉴权")
+	} else {
+		log.Printf("[go-datahub] 警告：未配置 GO_DATAHUB_TOKEN——/mcp 与 /internal/* 无鉴权，" +
+			"跨机部署必须配置（同端口同时暴露 MCP 与内部 REST，裸端口=任何可达者都能读写数据库）")
 	}
 	logger := log.New(log.Writer(), "[go-datahub] ", log.LstdFlags)
-	logger.Printf("启动 %s:%d/mcp", *addr, *port)
 	srv := &http.Server{Addr: fmt.Sprintf("%s:%d", *addr, *port), Handler: handler}
-	if err := srv.ListenAndServe(); err != nil {
+
+	// 优雅停机：SIGINT/SIGTERM 时停止接新连接、给在途请求 10s 收尾、关掉 job 与连接池。
+	// systemd 重启/升级（git pull + restart）是常态，硬杀会让在途批量导入半途而废。
+	idle, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-srvDone(srv, idle, logger)
+	}()
+	logger.Printf("启动 %s:%d/mcp (v%s)", *addr, *port, version)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Fatal(err)
 	}
+}
+
+// srvDone 等待退出信号后关闭 server（10s 宽限），并释放任务与连接池。
+func srvDone(srv *http.Server, ctx context.Context, logger *log.Logger) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		select {
+		case s := <-sig:
+			logger.Printf("收到信号 %v，开始优雅停机", s)
+		case <-ctx.Done():
+			return
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			logger.Printf("停机等待在途请求超时: %v", err)
+		}
+		jobs.AbortAll()
+		dbhub.CloseAllPools()
+		logger.Printf("已停机")
+	}()
+	return done
 }
 
 // bearerAuth 校验 Authorization: Bearer 头（常数时间比较，防时序侧信道）。

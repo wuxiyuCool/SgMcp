@@ -3,6 +3,8 @@
 #   退出码 0 = 全部通过（可直接用于巡检 / CI）。
 param(
     [int]$Load = 0,
+    [switch]$Rebuild,   # 强制重建 Go 二进制（默认：缺失或 Go 源码更新时自动重建）
+    [switch]$Secure,    # 全链路鉴权自检：临时生成随机令牌并启用网关/下游 Bearer + 审批令牌
     [int]$BootWaitSeconds = 10,
     [string]$Python = "",
     [string]$GodhUrl = ""   # 远端 go_datahub 地址（如 http://192.168.1.20:9300/mcp）；留空取环境变量 MCP_GODATAHUB_URL，再留空则本机起停
@@ -79,6 +81,19 @@ $godh = if ($GodhUrl) { $GodhUrl } `
 $env:MCP_GODATAHUB_URL = $godh
 $godhIsLocal = $godh -match "^https?://(127\.0\.0\.1|localhost|\[?::1\]?)(:\d+)?/"
 
+if ($Secure) {
+    # 临时随机令牌：只存在于本次子进程环境里，不落盘、不进 git
+    function New-Token { -join ((48..57)+(97..122) | Get-Random -Count 32 | ForEach-Object {[char]$_}) }
+    if (-not $env:MCP_GATEWAY_TOKEN)  { $env:MCP_GATEWAY_TOKEN  = New-Token }
+    if (-not $env:MCP_SERVER_TOKEN)   { $env:MCP_SERVER_TOKEN   = New-Token }   # Python 下游三层共用
+    if (-not $env:GO_DATAHUB_TOKEN)   { $env:GO_DATAHUB_TOKEN  = New-Token }
+    if (-not $env:MCP_APPROVAL_TOKEN) { $env:MCP_APPROVAL_TOKEN = New-Token }
+    $env:MCP_GODATAHUB_TOKEN  = $env:GO_DATAHUB_TOKEN           # 网关→Go 同值
+    $env:MCP_DOWNSTREAM_TOKEN_IT_OPS       = $env:MCP_SERVER_TOKEN
+    $env:MCP_DOWNSTREAM_TOKEN_COMMON_TOOLS = $env:MCP_SERVER_TOKEN
+    Write-Host "==> -Secure：已启用全链路 Bearer + 审批令牌（临时随机值，仅本次进程有效）" -ForegroundColor Green
+}
+
 Write-Host "==> 启动三层 server（HTTP）" -ForegroundColor Cyan
 $procs = @()
 
@@ -86,12 +101,24 @@ $procs = @()
 # - 远端地址（-GodhUrl / MCP_GODATAHUB_URL 非本机）→ 不起停本地，只把地址交给测试集直测
 # - 本机默认 → 二进制不存在时自动 go build，无 Go 环境则跳过并让测试集 --skip-go
 $godhExe = Join-Path $ROOT "layers\business\go_datahub\bin\datahub-server.exe"
+# -Secure 时 Go 也以 Bearer 启动（token 来自上面的随机值或外部环境）
+if ($Secure) { $godhArgs = @("-port", "9300", "-token", $env:GO_DATAHUB_TOKEN) } else { $godhArgs = @("-port", "9300") }
+
+# 二进制过期检测：Go 源码比 exe 新还跑旧二进制，会出现"改了 Go 代码但自检全绿"的假象
+function Test-GoStale([string]$exe) {
+    if ($Rebuild) { return $true }
+    if (-not (Test-Path $exe)) { return $true }
+    $t = (Get-Item $exe).LastWriteTime
+    $src = Join-Path $ROOT "layers\business\go_datahub"
+    return [bool](Get-ChildItem -Path $src -Recurse -Include *.go, go.mod |
+        Where-Object { $_.LastWriteTime -gt $t } | Select-Object -First 1)
+}
 $testArgs = @((Join-Path $ROOT "tests\ops\run_ops_test.py"), "--godh-url", $godh)
 if (-not $godhIsLocal) {
     Write-Host "==> go_datahub 使用远端地址：$godh（跳过本机构建/起停）" -ForegroundColor Cyan
-} elseif (-not (Test-Path $godhExe)) {
+} elseif (Test-GoStale $godhExe) {
     if (Get-Command go -ErrorAction SilentlyContinue) {
-        Write-Host "==> 构建 go_datahub" -ForegroundColor Cyan
+        Write-Host "==> 构建 go_datahub（二进制缺失或 Go 源码已更新）" -ForegroundColor Cyan
         Push-Location (Join-Path $ROOT "layers\business\go_datahub")
         go build -o bin/datahub-server.exe ./cmd/datahub-server
         $buildOk = ($LASTEXITCODE -eq 0)
@@ -101,14 +128,15 @@ if (-not $godhIsLocal) {
         Write-Warning "未找到 go_datahub 二进制且无 Go 环境，跳过 Go 层"
     }
     if (Test-Path $godhExe) {
-        $procs += Start-Process -FilePath $godhExe -ArgumentList @("-port", "9300") -PassThru -WindowStyle Hidden
+        $procs += Start-Process -FilePath $godhExe -ArgumentList $godhArgs -PassThru -WindowStyle Hidden
         Write-Host "    go_datahub -> :9300 (PID $($procs[-1].Id))"
     } else {
+        Write-Warning "Go 二进制过期但无 Go 环境重建，测试将跑旧行为（或手动构建后重试）"
         $testArgs += "--skip-go"
     }
 } else {
-    $procs += Start-Process -FilePath $godhExe -ArgumentList @("-port", "9300") -PassThru -WindowStyle Hidden
-    Write-Host "    go_datahub -> :9300 (PID $($procs[-1].Id))"
+    $procs += Start-Process -FilePath $godhExe -ArgumentList $godhArgs -PassThru -WindowStyle Hidden
+    Write-Host "    go_datahub -> :9300 (PID $($procs[-1].Id))$(' ' + $(if ($Secure) {'[Bearer 已启用]'} else {''}))"
 }
 
 # Python 三层：下游在前、网关最后（网关聚合器启动时连下游拉 tools/list）

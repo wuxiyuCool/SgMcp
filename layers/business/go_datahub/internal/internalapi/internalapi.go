@@ -25,6 +25,7 @@ import (
 	"github.com/sg/mcp/go-datahub/internal/config"
 	"github.com/sg/mcp/go-datahub/internal/dbhub"
 	"github.com/sg/mcp/go-datahub/internal/dsrouting"
+	"github.com/sg/mcp/go-datahub/internal/filetools"
 )
 
 // batchImportReq / batchQueryReq 与 MCP 工具入参字段一致，业务层两边可无缝切换。
@@ -45,10 +46,16 @@ type batchQueryReq struct {
 	Limit   int            `json:"limit,omitempty"`
 }
 
-// Register 把内部 REST 路由挂到 mux（与 /mcp 共存）。
-func Register(mux *http.ServeMux) {
-	mux.HandleFunc("GET /internal/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+// Register 把内部 REST 路由挂到 mux（与 /mcp 共存）。info 提供运行态概览（探活/巡检）。
+func Register(mux *http.ServeMux, info func() map[string]any) {
+	mux.HandleFunc("GET /internal/healthz", func(w http.ResponseWriter, r *http.Request) {
+		body := map[string]any{"ok": true}
+		if info != nil {
+			for k, v := range info() {
+				body[k] = v
+			}
+		}
+		writeJSON(w, http.StatusOK, body)
 	})
 	mux.HandleFunc("GET /internal/v1/dsn_refs", handleDSNRefs)
 	mux.HandleFunc("GET /internal/v1/datasets", handleListDatasets)
@@ -65,8 +72,9 @@ func Register(mux *http.ServeMux) {
 func handleDSNRefs(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":           true,
-		"refs":         config.DSNRefs(),
+		"refs":         config.DSNRefList(), // [{name,type}]：与 MCP 面 data_list_dsn_refs 同形态
 		"config_found": config.ConfigPath() != "",
+		"file_roots":   filetools.FileRoots(),
 	})
 }
 
@@ -92,7 +100,7 @@ func handleBatchProcess(w http.ResponseWriter, r *http.Request) {
 	}
 	dsn := ""
 	if mode == "real" {
-		d, err := resolveDSN(req.DBType, req.DSN, req.DSNRef)
+		_, d, err := resolveTarget(req.DBType, req.DSN, req.DSNRef)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 			return
@@ -119,14 +127,14 @@ func handleListDatasets(w http.ResponseWriter, _ *http.Request) {
 
 func handleListTables(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	dsn, err := resolveDSN(q.Get("db_type"), q.Get("dsn"), q.Get("dsn_ref"))
+	kind, dsn, err := resolveTarget(q.Get("db_type"), q.Get("dsn"), q.Get("dsn_ref"))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
 	ctx, cancel := contextWithTimeout(r)
 	defer cancel()
-	tables, err := dbhub.ListTables(ctx, q.Get("db_type"), dsn)
+	tables, err := dbhub.ListTables(ctx, kind, dsn)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -139,14 +147,14 @@ func handleBatchImport(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	dsn, err := resolveDSN(req.DBType, req.DSN, req.DSNRef)
+	kind, dsn, err := resolveTarget(req.DBType, req.DSN, req.DSNRef)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
 	ctx, cancel := contextWithTimeout(r)
 	defer cancel()
-	imported, err := dbhub.BatchImport(ctx, req.DBType, dsn, req.Table, req.Rows)
+	imported, err := dbhub.BatchImport(ctx, kind, dsn, req.Table, req.Rows)
 	if err != nil {
 		// 参数类错误（表名/列名/行数非法）→ 400；库侧失败 → 200 + ok=false
 		if isParamError(err) {
@@ -164,14 +172,14 @@ func handleBatchQuery(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	dsn, err := resolveDSN(req.DBType, req.DSN, req.DSNRef)
+	kind, dsn, err := resolveTarget(req.DBType, req.DSN, req.DSNRef)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
 	ctx, cancel := contextWithTimeout(r)
 	defer cancel()
-	rows, err := dbhub.BatchQuery(ctx, req.DBType, dsn, req.Table, req.Filters, req.Limit)
+	rows, err := dbhub.BatchQuery(ctx, kind, dsn, req.Table, req.Filters, req.Limit)
 	if err != nil {
 		if isParamError(err) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
@@ -187,19 +195,27 @@ func handleBatchQuery(w http.ResponseWriter, r *http.Request) {
 // helpers
 // ---------------------------------------------------------------------------
 
-// resolveDSN 与 main.go 的 MCP 工具侧同规则：dsn_ref 优先，其次 dsn 明文。
-func resolveDSN(dbType, dsn, dsnRef string) (string, error) {
+// resolveTarget 返回 (kind, dsn)：db_type 缺失时按连接串 scheme 推断，
+// 与 MCP 面 resolveTarget 一致——业务层不必两处各配一遍库类型。
+func resolveTarget(dbType, dsn, dsnRef string) (string, string, error) {
+	target := dsn
 	if dsnRef != "" {
 		d, ok := config.DSN(dsnRef)
 		if !ok {
-			return "", fmt.Errorf("配置中不存在 DSN 引用: %s（已配置: %v）", dsnRef, config.DSNRefs())
+			return "", "", fmt.Errorf("配置中不存在 DSN 引用: %s（已配置: %v）", dsnRef, config.DSNRefs())
 		}
-		return d, nil
+		target = d
 	}
-	if dsn != "" {
-		return dsn, nil
+	if target == "" {
+		return "", "", fmt.Errorf("dsn 与 dsn_ref 至少提供一个")
 	}
-	return "", fmt.Errorf("dsn 与 dsn_ref 至少提供一个")
+	kind := dbType
+	if kind == "" {
+		if kind = dbhub.InferKind(target); kind == "" {
+			return "", "", fmt.Errorf("无法推断数据库类型，请显式传 db_type（可选 %v）", dbhub.Kinds())
+		}
+	}
+	return kind, target, nil
 }
 
 // isParamError 与 main.go 同规则：参数校验类错误 4xx，库侧失败 200+ok=false。

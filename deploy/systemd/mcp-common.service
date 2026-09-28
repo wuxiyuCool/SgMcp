@@ -10,6 +10,11 @@ WorkingDirectory=@APP_DIR@
 Environment=NO_PROXY=*
 Environment=MCP_HOST=0.0.0.0
 Environment=MCP_PORT=9100
+# 注入本层的企业化开关：MCP_SERVER_TOKEN（本端口 Bearer 鉴权）、MCP_RATE_LIMIT_PER_SECOND、
+# MCP_DATA_DIR / MCP_AUDIT_DIR、MCP_FILE_ROOTS、DATASET_* 路由等。
+# 与网关共用同一份 platform.env；若本层要与网关不同 token，在本 unit 里再加一行
+# Environment=MCP_SERVER_TOKEN=... 覆盖即可（网关侧对应配 MCP_DOWNSTREAM_TOKEN_COMMON_TOOLS）。
+EnvironmentFile=-@APP_DIR@/config/platform.env
 ExecStart=@APP_DIR@/.venv/bin/python -m mcp_common_server.main --transport http --host ${MCP_HOST} --port ${MCP_PORT}
 Restart=always
 RestartSec=3

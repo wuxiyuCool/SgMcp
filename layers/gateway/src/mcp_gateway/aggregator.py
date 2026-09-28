@@ -32,6 +32,9 @@ from mcp_gateway.routing import Router, ToolRoute
 
 logger = logging.getLogger("mcp_gateway.aggregator")
 
+# 单个下游 tools/list 发现的超时（秒）：下游半死时不能拖住网关启动
+DISCOVERY_TIMEOUT = float(os.environ.get("MCP_DISCOVERY_TIMEOUT_SECONDS", "10"))
+
 # 默认下游注册表：中层 it_ops + 下层 common（Go 重活 go_datahub 由兼容入口单独追加）
 DEFAULT_DOWNSTREAMS = (
     "it_ops=http://127.0.0.1:9200/mcp,common-tools=http://127.0.0.1:9100/mcp"
@@ -64,17 +67,49 @@ class SyncReport:
         return f"成功: {ok}; 失败: {failed}"
 
 
-def requires_approval(tool: str) -> bool:
+def requires_approval(tool: str, server: str | None = None) -> bool:
     """审批策略：MCP_APPROVAL_TOOLS 显式指定则完全以其为准，否则用默认集合。
+
+    条目支持三种写法（逗号分隔，比对前把点号归一为下划线）：
+    - `itops_create_change`　完整工具名
+    - `data_batch_*`　　　　 前缀通配（整族写操作一次纳管）
+    - `go_datahub:data_submit_collect_job`　带 server 限定（同名工具跨域差异化策略）
 
     比对前把点号归一为下划线（部分平台序列化参数值中的 "." 会损坏，
     全平台工具名已改用下划线前缀；此处兼容历史点号写法）。
     """
+    import fnmatch
+
     canon = tool.replace(".", "_")
     raw = os.environ.get("MCP_APPROVAL_TOOLS")
-    if raw is not None:
-        return canon in {t.strip().replace(".", "_") for t in raw.split(",") if t.strip()}
-    return canon in DEFAULT_APPROVAL_TOOLS
+    if raw is None:
+        return canon in DEFAULT_APPROVAL_TOOLS
+    for entry in (t.strip().replace(".", "_") for t in raw.split(",") if t.strip()):
+        scope, _, pattern = entry.rpartition(":")
+        if not pattern:  # 无 ":" 限定 → 整条即模式
+            scope, pattern = "", entry
+        if scope and server and scope != _norm_server(server):
+            continue
+        if "*" in pattern or "?" in pattern:
+            if fnmatch.fnmatch(canon, pattern):
+                return True
+        elif canon == pattern:
+            return True
+    return False
+
+
+def _norm_server(server: str) -> str:
+    return server.strip().lower().replace("-", "_")
+
+
+def _headers_for(server: str, token: str | None = None) -> dict[str, str] | None:
+    """下游鉴权头：`MCP_DOWNSTREAM_TOKEN_<SERVER 大写>` 优先，其次显式 token。
+
+    网关→下游的 Bearer 与 Go 侧 GO_DATAHUB_TOKEN 同一约定：下游配了 token，
+    网关不配就会以 401 聚合失败（list_downstreams 里可见原因）。
+    """
+    raw = os.environ.get(f"MCP_DOWNSTREAM_TOKEN_{server.strip().upper().replace('-', '_')}") or token
+    return {"Authorization": f"Bearer {raw}"} if raw else None
 
 
 def downstream_specs_from_env() -> list[DownstreamSpec]:
@@ -89,18 +124,19 @@ def downstream_specs_from_env() -> list[DownstreamSpec]:
         name, sep, url = pair.partition("=")
         if not sep or not name.strip() or not url.strip():
             raise ValueError(f"MCP_DOWNSTREAMS 条目格式应为 name=url，实为: {pair!r}")
-        specs.append(DownstreamSpec(name=name.strip(), url=url.strip()))
+        specs.append(DownstreamSpec(name=name.strip(), url=url.strip(),
+                                    headers=_headers_for(name.strip())))
 
     # go_datahub 兼容入口：未显式配置时按 MCP_GODATAHUB_URL/TOKEN 追加（保持既有部署习惯）
     godh_url = os.environ.get("MCP_GODATAHUB_URL", "http://127.0.0.1:9300/mcp")
     godh_token = os.environ.get("MCP_GODATAHUB_TOKEN")
-    godh_headers = {"Authorization": f"Bearer {godh_token}"} if godh_token else None
     existing = next((s for s in specs if s.name == "go_datahub"), None)
     if existing is None:
         if not raw:  # 未显式指定 MCP_DOWNSTREAMS → 追加默认 go_datahub
-            specs.append(DownstreamSpec("go_datahub", godh_url, godh_headers))
-    elif existing.headers is None:
-        existing.headers = godh_headers
+            specs.append(DownstreamSpec("go_datahub", godh_url,
+                                        _headers_for("go_datahub", godh_token)))
+    elif existing.headers is None and godh_token:
+        existing.headers = {"Authorization": f"Bearer {godh_token}"}
     return specs
 
 
@@ -115,27 +151,35 @@ class Aggregator:
         self.router = router
         self.specs = specs if specs is not None else downstream_specs_from_env()
         self.on_sync: Callable[[], None] | None = None
+        self.last_report = SyncReport()
+        self.last_sync_at: float | None = None
 
     # ---- 发现 ----
-    async def _list_downstream(self, spec: DownstreamSpec) -> list:
+    async def _list_downstream(self, spec: DownstreamSpec,
+                               status_sink: list[int] | None = None) -> list:
         """连一个下游拉 tools/list（返回 mcp.types.Tool 列表）。失败抛异常由调用方记录。"""
         from mcp import Client
+        from mcp.client.streamable_http import streamable_http_client
+        from mcp_shared.mcp_client import new_http_client
 
-        if not spec.headers:
-            client = Client(spec.url, raise_exceptions=True, mode="legacy")
-        else:
-            import httpx2
-            from mcp.client.streamable_http import streamable_http_client
-
-            # mode 必须显式 legacy：默认 auto 的探测/回退竞态会把 URL 编码进请求路径（见 routing.py 注释）
-            transport = streamable_http_client(
-                spec.url, http_client=httpx2.AsyncClient(headers=spec.headers)
-            )
-            client = Client(transport, raise_exceptions=True, mode="legacy")
+        # mode 必须显式 legacy：默认 auto 的探测/回退竞态会把 URL 编码进请求路径（见 routing.py 注释）
+        # 发现同样要设超时——下游半死时不能让网关启动/refresh_routes 卡死
+        transport = streamable_http_client(
+            spec.url, http_client=new_http_client(spec.headers, DISCOVERY_TIMEOUT, status_sink)
+        )
+        client = Client(transport, raise_exceptions=True, mode="legacy")
 
         async with client:
             result = await client.list_tools()
         return list(result.tools)
+
+    def describe_failure(self, exc: BaseException, spec: "DownstreamSpec",
+                         status_sink: list[int] | None = None) -> str:
+        """聚合失败转成人能照着做的一句话（含 kind 与真实 HTTP 状态），而不是裸 ExceptionGroup。"""
+        from mcp_shared.mcp_client import classify_error
+
+        kind, hint, _ = classify_error(exc, spec.url, "tools/list", status_sink)
+        return f"{kind}: {type(exc).__name__}（{spec.url}）——{hint}"
 
     def sync(self, retry_seconds: float | None = None) -> SyncReport:
         """对所有下游做一轮聚合（带重试窗口），把工具表合并进路由表。
@@ -152,12 +196,13 @@ class Aggregator:
         while True:
             still_pending: list[DownstreamSpec] = []
             for spec in pending:
+                status_sink: list[int] = []
                 try:
-                    tools = asyncio.run(self._list_downstream(spec))
+                    tools = asyncio.run(self._list_downstream(spec, status_sink))
                 except Exception as e:  # noqa: BLE001 — 单个下游失败不能拖垮整体聚合
-                    logger.warning("下游 %s (%s) 暂不可达: %s", spec.name, spec.url, e)
+                    logger.warning("下游 %s (%s) 聚合失败: %s", spec.name, spec.url, e)
                     still_pending.append(spec)
-                    report.failed[spec.name] = f"{type(e).__name__}: {e}"
+                    report.failed[spec.name] = self.describe_failure(e, spec, status_sink)
                     continue
                 report.failed.pop(spec.name, None)
                 report.ok[spec.name] = len(tools)
@@ -173,6 +218,8 @@ class Aggregator:
                 "重试窗口耗尽，未聚合的下游: %s（网关继续启动，可稍后调用 refresh_routes 补拉）",
                 ", ".join(s.name for s in pending),
             )
+        self.last_report = report
+        self.last_sync_at = time.time()
         if self.on_sync is not None:
             try:
                 self.on_sync()
@@ -186,20 +233,35 @@ class Aggregator:
         for t in tools:
             desc = (t.description or "").strip()
             summary = desc.splitlines()[0] if desc else f"{spec.name}.{t.name}"
+            ann = getattr(t, "annotations", None)
             routes.append(
                 ToolRoute(
                     server=spec.name,
                     tool=t.name,
                     exec_kind="http",
-                    requires_approval=requires_approval(t.name),
+                    requires_approval=requires_approval(t.name, spec.name),
                     summary=summary,
                     endpoint=spec.url,
                     headers=spec.headers,
                     input_schema=t.input_schema,
+                    read_only=bool(getattr(ann, "readOnlyHint", False)),
+                    open_world=getattr(ann, "openWorldHint", None),
                 )
             )
         self.router.replace_server_routes(spec.name, routes)
 
     # ---- 供 list_routes / 诊断用 ----
     def downstream_status(self) -> list[dict[str, str]]:
-        return [{"name": s.name, "url": s.url} for s in self.specs]
+        """各下游的聚合健康度（供网关 list_downstreams 诊断）。"""
+        out = []
+        for s in self.specs:
+            agg = self.last_report.ok.get(s.name)
+            item = {"name": s.name, "url": s.url,
+                    "tools_aggregated": agg if agg is not None else 0,
+                    "status": "ok" if agg is not None else (
+                        f"failed: {self.last_report.failed.get(s.name)}" if s.name in self.last_report.failed
+                        else "never_synced")}
+            if s.headers:
+                item["auth"] = "bearer"
+            out.append(item)
+        return out

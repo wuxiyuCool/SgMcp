@@ -14,7 +14,7 @@ import (
 
 func connectInMemory(t *testing.T) *mcp.ClientSession {
 	t.Helper()
-	server, _ := buildServer()
+	server, _, _ := buildServer()
 	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
 	ct, st := mcp.NewInMemoryTransports()
 	ctx := context.Background()
@@ -214,21 +214,31 @@ func TestListDsnRefs(t *testing.T) {
 
 	sess := connectInMemory(t)
 	out := callStructured[struct {
-		Refs        []string `json:"refs"`
+		Refs []struct {
+			Name string `json:"name"`
+			Type string `json:"type"`
+		} `json:"refs"`
 		ConfigFound bool     `json:"config_found"`
+		FileRoots   []string `json:"file_roots"`
 	}](t, sess, "data_list_dsn_refs", nil)
 	found := false
 	for _, r := range out.Refs {
-		if r == "demo_pg" {
+		if r.Name == "demo_pg" {
 			found = true
+			if r.Type != "pg" {
+				t.Fatalf("refs 应带自动推断的库类型，demo_pg 实为 %q", r.Type)
+			}
 		}
+	}
+	if len(out.FileRoots) == 0 {
+		t.Fatalf("file_roots 不应为空（文件工具路径围栏）")
 	}
 	if !found {
 		t.Fatalf("DSN_DEMO_PG 环境变量未出现在 refs: %v", out.Refs)
 	}
 	for _, r := range out.Refs {
-		if strings.Contains(r, "://") {
-			t.Fatalf("refs 不应包含连接串本体: %v", out.Refs)
+		if strings.Contains(r.Name, "://") || strings.Contains(r.Type, "://") {
+			t.Fatalf("refs 不应包含连接串本体: %+v", out.Refs)
 		}
 	}
 }

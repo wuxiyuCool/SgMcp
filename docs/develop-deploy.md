@@ -47,7 +47,7 @@ SgMcp/
 │   │           └── datahub.env.example  # 监听/令牌/DSN_<名称> 注册表
 ├── tests/
 │   ├── smoke_test.py                # 协议级冒烟（内存 Client，不起网络）
-│   └── ops/run_ops_test.py          # 真实 HTTP 链路 36 项断言（可进 CI）
+│   └── ops/run_ops_test.py          # 真实 HTTP 链路 52 项断言（含企业化守护套件，可进 CI）
 └── scripts/
     ├── setup.ps1 / run-demo.ps1 / ops-check.ps1      # Windows 开发
     └── serversctl.sh                                 # Linux 启停（start|stop|restart|status）
@@ -59,9 +59,9 @@ SgMcp/
 
 AI 客户端只需记忆 3 个 route_* 工具（见 §2.5）；下列方法是各域 `method` 枚举取值。
 
-**common-tools（下层·轻活，14）**：`now` `timestamp` `echo` `slugify` `generate_id`
+**common-tools（下层·轻活，15）**：`now` `timestamp` `echo` `slugify` `generate_id`
 `hash_text` `base64_codec` `uuid_generate` `random_string` `json_tool`
-`datetime_convert`（时区转换+偏移）`url_parse` `regex_find` `text_stats`
+`datetime_convert`（时区转换+偏移）`url_parse` `regex_find` `text_stats` `server_self_check`（下层自检）
 
 **it_ops（中层·业务，13）**：`itops_create_incident` `itops_list_incidents` `itops_update_incident_status`
 `itops_create_change`【需审批】 `itops_get_change` `itops_register_asset` `itops_list_assets`
@@ -136,7 +136,12 @@ mcp.AddTool(server, &mcp.Tool{
 | `list_routes` | 全量路由明细（server/tool/入参 schema/审批标记） |
 | `list_tool_catalog` | 工具目录说明书：按 MCP server 分组，逐工具标注所在下游（in_mcp/endpoint）、参数类型与必填、`route_*` 可直接套用的调用示例，及「AI→网关→route_*→HTTP 转发→下游」的完整传递链 |
 | `refresh_routes` / `list_downstreams` | 运行时补拉工具表并**重建 route_* 枚举** / 诊断下游清单 |
-| `list_pending_approvals` / `approve_request` / `reject_request` | HITL 审批三件套 |
+| `list_pending_approvals` / `list_approvals` / `approve_request` / `reject_request` / `retry_execution` | HITL 审批：待办、台账、决策（需审批令牌）、执行失败重放 |
+| `describe_gateway` | 部署自检：路由数、下游聚合健康度、**生效的安全开关**（令牌/Bearer/超时/上限） |
+| `query_audit_log` | 调用审计回查（按 event/server/tool/call_id 过滤，敏感入参已脱敏） |
+
+写操作可调 `idempotency_key`（`gateway_call` 与 `route_*` 都支持）：AI 平台超时重发时，
+同一 key 不会二次执行——这是对"模型重试 = 重复建单"这类事故的兜底。
 
 route_* 工具由 `aggregator.on_sync → rebuild_route_tools()` 在每轮聚合后整体重建，
 枚举始终与下游最新工具表一致。新增下游 server 时同样自动生成对应 route 工具，
@@ -148,7 +153,7 @@ route_* 工具由 `aggregator.on_sync → rebuild_route_tools()` 在每轮聚合
 powershell -File scripts/setup.ps1        # 建 .venv + editable 安装（或 uv sync --all-packages，
                                           # 内网需 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/）
 powershell -File scripts/run-demo.ps1     # 一键起 common:9100 / itops:9200 / gateway:9000 (+本地 Go)
-powershell -File scripts/ops-check.ps1    # 一键自检：起服务→36 项断言→停服务（退出码可进 CI）
+powershell -File scripts/ops-check.ps1    # 一键自检：起服务→52 项断言（含 guard 守护套件）→停服务
 python tests/smoke_test.py                # 改代码后的秒级协议冒烟
 cd layers/business/go_datahub; go test ./...   # Go 侧内存链路测试
 ```
@@ -219,7 +224,7 @@ cp config/platform.env.example config/platform.env && vi config/platform.env
 HOST=0.0.0.0 bash scripts/serversctl.sh restart    # ★ HOST 不设默认只监听 127.0.0.1
 bash scripts/serversctl.sh status                  # 三个 [UP] 即正常
 ss -tlnp | grep 9000                               # 应见 *:9000
-NO_PROXY='*' .venv/bin/python tests/ops/run_ops_test.py --skip-go   # 20 项断言 OPS_TEST_OK
+NO_PROXY='*' .venv/bin/python tests/ops/run_ops_test.py --skip-go   # 无 Go 层降级跑，退出码 0 打 OPS_TEST_OK
 
 # 防火墙（对外提供时）
 firewall-cmd --add-port=9000/tcp --permanent && firewall-cmd --reload
@@ -290,3 +295,106 @@ unit 只注入路径/用户；监听、token、DSN 全由 `config/datahub.env` �
 - 密码零传输：数据库连接串只存 Go 机本地，工具传 `dsn_ref` 名称
 - 高风险写操作（含 `submit_collect_job`）必须经网关 HITL 审批后执行
 - 对外只开 9000；9100/9200/9300 内网互通；跨公网必须前置 TLS 反代
+
+
+---
+
+## 8. 企业化开关与上线清单
+
+### 8.1 安全/可靠性开关（全部在 `config/platform.env`，不配即开发默认）
+
+| 键 | 默认 | 作用 | 不配的代价 |
+|----|------|------|------------|
+| `MCP_GATEWAY_TOKEN` | 空 | 网关端口 Bearer 鉴权 | 任何能连到 :9000 的人=可以调用全部下游工具 |
+| `MCP_SERVER_TOKEN` | 空 | 业务/下层端口 Bearer 鉴权（各 server 同名） | 绕过网关直连下游即可跳过审批 |
+| `MCP_DOWNSTREAM_TOKEN_<域名大写>` | 空 | 网关→下游的 Bearer 头 | 下游启用鉴权时聚合 401 |
+| `MCP_APPROVAL_TOKEN` | 空 | **审批令牌**：approve/reject/retry 必须携带 | AI 可自问自答放行高风险写操作 |
+| `MCP_RATE_LIMIT_PER_SECOND` | 0（不限） | 按客户端滑动窗口限流，超限 429 | 平台重试风暴直接打穿下游 |
+| `MCP_TRUSTED_PROXY` | 空 | 可信反代 IP/CIDR，仅此来源采信 X-Forwarded-For | 伪造头即可绕过限流分桶 |
+| `MCP_DOWNSTREAM_TIMEOUT_SECONDS` | 60 | 下游调用整体超时（可按工具覆盖） | 下游半死→worker 线程挂死→网关整体不可用 |
+| `MCP_DOWNSTREAM_RETRIES` | 1 | **只读**工具的失败重试次数（写操作恒不重试） | 手动重试写操作=重复落库 |
+| `MCP_IDEMPOTENCY_TTL_SECONDS` | 600 | `idempotency_key` 缓存窗口（0=关闭） | AI 重发即二次执行 |
+| `MCP_MAX_RESULT_ITEMS` / `MCP_MAX_RESULT_CHARS` | 200 / 20000 | 返回给 AI 的结果规模上限（超限截断并引导） | 一次查询吃掉整个上下文窗口 |
+| `MCP_APPROVAL_TTL_MINUTES` | 240 | 审批单超时自动关闭 | 陈旧参数快照被放行 |
+| `MCP_APPROVAL_DEDUPE_SECONDS` | 300 | 等值请求合并到同一张审批单 | 一次重试堆 N 张单让人重复决策 |
+| `MCP_AUDIT_DIR` | `<root>/data/audit` | 审计与审批台账目录 | — |
+| `MCP_AUDIT_MAX_BYTES` / `MCP_AUDIT_KEEP` | 20MB / 3 | 审计文件按大小轮转与保留份数（防写满磁盘） | 长期运行撑爆数据盘 |
+| `MCP_AUDIT_SLOW_MS` | 3000 | 慢调用告警阈值 | — |
+| `MCP_FILE_ROOTS` | 空=拒绝 | Python 侧文件类入参的路径白名单 | 任意文件读取 |
+| `GO_DATAHUB_FILE_ROOTS` | 临时/工作/exe 目录 | Go 文件工具路径围栏 | AI 可读本机任意文件、覆盖写 |
+| `GO_DATAHUB_POOL_MAX` / `GO_DATAHUB_POOL_IDLE_SECONDS` | 8 / 600 | 数据库连接池复用与空闲回收 | 每次调用重连，跨机房明显变慢 |
+| `GO_DATAHUB_JOB_HISTORY` | 500 | 异步任务历史保留条数 | 长跑进程任务表只增不减 |
+| `GO_DATAHUB_IMPORT_GROUP` | 500 | 批量导入单语句合并行数 | 5 万行=5 万次往返 |
+
+### 8.1.1 三层怎么读到这些开关
+
+- **systemd（Linux）**：`mcp-gateway` / `mcp-itops` / `mcp-common` 三个 unit 都带
+  `EnvironmentFile=-@APP_DIR@/config/platform.env`，改完文件 `systemctl daemon-reload && systemctl restart mcp-*` 即生效。
+  三个 Python 层默认共用同一个 `MCP_SERVER_TOKEN`；要让某层用不同令牌，在该 unit 里再加一行
+  `Environment=MCP_SERVER_TOKEN=xxx` 覆盖，并同步网关侧的 `MCP_DOWNSTREAM_TOKEN_<域名大写>`。
+- **serversctl.sh / 手工起**：`load_platform_env()` 会从 cwd 逐级向上找 `config/platform.env`，
+  所以在部署目录里直接 `bash scripts/serversctl.sh restart` 也会读到；OS 环境变量优先于文件。
+- **Go 层**：只读自己的 `layers/business/go_datahub/config/datahub.env`（或 `GO_DATAHUB_CONFIG` 指定），
+  与 Python 侧文件分离，适配分机部署。
+
+### 8.2 上线前自检（三步）
+
+```bash
+# 1) 端口活着且真能应答（/healthz 免鉴权）
+bash scripts/serversctl.sh health
+curl -s http://127.0.0.1:9300/internal/healthz      # Go 层（版本/连接池/任务概览）
+
+# 2) 网关侧配置生效情况——重点看 security
+#    （AI 客户端或运维脚本调 describe_gateway）
+curl -s -X POST http://127.0.0.1:9000/healthz        # 应为 {"ok":true,...}
+
+# 3) 全链路回归（起服务 + 53 项断言，含企业化守护套件）
+powershell -ExecutionPolicy Bypass -File scripts/ops-check.ps1              # Windows 默认模式
+powershell -ExecutionPolicy Bypass -File scripts/ops-check.ps1 -Secure      # 全链路鉴权模式（下条）
+bash scripts/serversctl.sh restart && .venv/bin/python tests/ops/run_ops_test.py   # Linux
+```
+
+`describe_gateway.security` 里 `approval_token_required` 与 `gateway_bearer_enabled`
+只要有一个是 `false`，就是**未达生产标准**（ops-check 会打印提示）。
+
+### 8.2.1 `-Secure` 全链路鉴权自检（推荐的验收方式）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/ops-check.ps1 -Secure
+```
+
+脚本临时生成随机令牌并写入本次进程环境（不落盘、不进 git），四层全部以 Bearer 启动，
+然后跑完整 53 项断言。它额外证明了默认模式证明不了的东西：
+
+- 不带 `Authorization` 连不上网关（401），`/healthz` 仍免鉴权可探活；
+- 网关用 `MCP_DOWNSTREAM_TOKEN_IT_OPS` / `_COMMON_TOOLS` / `MCP_GODATAHUB_TOKEN`
+  能正常聚合启用了鉴权的下游（配错会直接在 `list_downstreams` 里显示 `unauthorized`）；
+- **审批闸门**：无令牌 `approve_request` 被拒，审批人带 `X-Sg-Approval-Token` 请求头即放行
+  （断言名「审批令牌闸门（AI 不可自批）」，默认模式下显示"跳过"）；
+- Go 层带 token 时 `/mcp`、`/internal/*`、`/internal/healthz` 均可用。
+
+### 8.3 审计与台账在哪
+
+| 文件 | 内容 |
+|------|------|
+| `data/audit/enterprise-gateway.jsonl` | 网关路由级事件：`tool_call` / `tool_error` / `approval_*` / `idempotent_hit` / `routes_refreshed` |
+| `data/audit/<server>.jsonl` | 各层 server 自己收到的每次 `tools/call`（由 `run_server` 自动挂载的中间件写入） |
+| `data/audit/approvals.jsonl` | 审批台账事件流（创建/决策/执行），网关启动时重放恢复待办 |
+
+入参里的 `token`/`password`/`dsn`/`authorization` 等敏感键在落盘前统一替换为 `***`，
+长文本截断并标注原长；回查用网关工具 `query_audit_log`（按 `call_id` 可串起跨层链路）。
+
+### 8.4 排障：报错怎么读
+
+网关转发的失败消息形如：
+
+```
+调用下游 data_batch_import 失败：…｜kind=unreachable｜建议：下游服务不可达。请用
+list_downstreams 查看聚合状态…（已尝试 1 次）｜call_id=cal_5f3a…
+```
+
+- `kind` 决定动作：`unreachable`→下游没起；`unauthorized`→两侧 token 不一致；
+  `timeout`→改异步任务或按工具调大超时；`tool_error`→按下游原文改入参。
+- **写调用 `已尝试 1 次` 是固定的**：网关不对写操作自动重试，重复执行只会发生在你自己重发时——
+  带上 `idempotency_key` 就安全。
+- 拿 `call_id` 去 `query_audit_log` 与 `logs/*.log`、Go 侧日志里查同一笔调用的全链细节。

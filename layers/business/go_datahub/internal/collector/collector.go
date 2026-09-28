@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/sg/mcp/go-datahub/internal/config"
 	"github.com/sg/mcp/go-datahub/internal/dbhub"
+	"github.com/sg/mcp/go-datahub/internal/filetools"
 	"github.com/sg/mcp/go-datahub/internal/jobs"
 )
 
@@ -87,6 +89,64 @@ func (r *Registry) Run(ctx context.Context, job *jobs.Handle, name string, p Par
 }
 
 // --- 参数小工具 -----------------------------------------------------------
+
+// dangerousSQL 以词边界匹配写操作/危险函数关键字（列名如 update_time、delete_flag
+// 不会误伤：下划线是单词字符，不构成词边界）。
+var dangerousSQL = regexp.MustCompile(`(?i)\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|merge|exec|execute|copy|vacuum|outfile|dumpfile|load_file|infile|pg_sleep|dbms_lock|benchmark|lo_import|lo_export|pg_read_file|shutdown)\b`)
+
+// dangerousTables 明确禁止读取的账号/权限类系统对象（凭证泄露面）。
+var dangerousTables = regexp.MustCompile(`(?i)\b(mysql\.user|mysql\.db|information_schema\.(user|user_privileges|columns_priv)|pg_shadow|pg_authid|sys\.sql_logins|sys\.server_principals|sys\.database_principals|dba_users|all_users)\b`)
+
+// GuardSelect 校验「只读单条查询」：允许 SELECT 与 WITH…SELECT（CTE 只读），
+// 拒绝多语句、注释伪装与写/系统表访问关键字。
+func GuardSelect(query string) error {
+	body := stripSQLComments(strings.TrimSpace(query))
+	if body == "" {
+		return fmt.Errorf("sql 不能为空")
+	}
+	if len(query) > 20000 {
+		return fmt.Errorf("sql 过长（%d 字符 > 20000），请简化查询", len(query))
+	}
+	trimmed := strings.TrimRight(body, " ;")
+	if strings.Contains(trimmed, ";") {
+		return fmt.Errorf("只允许单条 SELECT 语句（检测到分号，疑似拼接多条）")
+	}
+	if !(strings.HasPrefix(strings.ToLower(trimmed), "select") || strings.HasPrefix(strings.ToLower(trimmed), "with")) {
+		return fmt.Errorf("sql 只允许以 SELECT 或 WITH 开头（只读查询），写操作请用库表工具并走审批闸门")
+	}
+	if got := dangerousSQL.FindString(trimmed); got != "" {
+		return fmt.Errorf("sql 含被禁止的写法 %q（本工具只允许只读查询）", got)
+	}
+	if got := dangerousTables.FindString(trimmed); got != "" {
+		return fmt.Errorf("sql 不允许访问账号/权限系统对象 %q", got)
+	}
+	return nil
+}
+
+// stripSQLComments 去掉 -- 行注释与 /* */ 块注释（防注释伪装关键字绕过检查）。
+func stripSQLComments(q string) string {
+	var sb strings.Builder
+	for i := 0; i < len(q); {
+		if i+1 < len(q) && q[i] == '-' && q[i+1] == '-' {
+			for i < len(q) && q[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if i+1 < len(q) && q[i] == '/' && q[i+1] == '*' {
+			j := strings.Index(q[i+2:], "*/")
+			if j < 0 {
+				break
+			}
+			i += 2 + j + 2
+			sb.WriteByte(' ')
+			continue
+		}
+		sb.WriteByte(q[i])
+		i++
+	}
+	return strings.TrimSpace(sb.String())
+}
 
 func intParam(p Params, key string, def int) int {
 	if v, ok := p[key]; ok {
@@ -171,6 +231,10 @@ func (CsvSource) Collect(ctx context.Context, p Params, emit func(Record) error)
 	if err != nil {
 		return err
 	}
+	path, err = filetools.CheckPath(path, false) // 路径围栏：AI 给的 path 不能读任意文件
+	if err != nil {
+		return err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("打开文件失败: %w", err)
@@ -219,6 +283,22 @@ func (HttpSource) Description() string {
 	return "GET 一个 HTTP 接口并把响应体作为单条记录采集（params: url=必填, list_key=可选，按数组字段拆行）"
 }
 
+// httpCollectClient 采集用 HTTP 客户端：必须自带超时——http.DefaultClient 无超时，
+// 对端挂起会让 job 永久 running 并占住连接。
+var httpCollectClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          20,
+		IdleConnTimeout:       60 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+}
+
+// MaxHTTPBody 单次接口采集的响应体上限（8MB）：超限截断并报错，防 OOM。
+const MaxHTTPBody = 8 << 20
+
 func (HttpSource) Collect(ctx context.Context, p Params, emit func(Record) error) error {
 	url, err := strParam(p, "url")
 	if err != nil {
@@ -228,7 +308,7 @@ func (HttpSource) Collect(ctx context.Context, p Params, emit func(Record) error
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpCollectClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("请求失败: %w", err)
 	}
@@ -237,9 +317,12 @@ func (HttpSource) Collect(ctx context.Context, p Params, emit func(Record) error
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	// 骨架实现：整个响应体作为一条记录，真实业务在此换成解码 + 分页拉取。
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPBody+1))
 	if err != nil {
 		return err
+	}
+	if int64(len(body)) > MaxHTTPBody {
+		return fmt.Errorf("接口响应超过 %d 字节上限，请改用分页采集", MaxHTTPBody)
 	}
 	return emit(Record{"url": url, "status": resp.StatusCode, "body": string(body)})
 }
@@ -287,9 +370,8 @@ func (DbQuerySource) Collect(ctx context.Context, p Params, emit func(Record) er
 	if err != nil {
 		return err
 	}
-	// 简单护栏：只允许单条 SELECT，写操作必须走审批闸门的其他通道。
-	if len(query) < 6 || query[:6] != "SELECT" && query[:6] != "select" {
-		return fmt.Errorf("sql 参数只允许 SELECT 查询")
+	if err := GuardSelect(query); err != nil {
+		return err
 	}
 	maxRows := intParam(p, "max_rows", 0)
 
@@ -356,8 +438,8 @@ func Preview(ctx context.Context, p Params, limit int) (kind string, cols []stri
 	if err != nil {
 		return "", nil, nil, false, err
 	}
-	if len(query) < 6 || !strings.EqualFold(query[:6], "SELECT") {
-		return "", nil, nil, false, fmt.Errorf("sql 参数只允许 SELECT 查询")
+	if err := GuardSelect(query); err != nil {
+		return "", nil, nil, false, err
 	}
 	db, err := dbhub.Open(kind, dsn)
 	if err != nil {

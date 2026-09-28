@@ -4,6 +4,7 @@
 #   bash scripts/serversctl.sh start     # 后台拉起 common/itops/gateway
 #   bash scripts/serversctl.sh stop      # 按 PID 逐个停止
 #   bash scripts/serversctl.sh status    # 查看存活与端口
+#   bash scripts/serversctl.sh health    # 打 /healthz 确认真能应答（免鉴权探针）
 #   bash scripts/serversctl.sh restart   # 先停后起
 #
 # 可配置环境变量：
@@ -84,6 +85,24 @@ stop() {
   done
 }
 
+health() {
+  # 走 /healthz（免鉴权）确认真能应答，不只是进程活着；Bash 无 curl 时退回 PID 检查
+  for svc in "${SERVICES[@]}"; do
+    IFS=: read -r name entry port <<<"$svc"
+    if command -v curl >/dev/null 2>&1; then
+      out="$(curl -fsS --max-time 3 "http://127.0.0.1:$port/healthz" 2>/dev/null || true)"
+      if [ -n "$out" ]; then
+        echo "  [ HEALTHY ] $name :$port  ${out}"
+      else
+        echo "  [ DEAD    ] $name :$port（/healthz 无响应；进程状态见 status）"
+      fi
+    else
+      echo "  [ ? ] 无 curl，无法探测 /healthz（请用 status 看 PID）"
+      return 1
+    fi
+  done
+}
+
 status() {
   for svc in "${SERVICES[@]}"; do
     IFS=: read -r name entry port <<<"$svc"
@@ -100,5 +119,6 @@ case "${1:-}" in
   stop)    stop ;;
   restart) stop; sleep 1; start ;;
   status)  status ;;
-  *)       echo "用法: bash scripts/serversctl.sh {start|stop|restart|status}"; exit 2 ;;
+  health)  health ;;
+  *)       echo "用法: bash scripts/serversctl.sh {start|stop|restart|status|health}"; exit 2 ;;
 esac

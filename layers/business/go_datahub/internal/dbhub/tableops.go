@@ -10,7 +10,9 @@ package dbhub
 import (
 	"context"
 	"fmt"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -73,11 +75,11 @@ func ListTables(ctx context.Context, kind, dsn string) ([]string, error) {
 	if !ok {
 		return nil, fmt.Errorf("不支持的数据库类型: %s（可选 %v）", kind, Kinds())
 	}
-	db, err := Open(kind, dsn)
+	db, release, err := Acquire(kind, dsn)
 	if err != nil {
 		return nil, Scrub(err, dsn)
 	}
-	defer db.Close()
+	defer release() // 连接池共享：只归还，不 Close
 
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -123,18 +125,14 @@ func BatchImport(ctx context.Context, kind, dsn, table string, rows []map[string
 		seen[k] = true
 	}
 
-	ph := make([]string, len(cols))
-	for i := range cols {
-		ph[i] = placeholder(kind, i+1)
-	}
-	sqlText := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-		tbl, strings.Join(cols, ", "), strings.Join(ph, ", "))
+	groupSize := importGroupSize(kind, len(cols))
+	sqlText := buildInsertSQL(kind, tbl, cols, groupSize)
 
-	db, err := Open(kind, dsn)
+	db, release, err := Acquire(kind, dsn)
 	if err != nil {
 		return 0, Scrub(err, dsn)
 	}
-	defer db.Close()
+	defer release() // 连接池共享：只归还，不 Close
 
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
@@ -151,20 +149,67 @@ func BatchImport(ctx context.Context, kind, dsn, table string, rows []map[string
 	defer stmt.Close()
 
 	imported := 0
-	for _, row := range rows {
-		args := make([]any, len(cols))
-		for i, c := range cols {
-			args[i] = row[c] // 缺失键 → nil
+	for start := 0; start < len(rows); start += groupSize {
+		group := rows[start:min(start+groupSize, len(rows))]
+		args := make([]any, 0, len(group)*len(cols))
+		for _, row := range group {
+			for _, c := range cols {
+				args = append(args, row[c]) // 缺失键 → nil
+			}
 		}
-		if _, err := stmt.ExecContext(ctx, args...); err != nil {
+		// 不满一批时补空行占位（参数个数必须与 SQL 一致）：改为动态构造更省事，
+		// 因此最后一批用单独语句；只有一般情况才走预编译语句。
+		if len(group) < groupSize {
+			single := buildInsertSQL(kind, tbl, cols, len(group))
+			if _, err := tx.ExecContext(ctx, single, args...); err != nil {
+				return 0, Scrub(err, dsn)
+			}
+		} else if _, err := stmt.ExecContext(ctx, args...); err != nil {
 			return 0, Scrub(err, dsn)
 		}
-		imported++
+		imported += len(group)
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, Scrub(err, dsn)
 	}
 	return imported, nil
+}
+
+// importGroupSize 单条 INSERT 合并多少行：一次往返写多行比逐行 Exec 快一个量级
+// （逐行时 5 万行 = 5 万次网络往返）。上限受各库绑定变量个数限制约束。
+func importGroupSize(kind string, cols int) int {
+	if cols < 1 {
+		cols = 1
+	}
+	max := 500
+	if kind == "mssql" { // SQLServer 单语句参数上限 2100
+		max = 2000 / cols
+	} else if kind == "oracle" {
+		max = 1000 / cols // Oracle 绑定变量上限较紧，保守取
+	}
+	if max < 1 {
+		max = 1
+	}
+	if env := strings.TrimSpace(os.Getenv("GO_DATAHUB_IMPORT_GROUP")); env != "" {
+		if n, err := strconv.Atoi(env); err == nil && n > 0 && n < max {
+			max = n
+		}
+	}
+	return max
+}
+
+// buildInsertSQL 生成 n 组 VALUES 的批量 INSERT。
+func buildInsertSQL(kind, table string, cols []string, n int) string {
+	groups := make([]string, 0, n)
+	for r := 0; r < n; r++ {
+		ph := make([]string, len(cols))
+		for i := range cols {
+			ph[i] = placeholder(kind, r*len(cols)+i+1)
+		}
+		groups = append(groups, "("+strings.Join(ph, ", ")+")")
+	}
+	return fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
+		table, strings.Join(cols, ", "), strings.Join(groups, ", "))
 }
 
 // BatchQuery 条件查询（只读）：filters 为等值匹配（列名白名单 + 参数绑定），limit 兜底防全表拖库。
@@ -203,11 +248,11 @@ func BatchQuery(ctx context.Context, kind, dsn, table string, filters map[string
 		sqlText = fmt.Sprintf("SELECT * FROM %s%s LIMIT %d", tbl, cond, limit)
 	}
 
-	db, err := Open(kind, dsn)
+	db, release, err := Acquire(kind, dsn)
 	if err != nil {
 		return nil, Scrub(err, dsn)
 	}
-	defer db.Close()
+	defer release() // 连接池共享：只归还，不 Close
 
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -252,11 +297,11 @@ func CountTable(ctx context.Context, kind, dsn, table string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	db, err := Open(kind, dsn)
+	db, release, err := Acquire(kind, dsn)
 	if err != nil {
 		return 0, Scrub(err, dsn)
 	}
-	defer db.Close()
+	defer release() // 连接池共享：只归还，不 Close
 
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()

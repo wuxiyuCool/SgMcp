@@ -42,7 +42,7 @@ AI 客户端 ──MCP──▶ [上层 gateway = MCP 聚合 + 鉴权 + 路由�
                        │     └─ 需审批写操作：建审批单 → 人工 approve → 转发
                        ▼
         [中层业务 Python MCP Server]      [中层重活 Go MCP Server]
-         - 暴露给 AI 的工具: business.*    - /mcp          -> 给网关聚合，暴露给 AI
+         - 暴露给 AI: itops_* 等域前缀     - /mcp          -> 给网关聚合，暴露给 AI
          - 内部方法: 调 Go、调 DB、        - /internal/*   -> 给业务 Python 内部调
            调其他服务（见下）                   （双端点设计，同端口同 Bearer 鉴权）
                        │                        ▲
@@ -53,18 +53,19 @@ AI 客户端 ──MCP──▶ [上层 gateway = MCP 聚合 + 鉴权 + 路由�
   server 建立 MCP Client 连接，拉取 `tools/list` 合并成本地工具表；AI 调工具时
   按路由经 Streamable HTTP 转发到对应下游。**网关不硬编码任何业务工具**——
   下游新增/删除工具，网关重新聚合即同步（运行时可用 `refresh_routes` 工具补拉）。
-- **工具命名前缀 = 层级语义**：业务层 Python 统一 `business.*`
-  （`@mcp.tool(name="business.xxx")` 别名，函数名不变）；重活层 Go 统一 `heavy.*`。
+- **工具命名前缀 = 层级语义**：业务层 Python 带领域前缀（IT 运维 `itops_*`、制造域将来 `mfg_*`），
+  重活层 Go 统一 `data_*`，下层通用工具不带前缀；名字一律用下划线不含点号（规避部分平台
+  对参数值中 "." 的序列化缺陷）。网关对 AI 再按域收敛成一个 `route_*` 聚合路由工具。
   AI 在网关工具表里一眼分清工具归属，也便于按前缀配置审批/授权策略。
 - **服务间内部调用走 `/internal/*` REST 面（双端点设计）**：重活层 Go server
   同端口两类端点——`/mcp` 只说 MCP 协议（给网关聚合、暴露给 AI）；
   `/internal/v1/*`（HTTP + JSON）给业务 Python 服务间直调，不经网关、不暴露给 AI。
   内部端点（`healthz` / `dsn_refs` / `tables` / `batch/import` / `batch/query`）与
-  同名 heavy.* 工具共用 `internal/dbhub` 核心实现：表名列名白名单 + 值参数绑定 +
+  同名 data_* 工具共用 `internal/dbhub` 核心实现：表名列名白名单 + 值参数绑定 +
   错误脱敏，参数错误 4xx、库侧失败 200 + ok=false。业务层用 httpx2 + Bearer
   直调（`MCP_GODATAHUB_TOKEN`，与 `GO_DATAHUB_TOKEN` 同值）。
-  内置示例见 it_ops 的 `business.export_assets_to_warehouse` /
-  `business.query_warehouse_assets`（完整三跳 `gateway → business → heavy`）。
+  内置示例见 it_ops 的 `itops_export_assets_to_warehouse` /
+  `itops_query_warehouse_assets`（完整三跳 `gateway → business → data`）。
 - 下游注册表来自环境变量（可写入 `config/platform.env`）：`MCP_DOWNSTREAMS`
   （`name=url` 逗号分隔）；`MCP_GODATAHUB_URL/TOKEN` 为 go_datahub 的兼容入口。
   未显式配置时使用默认注册表（it_ops:9200 / common:9100 / go_datahub:9300）。
@@ -84,13 +85,17 @@ AI 客户端 ──MCP──▶ [上层 gateway = MCP 聚合 + 鉴权 + 路由�
 
 ## 3. 审批流（HITL）
 
-1. AI 调用 `gateway_call(server='it_ops', tool='business.create_change', ...)`。
-2. 网关查聚合工具表：`business.create_change` 命中审批策略 `requires_approval=True`
-   （默认集合 `business.create_change` / `heavy.submit_collect_job`，可用
-   `MCP_APPROVAL_TOOLS` 覆盖，见 `aggregator.requires_approval`）。
+1. AI 调用 `route_it_ops(method='itops_create_change', params={...})`
+   （或通用入口 `gateway_call(server='it_ops', tool='itops_create_change', ...)`）。
+2. 网关查聚合工具表：该工具命中审批策略 `requires_approval=True`
+   （默认集合 `itops_create_change` / `data_submit_collect_job`；`MCP_APPROVAL_TOOLS`
+   可覆盖并支持前缀通配与 `server:tool` 限定，见 `aggregator.requires_approval`）。
 3. 网关创建 `ApprovalRequest`（状态 `pending`），返回审批单 ID；**不执行**。
-4. 审批人调用 `list_pending_approvals` 查看，用 `approve_request` / `reject_request` 决定。
-5. 批准 → 网关调用下游执行；驳回 → 不执行。
+4. 审批人（**独立客户端，持 `MCP_APPROVAL_TOKEN`**）调 `list_pending_approvals` 查看，
+   用 `approve_request` / `reject_request` 决定——AI 侧没有令牌，无法自行放行。
+5. 批准 → 网关调用下游执行并回写结果；驳回 → 不执行。
+6. 下游执行失败 → 单据置 `exec_failed`（带 attempts/exec_error），修正原因后
+   `retry_execution` 按原入参重放，不必重新审批。
 
 审批单模型见 `shared/src/mcp_shared/approval.py`。
 
@@ -103,18 +108,73 @@ AI 客户端 ──MCP──▶ [上层 gateway = MCP 聚合 + 鉴权 + 路由�
    （或运行期让 AI 调 `refresh_routes` 补拉）——**无需改网关代码**。
 5. （可选）如该系统有高风险写工具，把工具名加进 `MCP_APPROVAL_TOOLS`。
 
-## 5. 安全与审计（后续推进）
+## 5. 安全、审批与审计（已落地）
 
-- **认证鉴权**：网关接入企业 IdP（OAuth/OIDC），角色映射 RBAC。参考 [Akka MCP Gateway](https://github.com/akka/mcp-gateway)。
-- **审计日志**：每次工具调用记录事件（用户、工具、参数、时间）。可扩为事件溯源。
-- **超时/撤销**：审批单支持超时自动关闭。
+对照公有云 MCP 网关（阿里云 OpenAPI MCP / Higress+Nacos MCP 网关）的通用做法，
+本平台把「AI 不可信」作为前提，逐条在代码里落地。表里每条都标注了**坑点**与**对策**。
+
+### 5.1 HITL 审批不能被 AI 自己放行
+
+| 坑点 | 现象 | 对策 |
+|------|------|------|
+| AI 自批 | `approve_request` 与 `gateway_call` 在同一工具表里，模型可以先挂单再自己批准 | 审批决策要求令牌（服务端配 `MCP_APPROVAL_TOKEN` 即生效）：推荐由审批人独立客户端的请求头
+  `X-Sg-Approval-Token` 携带（模型看不到也无法复述），也支持 `approval_token` 参数（运维脚本用）；
+  `X-Sg-Actor` 作为真实发起人写进台账。未配置时启动打警告，`describe_gateway.security` 与 ops-check 都会显式回报"未鉴权" |
+| 批准即丢单 | 批准后下游执行失败，单据状态已是 approved，重试被状态机拒绝，动作永远没做 | 执行失败置 `exec_failed`（含 `attempts`/`exec_error`），可 `retry_execution` 按原入参重放，无需重新审批 |
+| 陈旧审批 | 挂起几天的单被放行，用的还是当时的参数快照 | `MCP_APPROVAL_TTL_MINUTES`（默认 240）超时自动 `timeout`；待办超 `MCP_APPROVAL_MAX_PENDING` 按最旧撤销 |
+| 重复挂单 | 平台超时重试产生 N 张等值单，人得点 N 次 | 等值请求（server+工具+入参指纹）在 `MCP_APPROVAL_DEDUPE_SECONDS`（默认 300）内复用同一张单 |
+| 重启丢台账 | 审批单只在内存，网关重启后 request_id 全失效、事后无法追责 | JSONL 事件流落盘 `data/audit/approvals.jsonl`，启动重放；`list_approvals(status=…)` 查已决单 |
+| 策略只能写死 | 审批集合只能逐个工具名配 | `MCP_APPROVAL_TOOLS` 支持前缀通配（`data_batch_*`）与 server 限定（`go_datahub:data_submit_collect_job`） |
+
+### 5.2 调用链可靠性（网关 → 下游）
+
+| 坑点 | 后果 | 对策 |
+|------|------|------|
+| 无超时 | 下游半死（TCP 连着不响应）永久占住 SDK worker 线程，整个网关不可用 | 每次转发整体超时：`MCP_DOWNSTREAM_TIMEOUT_SECONDS`（默认 60），可按工具覆盖 `MCP_DOWNSTREAM_TIMEOUT_<工具名大写>`；聚合发现另有 `MCP_DISCOVERY_TIMEOUT_SECONDS` |
+| 盲目重试 | 对写操作重试 = 重复建单/重复导入 | 只有 `readOnlyHint=true` 的下游工具才自动重试一次（`MCP_DOWNSTREAM_RETRIES`）；写调用恒定不重试 |
+| 平台重试导致二次执行 | AI 客户端超时后自己重发，业务数据翻倍 | `gateway_call` / `route_*` 支持 `idempotency_key`：窗口内同键不二次执行，返回缓存结果并标 `idempotent_replay` |
+| 错误不可行动 | 只回"调用失败"，模型反复换姿势重试烧 token | 失败分类为 `timeout/unreachable/unauthorized/not_found/downstream_5xx/tool_error`，消息里带下一步建议；ExceptionGroup 会先展开再归类（否则连不上被误报成协议错误） |
+| 结果过大 | 一次查询把上万行灌进上下文，超 token 且模型读不懂 | `MCP_MAX_RESULT_ITEMS`/`MCP_MAX_RESULT_CHARS` 截断，返回 `truncated/returned/total/note` 引导改用过滤或异步任务；Go 侧预览另有行数上限 |
+| 跨层排障 | AI 报的错对不上服务端日志 | 网关生成 `call_id`，以 `X-Sg-Call-Id` 头透传下游，业务层内部 REST 再透传给 Go；审计与错误消息都带 call_id，`query_audit_log(call_id=…)` 一把查全 |
+
+### 5.3 入口与数据面防护
+
+| 坑点 | 对策 |
+|------|------|
+| Python 端口裸奔（Go 早已有 token，网关/业务层没有） | `shared/mcp_shared/http_kit.py` 纯 ASGI 前置层：`MCP_GATEWAY_TOKEN` / `MCP_SERVER_TOKEN` 非空即要求 Bearer（常数时间比较，401）；网关→下游用 `MCP_DOWNSTREAM_TOKEN_<NAME>` |
+| 无探活、无限流 | 同层提供免鉴权 `GET /healthz`（含 uptime/routes/下游健康度）与按客户端滑动窗口限流（`MCP_RATE_LIMIT_PER_SECOND` → 429 + `Retry-After`）；`X-Forwarded-For` 仅在 `MCP_TRUSTED_PROXY` 命中时采信 |
+| 文件工具任意读写（AI 传 path 即可读 `/etc/passwd`、覆盖任意文件） | Go 侧 `filetools.CheckPath` 路径围栏（`GO_DATAHUB_FILE_ROOTS`，默认临时目录/工作目录/exe 目录；解析软链后判定防穿越；拒写 `*.env` 与目录；`src==dst` 拒绝）；Python 侧 `mcp_shared.limits.safe_path` 同语义（未配白名单即拒绝） |
+| `data_db_query_preview` 名义只读、实际可越权 | `collector.GuardSelect`：剥注释后必须 `SELECT`/`WITH` 开头，禁多语句分号，词边界拦截写关键字与危险函数（`outfile`/`pg_sleep`/`load_file`…），并禁读账号权限类系统对象（`mysql.user`/`pg_authid`/`dba_users`…）；采集器 `db_query`/`csv` 走同一套（csv 也过路径围栏） |
+| 轻工具把进程打满 | `mcp_shared.limits`：文本规模上限 + ReDoS 形态拦截（Python `re` 无超时，`(a+)+b` 一条即可挂死共享进程）；HTTP 采集器自带 30s 超时与 8MB 响应体上限 |
+| 连接不释放/攒内存 | Go 侧 dbhub 连接池复用（LRU + 空闲清理）；jobs 注册表按 `GO_DATAHUB_JOB_HISTORY` 裁剪已结束任务（运行中不裁），停机 `AbortAll` + 关池 |
+| 入参被静默改坏 | 扁平 kv 串支持引号保原样（`msg='v2.0.0'`、`id=007`、`version=1.10` 不再被误转成 7 / 1.1） |
+| 凭证泄露 | 审计与台账落盘前统一脱敏（`token/password/dsn/authorization/…` → `***`，长值截断）；错误消息不带 endpoint URL 与连接串；Go 侧 `dbhub.Scrub` 继续兜底 |
+
+### 5.4 审计
+
+- 每次 `tools/call` 由 SDK server 中间件（`mcp_shared.audit.AuditMiddleware`，`run_server` 自动挂载）
+  统一落盘，业务工具不需要自己埋点；网关额外记录路由级事件（`tool_call`/`tool_error`/
+  `approval_created`/`approval_decided`/`approval_executed`/`approval_exec_failed`/
+  `idempotent_hit`/`routes_refreshed`）。
+- 事件字段：`ts`/`component`/`event`/`call_id`/`actor`/`server`/`tool`/`args`(脱敏)/`ok`/`ms`/`error`。
+- 查询入口：网关工具 `query_audit_log(limit, event, server, tool, call_id)`。
+- 部署自检入口：`describe_gateway`（路由数、下游聚合状态、安全开关生效情况）。
+
+### 5.5 仍待推进
+
+- **认证鉴权升级**：接入企业 IdP（OAuth/OIDC）替代静态 Bearer，角色映射 RBAC
+  （参考 [Akka MCP Gateway](https://github.com/akka/mcp-gateway) 与阿里云 OpenAPI MCP 的
+  OAuth / 静态凭证双模式）；当前令牌为共享密钥，只解决"能不能调"，不解决"以谁的身份调"。
+- **审批人身份**：`approve_request` 的决策人现在固定记 `approver`，接入 IdP 后应把
+  subject 写进台账，实现双人复核与四眼原则。
+- **指标**：调用量/失败率/时方可从审计文件导出，后续接 Prometheus。
 
 ## 6. 技术选型依据
 
 - Python 3.10+，官方 [`mcp`](https://github.com/modelcontextprotocol/python-sdk) SDK **v2**（`>=2.2,<3`）。
 - 用 SDK v2 高层 API **`MCPServer`**（`from mcp.server import MCPServer`）快速暴露 tool；注意旧 `mcp.server.fastmcp.FastMCP` 导入路径在 v2 中**已移除且无兼容层**，社区版 fastmcp v4 是另一个独立项目。
 - **不引入 fastmcp v4**：其 `[server]` extra 会连带约 25 个依赖，而本项目只需「暴露工具 + 转发调用 + 双传输」，官方 SDK 已完整覆盖，额外依赖树与精简目标相悖（对比见 README「技术选型」）。
-- Streamable HTTP 作为生产传输；传输参数（host/port）传给 `mcp.run()` 而非构造器，由 `shared/mcp_shared/server_kit.run_server` 统一收敛（避免五个 server 各抄一份 argparse）。
+- Streamable HTTP 作为生产传输；传输参数（host/port）传给 `mcp.run()` 而非构造器，由 `shared/mcp_shared/server_kit.run_server` 统一收敛（避免五个 server 各抄一份 argparse）。HTTP 模式下再套一层 `mcp_shared.http_kit.HttpFrontend`（Bearer 鉴权 + `/healthz` 探活 + 按客户端限流 + 会话/调用号透传）；未配令牌时只增加探活能力，不改既有行为。
 - 工具返回 `list[...]` 时 SDK 会包一层 `{"result": [...]}` 信封（标量/dict 则不包），客户端解包时需注意。
 - pip + venv 管理依赖（每 server 独立 `pyproject.toml`，开发期共用根 `.venv`）。
 
@@ -151,11 +211,11 @@ go-sdk 已由 MCP 官方仓库维护（v1.8+，stable，Go 1.24+），协议对�
 
 大批量采集**不能**在一次 MCP 工具调用里同步完成（网关 HTTP 转发会超时、审批链路会被长阻塞）：
 
-1. `heavy.submit_collect_job(source, params)` 校验采集器后立即返回 `job_id`（`pending`），**不阻塞**；
-2. 采集在后台 goroutine 流式执行，逐行累计 `rows` 进度，支持 `heavy.cancel_job` 中止（context 传播）；
-3. 客户端轮询 `heavy.get_job_status(job_id)` 取 `running/completed/failed/cancelled`。
+1. `data_submit_collect_job(source, params)` 校验采集器后立即返回 `job_id`（`pending`），**不阻塞**；
+2. 采集在后台 goroutine 流式执行，逐行累计 `rows` 进度，支持 `data_cancel_job` 中止（context 传播）；
+3. 客户端轮询 `data_get_job_status(job_id)` 取 `running/completed/failed/cancelled`。
 
-网关侧 `heavy.submit_collect_job` 标记 `requires_approval=True`：审批人放行后 job 才真正创建。
+网关侧 `data_submit_collect_job` 标记 `requires_approval=True`：审批人放行后 job 才真正创建。
 
 ### 8.4 采集器框架
 
@@ -164,7 +224,7 @@ go-sdk 已由 MCP 官方仓库维护（v1.8+，stable，Go 1.24+），协议对�
 新数据源 = 实现接口 + `Default()` 注册一行。
 `internal/dbhub` 统一多库驱动（纯 Go：go-ora / go-sql-driver / pgx stdlib / go-mssqldb，
 免 Oracle Instant Client 等 CGO 依赖）与 DSN 规范；`tableops.go` 提供贴近业务的
-库表操作（`heavy.list_tables` / `heavy.batch_import` / `heavy.batch_query`）：
+库表操作（`data_list_tables` / `data_batch_import` / `data_batch_query`）：
 表名列名白名单校验 + 值参数绑定（防注入）、事务批量写入（单次上限 5 万行）、
 等值过滤 + 行数上限（防拖库）、四库方言（占位符 pg=$n、oracle=:n、其余=?；
 分页 LIMIT / FETCH FIRST / TOP）集中处理，错误经 `Scrub` 脱敏。
@@ -176,8 +236,14 @@ go-sdk 已由 MCP 官方仓库维护（v1.8+，stable，Go 1.24+），协议对�
   不依赖 `{"result": ...}` 信封；
 - 错误按 Go handler 返回 error → SDK 打包为 `is_error` 工具错误，与 it_ops 行为一致；
 - 网关地址可用 `MCP_GODATAHUB_URL` 环境变量覆盖（默认 `http://127.0.0.1:9300/mcp`）；
-- 测试：`go test ./cmd/datahub-server/`（内存传输协议级）；`scripts/ops-check.ps1` 会自动构建/起停
-  Go server 并跑 34 项断言，无 Go 环境时自动 `--skip-go` 降级。
+- 数据源清单 `data_list_dsn_refs` 返回 `refs=[{name,type}]`（类型自动推断，调用时可省 `db_type`），
+  并附 `file_roots` 便于确认文件工具围栏；`/internal/v1/dsn_refs` 同形态。
+- 内部 REST 与 MCP 面一样支持 dsn 类型自动推断；`tenant_id=default` 走 `_DSN_DEFAULT` 兜底路由
+  （两侧 dsrouting 同规则，租户名限字符集防配置注入）。
+- 优雅停机：SIGINT/SIGTERM → 停止接新请求（10s 宽限）→ 在途任务置 cancelled → 关闭连接池；
+  systemd 重启不会把批量导入腰斩在一半。
+- 测试：`go test ./...`（内存传输协议级 + 路径围栏/SQL 护栏/任务保留窗口单测）；
+  `scripts/ops-check.ps1` 会自动构建/起停 Go server 并跑全量断言，无 Go 环境时自动 `--skip-go` 降级。
 
 ### 8.5.1 业务名路由与批处理（dataset routing）
 
@@ -188,11 +254,11 @@ db    = routeDB("orders", "t1")          # 按租户路由：DATASET_ORDERS_DSN_
 table = routeTable("orders", "2024-05")  # 按月分表：orders_202405
 ```
 
-- **Go 侧** `internal/dsrouting`：`heavy.batch_process`（异步 job，立即返回 task_id，
-  `heavy.get_job_status` 轮询；任务消息记录路由明细）+ `heavy.list_datasets`（数据集发现）。
+- **Go 侧** `internal/dsrouting`：`data_batch_process`（异步 job，立即返回 task_id，
+  `data_get_job_status` 轮询；任务消息记录路由明细）+ `data_list_datasets`（数据集发现）。
   批处理核心 `internal/batchproc`：simulate（演练不触库）/ real（连路由库统计目标表）。
-- **Python 侧** `mcp_shared/dsrouting.py`：`business.batch_process`（业务层路由解析，
-  real 模式经内部 REST `/internal/v1/batch/process` 下放重活执行）+ `business.list_datasets`。
+- **Python 侧** `mcp_shared/dsrouting.py`：`itops_batch_process`（业务层路由解析，
+  real 模式经内部 REST `/internal/v1/batch/process` 下放重活执行）+ `itops_list_datasets`。
   两侧数据集清单一致性有测试断言（`gw_list_datasets`）。
 - **内部面** 对应端点：`POST /internal/v1/batch/process`、`GET /internal/v1/datasets`。
 
@@ -242,9 +308,9 @@ $env:MCP_GODATAHUB_TOKEN = "<与 Go 侧一致的 token>"   # 不设则不带 Aut
 - **打包后可改**：文件在产物之外（Go 从 exe 位置逐级向上找 6 级；也可用
   `GO_DATAHUB_CONFIG` / `MCP_CONFIG_FILE` 指定绝对路径），改完重启进程即生效，无需重编译。
 - **DSN 引用机制（密码零传输）**：数据库连接串只存 Go 服务器的 `DSN_<名称>`，
-  MCP 工具参数用 `dsn_ref:"order_pg"` 引用；`heavy.list_dsn_refs` 只回名称不回值；
+  MCP 工具参数用 `dsn_ref:"order_pg"` 引用；`data_list_dsn_refs` 只回名称不回值；
   驱动报错经 `dbhub.Scrub` 把 DSN/密码替换为 `***` 才返回。
   由此密码不进入 AI 客户端上下文、网关审批单（tool_args）、审计日志与错误回显。
   （兼容：仍可直接传裸 `dsn`，仅建议本机调试用。）
 - 回归覆盖：`go test ./internal/config/`（解析/优先级/引号剥离）、`tests/smoke_test.py`
-  的 config 段、`tests/ops` 「未知 dsn_ref 不泄露凭证」断言、ops-check 26 项全链路。
+  的 config 段、`tests/ops`「未知 dsn_ref 不泄露凭证」与审计脱敏断言、ops-check 全量守护套件。

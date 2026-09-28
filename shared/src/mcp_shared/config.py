@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-__all__ = ["load_platform_env", "get", "config_path"]
+__all__ = ["load_platform_env", "get", "config_path", "project_root", "audit_dir", "data_dir"]
 
 _loaded = False
 _found_path: Path | None = None
@@ -89,8 +89,48 @@ def get(key: str, default: str | None = None) -> str | None:
     return os.environ.get(key, default)
 
 
+_project_root_cache: Path | None = None
+
+
+def project_root() -> Path:
+    """项目根（运行时可写数据目录的锚点）：MCP_PROJECT_ROOT > git 根 > cwd。"""
+    global _project_root_cache
+    if _project_root_cache is not None:
+        return _project_root_cache
+    raw = get("MCP_PROJECT_ROOT")
+    if raw:
+        _project_root_cache = Path(raw)
+        return _project_root_cache
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / ".git").exists():
+            _project_root_cache = parent
+            return _project_root_cache
+    _project_root_cache = Path.cwd()
+    return _project_root_cache
+
+
+def data_dir(subdir: str = "") -> Path:
+    """运行时数据目录（SQLite / 审计 / 审批单），不存在则创建。"""
+    base = Path(get("MCP_DATA_DIR") or (project_root() / "data"))
+    p = base / subdir if subdir else base
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def audit_dir() -> Path:
+    """审计与审批单落盘目录：`MCP_AUDIT_DIR` > `<MCP_DATA_DIR>/audit` > `data/audit`。"""
+    raw = get("MCP_AUDIT_DIR")
+    if raw:
+        p = Path(raw)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    return data_dir("audit")
+
+
 def _reset() -> None:
     """清除加载缓存（仅供测试使用）。"""
-    global _loaded, _found_path
+    global _loaded, _found_path, _project_root_cache
     _loaded = False
     _found_path = None
+    _project_root_cache = None

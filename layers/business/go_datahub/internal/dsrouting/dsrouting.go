@@ -38,32 +38,36 @@ func norm(s string) string { return strings.ToUpper(strings.TrimSpace(s)) }
 // RouteDB 按业务名 + 租户路由数据源：返回 (db_type, dsn_ref)。
 // 键约定：租户专属 = DATASET_<NAME>_DSN_<租户大写>（如 t1 → DATASET_ORDERS_DSN_T1），
 // 未命中回退 DATASET_<NAME>_DSN_DEFAULT，都没有则报可读错误（列出期望的键名）。
-// 租户名保留字 DEFAULT 不允许（与兜底键冲突）。
+// tenant 传 "default"（各工具入参的默认值）即直接走兜底键；租户名参与拼配置键，
+// 必须限字符集，否则调用方可借 tenant_id 读取任意 DATASET_* 键的值。
 func RouteDB(dataset, tenant string) (dbType, dsnRef string, err error) {
 	if !identRe.MatchString(strings.TrimSpace(strings.ToLower(dataset))) {
 		return "", "", fmt.Errorf("数据集名非法（小写字母数字下划线）: %q", dataset)
 	}
 	tn := norm(tenant)
 	if strings.TrimSpace(tenant) == "" {
-		return "", "", fmt.Errorf("tenant_id 不能为空")
+		return "", "", fmt.Errorf("tenant_id 不能为空（本域数据集请传 default 走兜底路由）")
 	}
-	if tn == "DEFAULT" {
-		return "", "", fmt.Errorf("tenant_id 不能为保留字 default")
+	if tn != "DEFAULT" && !identRe.MatchString(strings.ToLower(strings.TrimSpace(tenant))) {
+		return "", "", fmt.Errorf("租户名非法（小写字母开头，可含数字/下划线）: %q", tenant)
 	}
 	base := "DATASET_" + norm(dataset)
 	dbType = config.Value(base + "_DBTYPE")
 	if dbType == "" {
 		dbType = "pg"
 	}
-	if v := config.Value(base + "_DSN_" + tn); v != "" {
-		return dbType, v, nil
+	if tn != "DEFAULT" {
+		if v := config.Value(base + "_DSN_" + tn); v != "" {
+			return dbType, strings.ToLower(v), nil
+		}
 	}
 	if v := config.Value(base + "_DSN_DEFAULT"); v != "" {
-		return dbType, v, nil
+		return dbType, strings.ToLower(v), nil
 	}
 	return "", "", fmt.Errorf(
-		"数据集 %q 未配置路由：需要 %s_DSN_%s 或 %s_DSN_DEFAULT（值为 dsn_ref，见 heavy.list_dsn_refs）",
-		dataset, base, tn, base)
+		"数据集 %q 未配置路由：需要 %s_DSN_<租户> 或 %s_DSN_DEFAULT"+
+			"（值为 dsn_ref，用 data_list_dsn_refs 查数据源、data_list_datasets 查已配置数据集）",
+		dataset, base, base)
 }
 
 // RouteTable 按业务名 + 周期路由表名（按月分表）：orders + 2024-05 → orders_202405。

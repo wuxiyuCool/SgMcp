@@ -11,7 +11,9 @@ WorkingDirectory=@APP_DIR@
 Environment=NO_PROXY=*
 Environment=MCP_HOST=0.0.0.0
 Environment=MCP_PORT=9000
-# 注入 MCP_GODATAHUB_URL / MCP_GODATAHUB_TOKEN（网关→Go 转发配置；文件不存在也不报错）
+# 注入全部平台配置：MCP_GODATAHUB_URL/TOKEN、MCP_GATEWAY_TOKEN（对外端口鉴权）、
+# MCP_APPROVAL_TOKEN（审批令牌）、MCP_RATE_LIMIT_PER_SECOND、MCP_DATA_DIR 等
+# （文件不存在也不报错；生产必须配好令牌，否则网关裸奔、审批可被 AI 自批）
 EnvironmentFile=-@APP_DIR@/config/platform.env
 ExecStart=@APP_DIR@/.venv/bin/python -m mcp_gateway.main --transport http --host ${MCP_HOST} --port ${MCP_PORT}
 Restart=always

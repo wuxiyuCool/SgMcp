@@ -25,6 +25,7 @@ from mcp_shared.config import load_platform_env
 
 _PERIOD_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 _IDENT_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+_TENANT_RE = _IDENT_RE
 
 
 def _norm(s: str) -> str:
@@ -41,25 +42,29 @@ def _check_dataset(dataset: str) -> str:
 def route_db(dataset: str, tenant: str) -> tuple[str, str]:
     """按业务名 + 租户路由数据源，返回 (db_type, dsn_ref)。
 
-    先查租户专属键，未命中回退 DEFAULT；都没有抛 ValueError（错误里列出期望键名）。
+    tenant 传 "default"（各工具默认值）或空串 → 直接取兜底键；其他值先查租户专属键、
+    未命中回退兜底。租户名参与拼环境变量键，必须校验字符集——否则调用方能借
+    tenant_id 读取任意 `DATASET_*` 键的值（配置注入）。
     """
     ds = _check_dataset(dataset)
-    tn = _norm(tenant)
     if not tenant or not tenant.strip():
-        raise ValueError("tenant_id 不能为空")
-    if tn == "DEFAULT":
-        raise ValueError("tenant_id 不能为保留字 default")
+        raise ValueError("tenant_id 不能为空（本域数据集请传 default 走兜底路由）")
+    tn = _norm(tenant)
+    if tn != "DEFAULT" and not _TENANT_RE.match(tenant.strip().lower()):
+        raise ValueError(f"租户名非法（小写字母开头，可含数字/下划线）: {tenant!r}")
     load_platform_env()  # 幂等：把 config/platform.env 的 DATASET_* 注入 os.environ
     base = f"DATASET_{_norm(dataset)}"
     db_type = os.environ.get(f"{base}_DBTYPE") or "pg"
-    specific = f"{base}_DSN_{tn}"
-    if os.environ.get(specific):
-        return db_type, os.environ[specific].strip().lower()
     fallback = f"{base}_DSN_DEFAULT"
+    if tn != "DEFAULT":
+        specific = f"{base}_DSN_{tn}"
+        if os.environ.get(specific):
+            return db_type, os.environ[specific].strip().lower()
     if os.environ.get(fallback):
         return db_type, os.environ[fallback].strip().lower()
     raise ValueError(
-        f"数据集 {dataset!r} 未配置路由：需要 {specific} 或 {fallback}（值为 dsn_ref，见 heavy.list_dsn_refs）"
+        f"数据集 {dataset!r} 未配置路由：需要 {base}_DSN_<租户> 或 {fallback}"
+        f"（值为 dsn_ref，用 data_list_dsn_refs 查可用数据源、data_list_datasets 查已配置数据集）"
     )
 
 
@@ -78,28 +83,36 @@ def table_of(dataset: str) -> str:
 
 
 def list_datasets() -> list[dict[str, Any]]:
-    """枚举已配置的数据集路由（扫描 DATASET_* 键，只回名称与引用名，不回连接串）。"""
-    import os
+    """枚举已配置的数据集路由（扫描 DATASET_* 键，只回名称与引用名，不回连接串）。
 
+    字段与 Go 侧 dsrouting.DatasetInfo 对齐（dataset/db_type/domain/desc/
+    tenants/dsn_tenant_refs/dsn_default），两侧清单一致性由测试断言。
+    """
     load_platform_env()
     sets: dict[str, dict[str, Any]] = {}
+
+    def slot(name: str) -> dict[str, Any]:
+        return sets.setdefault(name, {"dbtype": "", "default": "", "domain": "",
+                                      "desc": "", "tenants": {}})
+
     for key in os.environ:
         if not key.startswith("DATASET_"):
             continue
         rest = key[len("DATASET_"):]
+        val = (os.environ[key] or "").strip()
         if rest.endswith("_DBTYPE"):
-            name = rest[: -len("_DBTYPE")].lower()
-            sets.setdefault(name, {"dbtype": os.environ[key], "default": "", "tenants": {}})
+            slot(rest[: -len("_DBTYPE")].lower())["dbtype"] = val
         elif rest.endswith("_DSN_DEFAULT"):
             name = rest[: -len("_DSN_DEFAULT")].lower()
-            sets.setdefault(name, {"dbtype": "", "default": "", "tenants": {}})
-            sets[name]["default"] = os.environ[key].strip().lower()
+            slot(name)["default"] = val.lower()
+        elif rest.endswith("_DOMAIN"):
+            slot(rest[: -len("_DOMAIN")].lower())["domain"] = val.lower()
+        elif rest.endswith("_DESC"):
+            slot(rest[: -len("_DESC")].lower())["desc"] = val
         elif "_DSN_" in rest:
             name, tenant = rest.split("_DSN_", 1)
-            name = name.lower()
             if tenant and tenant != "DEFAULT":
-                sets.setdefault(name, {"dbtype": "", "default": "", "tenants": {}})
-                sets[name]["tenants"][tenant.lower()] = os.environ[key].strip().lower()
+                slot(name.lower())["tenants"][tenant.lower()] = val.lower()
 
     out: list[dict[str, Any]] = []
     for name in sorted(sets):
@@ -108,8 +121,22 @@ def list_datasets() -> list[dict[str, Any]]:
         out.append({
             "dataset": name,
             "db_type": s["dbtype"] or "pg",
+            "domain": s["domain"],
+            "desc": s["desc"],
             "tenants": tenants,
             "dsn_tenant_refs": [s["tenants"][t] for t in tenants],
             "dsn_default": s["default"],
         })
     return out
+
+
+def dataset_names() -> list[str]:
+    """已配置数据集名列表（领域工具生成 Literal 枚举用）。"""
+    return [d["dataset"] for d in list_datasets()]
+
+
+def domain_datasets(domain: str) -> list[str]:
+    """某域下的数据集（域归属由 DATASET_<名称>_DOMAIN 决定；未标注域的按 domain 名收）。"""
+    want = domain.strip().lower()
+    return [d["dataset"] for d in list_datasets()
+            if (d["domain"] or want) == want]

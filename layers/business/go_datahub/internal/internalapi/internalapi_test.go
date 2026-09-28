@@ -12,7 +12,7 @@ import (
 func newServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
-	Register(mux)
+	Register(mux, nil)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
@@ -64,8 +64,11 @@ func TestListDSNRefs(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	var out struct {
-		OK   bool     `json:"ok"`
-		Refs []string `json:"refs"`
+		OK   bool `json:"ok"`
+		Refs []struct {
+			Name string `json:"name"`
+			Type string `json:"type"`
+		} `json:"refs"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
@@ -75,10 +78,10 @@ func TestListDSNRefs(t *testing.T) {
 	}
 	found := false
 	for _, r := range out.Refs {
-		if r == "demo_pg" {
+		if r.Name == "demo_pg" {
 			found = true
 		}
-		if strings.Contains(r, "://") {
+		if strings.Contains(r.Name, "://") || strings.Contains(r.Type, "://") {
 			t.Fatalf("refs 不应包含连接串本体: %v", out.Refs)
 		}
 	}

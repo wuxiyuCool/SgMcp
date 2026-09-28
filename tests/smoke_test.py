@@ -38,10 +38,24 @@ for sub in (
 
 from mcp import Client  # noqa: E402
 
-# it_ops SQLite 隔离到系统临时目录（避免冒烟污染仓库）
+# it_ops SQLite 与审计/审批台账隔离到系统临时目录（避免冒烟污染仓库）
 import tempfile  # noqa: E402
 
-os.environ.setdefault("MCP_ITOPS_DB", str(Path(tempfile.gettempdir()) / "sgmcp_smoke_itops.db"))
+_TMP = Path(tempfile.gettempdir()) / "sgmcp_smoke"
+_TMP.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MCP_ITOPS_DB", str(_TMP / "itops.db"))
+os.environ.setdefault("MCP_AUDIT_DIR", str(_TMP / "audit"))
+os.environ.setdefault("MCP_APPROVAL_STORE", str(_TMP / "audit" / "approvals.jsonl"))
+
+# 数据集路由与域归属（与 scripts/ops-check.ps1 同一套键）：it_ops 的领域枚举与
+# 中文说明在导入期由这些配置生成，冒烟必须在 import 前放好
+os.environ.setdefault("DATASET_INCIDENTS_DBTYPE", "pg")
+os.environ.setdefault("DATASET_INCIDENTS_DSN_DEFAULT", "itsm_pg")
+os.environ.setdefault("DATASET_INCIDENTS_DOMAIN", "itops")
+os.environ.setdefault("DATASET_INCIDENTS_DESC", "IT 运维事件单（工单流水）")
+os.environ.setdefault("DATASET_ASSETS_DSN_DEFAULT", "itsm_pg")
+os.environ.setdefault("DATASET_ASSETS_DOMAIN", "itops")
+os.environ.setdefault("DATASET_ASSETS_DESC", "CMDB 资产台账")
 
 
 async def _call(server_obj, tool: str, args: dict):
@@ -53,6 +67,13 @@ async def _list_tools(server_obj) -> set[str]:
     async with Client(server_obj, raise_exceptions=True) as client:
         result = await client.list_tools()
     return {t.name for t in result.tools}
+
+
+def _items(payload):
+    """剥掉 list 返回值的 {"result": [...]} 信封。"""
+    if isinstance(payload, dict) and set(payload) == {"result"}:
+        return payload["result"]
+    return payload
 
 
 def _payload(result) -> dict:
@@ -146,8 +167,15 @@ def test_gateway_aggregation_flow() -> None:
                     ("common-tools", n) for n in await _list_tools(common.mcp)
                 }
                 assert pairs == expect, f"聚合路由与下游不一致: 多={pairs - expect} 少={expect - pairs}"
-                assert all(x.get("input_schema") for x in items), "聚合路由应携带入参 schema"
-                print(f"PASS  网关·list_routes 聚合一致性（{len(pairs)} 条路由）")
+                assert all("params" in x for x in items), "聚合路由应携带入参摘要（无参工具为空对象）"
+                assert any(x["params"] for x in items), "有参工具的摘要不能为空"
+                full = _payload(await client.call_tool("list_routes", {"full_schema": True}))
+                full = full["result"] if isinstance(full, dict) and set(full) == {"result"} else full
+                assert all(x.get("input_schema") for x in full), "full_schema=True 才回完整 JSON Schema"
+                filtered = _payload(await client.call_tool("list_routes", {"server": "Common-Tools"}))
+                filtered = filtered["result"] if isinstance(filtered, dict) else filtered
+                assert filtered and all(x["server"] == "common-tools" for x in filtered), "server 过滤生效"
+                print(f"PASS  网关·list_routes 聚合一致性（{len(pairs)} 条路由，摘要/完整/过滤三态）")
 
                 # 4) 只读工具直接放行（经 HTTP 转发到 common）
                 r = await client.call_tool(
@@ -242,7 +270,7 @@ def test_gateway_aggregation_flow() -> None:
                 print("PASS  网关·route_* 聚合路由工具（枚举一致+kv 入参+审批闸门+错误引导）")
 
                 # 4f) list_tool_catalog：全目录（工具在哪个 MCP + 上层如何传递调用）
-                r = await client.call_tool("list_tool_catalog", {})
+                r = await client.call_tool("list_tool_catalog", {"mode": "full"})
                 groups = _payload(r)
                 groups = groups["result"] if isinstance(groups, dict) and set(groups) == {"result"} else groups
                 gmap = {g["mcp_server"]: g for g in groups}
@@ -312,6 +340,133 @@ def test_gateway_aggregation_flow() -> None:
                 assert set(d["ok"]) == {"it_ops", "common-tools"} and not d["failed"], d
                 print("PASS  网关·refresh_routes 运行时补拉")
 
+                # 11) route_* 的 method 是 enum：拼错的方法直接被 schema 拦下（不再宽容猜）
+                props = gw_tools["route_it_ops"].input_schema["properties"]
+                assert props["method"].get("enum"), "method 必须带枚举"
+                assert "object" in json.dumps(props["params"]), "params 应声明对象形态"
+                r = await client.call_tool("route_it_ops", {"method": "not_a_tool", "params": {}})
+                assert r.is_error, "枚举外的 method 竟然通过"
+                print("PASS  网关·method 枚举约束（拼错即拦 + 参数类型可见）")
+
+                # 12) 工具名写错时给相近候选（省 AI 往返）
+                r = await client.call_tool(
+                    "gateway_call",
+                    {"server": "it_ops", "tool": "create_inciden", "arguments": {"title": "typo"}},
+                )
+                assert r.is_error and "itops_create_incident" in str(r.content), \
+                    f"未命中时应给出相近工具名: {r.content}"
+                print("PASS  网关·未命中路由给相近工具名")
+
+                # 13) 审批令牌：配了 MCP_APPROVAL_TOKEN 后，AI 侧无令牌无法自批
+                os.environ["MCP_APPROVAL_TOKEN"] = "human-only-secret"
+                try:
+                    r = await client.call_tool(
+                        "gateway_call",
+                        {"server": "it_ops", "tool": "itops_create_change",
+                         "arguments": {"title": "令牌保护"}},
+                    )
+                    rid3 = _payload(r)["request_id"]
+                    r = await client.call_tool("approve_request", {"request_id": rid3})
+                    assert r.is_error and "审批令牌" in str(r.content), \
+                        f"无令牌的 approve_request 竟然放行: {r.content}"
+                    r = await client.call_tool(
+                        "approve_request", {"request_id": rid3, "approval_token": "human-only-secret"}
+                    )
+                    assert _payload(r)["executed"] is True, "带令牌的审批人应能放行"
+                    print("PASS  网关·审批令牌挡住 AI 自批（人类令牌才能放行）")
+                finally:
+                    os.environ.pop("MCP_APPROVAL_TOKEN", None)
+
+                # 14) 批准后下游执行失败 → 单据置 exec_failed（可重放），不静默丢单
+                r = await client.call_tool(
+                    "gateway_call",
+                    {"server": "it_ops", "tool": "itops_create_change",
+                     "arguments": {"title": "超长标题" + "呀" * 600}},
+                )
+                rid4 = _payload(r)["request_id"]
+                r = await client.call_tool("approve_request", {"request_id": rid4})
+                assert r.is_error, "下游必然失败的场景竟然执行成功"
+                st = _payload(await client.call_tool("list_approvals",
+                                                     {"request_id_filter": rid4})) \
+                    if False else None
+                r = await client.call_tool("list_approvals", {"status": "exec_failed"})
+                failed_ids = [x["id"] for x in _items(_payload(r))]
+                assert rid4 in failed_ids, f"执行失败的审批单应可查（exec_failed）: {failed_ids}"
+                assert "attempts" in next(x for x in _items(_payload(r)) if x["id"] == rid4)
+                print("PASS  网关·批准但下游失败 → exec_failed 可追溯/可重放")
+
+                # 15) 幂等键：同一 key 的重复写请求不会二次执行（AI 重试安全）
+                r = await client.call_tool(
+                    "gateway_call",
+                    {"server": "it_ops", "tool": "itops_create_incident",
+                     "arguments": {"title": "幂等验证"}, "idempotency_key": "smoke-key-1"},
+                )
+                first = _payload(r)["result"]["id"]
+                r = await client.call_tool(
+                    "gateway_call",
+                    {"server": "it_ops", "tool": "itops_create_incident",
+                     "arguments": {"title": "幂等验证"}, "idempotency_key": "smoke-key-1"},
+                )
+                again = _payload(r)
+                assert again["result"]["id"] == first and again.get("idempotent_replay") is True, again
+                print("PASS  网关·idempotency_key 幂等重放（重试不重复建单）")
+
+                # 16) 结果规模上限：超限截断并引导改用过滤/异步（护住上下文与 token）
+                gw.MAX_RESULT_ITEMS = 3
+                try:
+                    for i in range(6):
+                        await client.call_tool(
+                            "gateway_call",
+                            {"server": "it_ops", "tool": "itops_create_incident",
+                             "arguments": {"title": f"批量{i}", "priority": "low"}},
+                        )
+                    r = await client.call_tool(
+                        "gateway_call",
+                        {"server": "it_ops", "tool": "itops_list_incidents", "arguments": {}},
+                    )
+                    capped = _payload(r)["result"]
+                    assert isinstance(capped, dict) and capped["truncated"] is True, capped
+                    assert capped["returned"] == 3 and capped["total"] >= 6, capped
+                    assert "data_submit_collect_job" in capped["note"] or "过滤" in capped["note"]
+                finally:
+                    gw.MAX_RESULT_ITEMS = 200
+                print("PASS  网关·结果超限截断（返回条数/总数/引导）")
+
+                # 17) 扁平 kv 串的数值语义：前导零编号与版本号不被改坏
+                r = await client.call_tool(
+                    "gateway_call",
+                    {"server": "it_ops", "tool": "itops_create_incident",
+                     "arguments": "title='编号 007 与版本 1.10';priority=high"},
+                )
+                d = _payload(r)
+                assert d["executed"] is True and "007" in str(d["result"]["title"]), d
+                print("PASS  网关·kv 引号保原样（007/1.10 不被误转数值）")
+
+                # 18) 审计落盘：调用与审批可回查，敏感入参已脱敏
+                r = await client.call_tool(
+                    "gateway_call",
+                    {"server": "common-tools", "tool": "echo",
+                     "arguments": {"message": "hi", "token": "super-secret-value"}},
+                )
+                _payload(r)
+                r = await client.call_tool("query_audit_log", {"limit": 50})
+                events = _items(_payload(r))
+                assert any(e["event"] == "tool_call" for e in events), events[:2]
+                assert any(e["event"] in {"approval_created", "approval_decided"} for e in events)
+                leaked = [e for e in events if "super-secret-value" in json.dumps(e, ensure_ascii=False)]
+                assert not leaked, f"审计日志泄露敏感入参: {leaked}"
+                echoed = next(e for e in events if e.get("tool") == "echo" and "args" in e)
+                assert echoed["args"]["token"] == "***", echoed
+                print(f"PASS  网关·审计落盘（{len(events)} 条事件，敏感键已遮蔽）")
+
+                # 19) describe_gateway：部署自检（安全开关一目了然）
+                r = await client.call_tool("describe_gateway", {})
+                info = _payload(r)
+                assert info["routes"] > 0
+                assert info["security"]["approval_token_required"] is False, "测试环境未配令牌应为 False"
+                assert "gateway_bearer_enabled" in info["security"]
+                print(f"PASS  网关·describe_gateway 自检（{info['routes']} 条路由，安全开关可见）")
+
         asyncio.run(flow())
     finally:
         for srv, th in ((itops_srv, itops_th), (common_srv, common_th)):
@@ -358,6 +513,14 @@ def test_shared_dsrouting() -> None:
     try:
         assert dsrouting.route_db("orders", "t1") == ("pg", "order_t1_pg")
         assert dsrouting.route_db("ORDERS", "T9") == ("pg", "order_pg")  # 兜底 + 大小写归一
+        assert dsrouting.route_db("orders", "default") == ("pg", "order_pg"), \
+            "tenant_id=default 是各工具的默认值，应走兜底路由而不是报错"
+        for bad_tenant in ("t1;DATASET_ORDERS_DSN_T1", "a b", "../x"):
+            try:
+                dsrouting.route_db("orders", bad_tenant)
+                raise AssertionError(f"非法租户名竟通过: {bad_tenant}")
+            except ValueError:
+                pass  # 租户名参与拼 env 键，必须限字符集（防配置注入）
         assert dsrouting.route_table("orders", "2024-05") == "orders_202405"
         for bad in ("2024-13", "202405", "'; DROP TABLE x"):
             try:
@@ -391,11 +554,292 @@ def test_itops_persistence() -> None:
     print(f"PASS  it_ops·SQLite 跨重启持久化（{rec['id']} 重开库仍可查）")
 
 
+
+def test_shared_limits() -> None:
+    """轻活层护栏：文本规模 / ReDoS / 路径围栏（AI 入参不可信的兜底）。"""
+    import tempfile
+    from pathlib import Path as _P
+
+    from mcp_shared import limits
+
+    os.environ["MCP_MAX_TEXT_CHARS"] = "1000"
+    try:
+        limits.check_text("x" * 50)
+        try:
+            limits.check_text("x" * 5000)
+            raise AssertionError("超限文本竟然通过")
+        except ValueError as e:
+            assert "上限" in str(e) and "data_file_stats" in str(e), e
+    finally:
+        os.environ.pop("MCP_MAX_TEXT_CHARS", None)
+
+    for bad in (r"(a+)+b", "(a|a?)*b"):  # Python re 无超时，一条就能挂死共享进程
+        try:
+            limits.check_pattern(bad)
+            raise AssertionError(f"灾难性回溯正则竟通过: {bad}")
+        except ValueError as e:
+            assert "回溯" in str(e)
+    assert limits.check_pattern(r"(?P<y>\d{4})-\d{2}")
+
+    with tempfile.TemporaryDirectory() as td:
+        root = _P(td) / "exports"
+        root.mkdir()
+        (root / "ok.csv").write_text("a\n1\n", encoding="utf-8")
+        outside = _P(td) / "secret.txt"
+        outside.write_text("top", encoding="utf-8")
+
+        os.environ.pop("MCP_FILE_ROOTS", None)
+        try:
+            limits.safe_path(str(root / "ok.csv"))
+            raise AssertionError("未配白名单时不应放行任意文件读取")
+        except ValueError as e:
+            assert "MCP_FILE_ROOTS" in str(e)
+
+        os.environ["MCP_FILE_ROOTS"] = str(root)
+        try:
+            assert limits.safe_path(str(root / "ok.csv")).name == "ok.csv"
+            for bad in (str(outside), str(root / ".." / "secret.txt")):
+                try:
+                    limits.safe_path(bad)
+                    raise AssertionError(f"白名单外路径应被拒: {bad}")
+                except ValueError as e:
+                    assert "越界" in str(e)
+        finally:
+            os.environ.pop("MCP_FILE_ROOTS", None)
+    print("PASS  shared·limits 护栏（规模上限 / ReDoS / 路径围栏）")
+
+
+def test_shared_audit() -> None:
+    """审计：敏感键遮蔽、长值截断、尾部查询、入参指纹与键序无关。"""
+    import tempfile
+
+    from mcp_shared import audit
+
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["MCP_AUDIT_DIR"] = td
+        audit._INSTANCES.clear()
+        log = audit.audit_log("smoke")
+        log.record("tool_call", tool="demo",
+                   args={"dsn": "postgres://u:p@h/db", "token": "abc", "page": 1, "big": "y" * 5000})
+        line = log.query(1)[0]
+        assert line["args"]["dsn"] == "***" and line["args"]["token"] == "***", line
+        assert line["args"]["page"] == 1
+        assert "len=5000" in line["args"]["big"], "长文本应截断并标注原长"
+        log.record("tool_error", tool="demo", error="boom")
+        assert [e["event"] for e in log.query(5)] == ["tool_error", "tool_call"], "应最新在前"
+        assert log.query(5, event="tool_error")[0]["error"] == "boom"
+        assert audit.digest({"a": 1, "b": 2}) == audit.digest({"b": 2, "a": 1})
+        assert audit.digest({"a": 1}) != audit.digest({"a": 2})
+        # 轮转：长期运行不能把磁盘写满
+        os.environ["MCP_AUDIT_MAX_BYTES"] = "4000"
+        os.environ["MCP_AUDIT_KEEP"] = "2"
+        for i in range(60):
+            log.record("tool_call", tool="rot", args={"i": i, "pad": "z" * 120})
+        names = sorted(os.listdir(td))
+        assert "smoke.jsonl.1" in names and "smoke.jsonl.2" in names, names
+        assert "smoke.jsonl.3" not in names, "超出 KEEP 份数的最旧文件应被丢弃"
+        assert log.query(1)[0]["args"]["i"] >= 59, "轮转后仍能读到最新事件"
+        os.environ.pop("MCP_AUDIT_MAX_BYTES", None)
+        os.environ.pop("MCP_AUDIT_KEEP", None)
+        audit._INSTANCES.clear()
+        os.environ.pop("MCP_AUDIT_DIR", None)
+    print("PASS  shared·audit 落盘（脱敏 / 截断 / 查询 / 轮转）")
+
+
+def test_http_frontend_guards() -> None:
+    """HTTP 前置层：Bearer 401、/healthz 免鉴权、滑动窗口限流 429。"""
+    import asyncio
+
+    from mcp_shared import http_kit
+
+    calls = {"n": 0}
+
+    async def inner(scope, receive, send):
+        calls["n"] += 1
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-length", b"2")]})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    def scope(path="/mcp", headers=None, client=("10.0.0.1", 5555)):
+        return {"type": "http", "method": "POST" if path == "/mcp" else "GET", "path": path,
+                "headers": [(k.encode(), v.encode()) for k, v in (headers or {}).items()],
+                "client": client}
+
+    front = http_kit.HttpFrontend(inner, server_name="t", token="sekret", rate_limit_per_second=2)
+
+    async def run(sc):
+        out = {}
+
+        async def receive():
+            return {"type": "http.request", "body": b"{}", "more_body": False}
+
+        async def send(msg):
+            out.setdefault("status", msg.get("status"))
+            out.setdefault("headers", msg.get("headers", []))
+
+        await front(sc, receive, send)
+        return out
+
+    async def flow():
+        r = await run(scope("/mcp"))
+        assert r["status"] == 401 and calls["n"] == 0, "缺 token 必须 401 且不进内层"
+        r = await run(scope("/mcp", {"authorization": "Bearer wrong"}))
+        assert r["status"] == 401
+        r = await run(scope("/healthz"))
+        assert r["status"] == 200 and calls["n"] == 0, "/healthz 免鉴权且不转发"
+        for _ in range(2):
+            r = await run(scope("/mcp", {"authorization": "Bearer sekret"}))
+            assert r["status"] == 200
+        r = await run(scope("/mcp", {"authorization": "Bearer sekret"}))
+        assert r["status"] == 429, "超过 2/s 应限流"
+        assert any(k == b"retry-after" for k, _ in r["headers"]), "429 需带 Retry-After"
+        r = await run(scope("/mcp", {"authorization": "Bearer sekret"}, client=("10.0.0.2", 1)))
+        assert r["status"] == 200, "限流应按客户端分桶"
+
+    asyncio.run(flow())
+    assert calls["n"] == 3, calls
+    print("PASS  shared·http 前置层（Bearer / healthz / 限流分桶）")
+
+
+def test_downstream_failure_class() -> None:
+    """下游失败分类：不可达给可读建议，写工具绝不自动重试。"""
+    from mcp_shared.mcp_client import (
+        DownstreamError,
+        call_downstream_http,
+        retries_for,
+        timeout_for,
+    )
+
+    assert retries_for("data_batch_import", read_only=False) == 0, "写工具绝不能自动重试（会重复落库）"
+    assert retries_for("data_list_tables", read_only=True) >= 1
+    os.environ["MCP_DOWNSTREAM_TIMEOUT_DATA_SLOW_TOOL"] = "3"
+    try:
+        assert timeout_for("data_slow_tool") == 3.0 and timeout_for("other") == 60.0
+    finally:
+        os.environ.pop("MCP_DOWNSTREAM_TIMEOUT_DATA_SLOW_TOOL")
+
+    try:
+        call_downstream_http("http://127.0.0.1:59999/mcp", "x", {}, read_only=False, timeout=2)
+        raise AssertionError("不可达下游竟然成功")
+    except DownstreamError as e:
+        assert e.kind == "unreachable", e.kind
+        assert "list_downstreams" in e.hint or "refresh_routes" in e.hint, e.hint
+        assert e.attempts == 1, f"写工具不应重试: {e.attempts}"
+    # SDK 会把 HTTP 状态码吞成 MCPError，靠响应钩子记下的真实码才能报对"鉴权失败"
+    from mcp_shared.mcp_client import classify_http_status
+
+    assert classify_http_status([]) is None
+    kind, hint, retry = classify_http_status([401])
+    assert kind == "unauthorized" and retry is False and "MCP_DOWNSTREAM_TOKEN" in hint, hint
+    assert classify_http_status([503])[0] == "downstream_5xx"
+    assert classify_http_status([404])[0] == "not_found"
+    print("PASS  shared·下游失败分类（不可达/鉴权→可读建议，写调用不重试）")
+
+
+def test_gateway_kv_and_schema() -> None:
+    """入参形态归一：kv 引号保真、脏参数结构化报错、路由别名。"""
+    import mcp_gateway.main as gw
+
+    parsed = gw._parse_kv_params(
+        "id=007;version=1.10;on=true;qty=3;ratio=1.5;note=null;msg='v2.0.0';t=a=1"
+    )
+    assert parsed == {"id": "007", "version": "1.10", "on": True, "qty": 3, "ratio": 1.5,
+                      "note": None, "msg": "v2.0.0", "t": "a=1"}, parsed
+    assert gw._parse_kv_params("a=1;b='x;y'") == {"a": 1, "b": "x;y"}, "引号内分号不算分隔符"
+    assert gw._coerce_args('{"a": 1}') == {"a": 1} and gw._coerce_args(None) == {}
+    for bad in ("not-a-kv", '{"a": 1', "[1,2]", 12):
+        try:
+            gw._coerce_args(bad)
+            raise AssertionError(f"脏 arguments 应报错: {bad!r}")
+        except Exception as e:
+            assert "arguments" in str(e) or "params" in str(e), e
+    assert gw._route_tool_name("go_datahub") == "route_go_datahub"
+    assert gw._norm("Common-Tools") == "common_tools"
+    print("PASS  网关·入参形态归一（kv 引号 / JSON / 脏参数可读报错）")
+
+
+def test_itops_dataset_enum_from_config() -> None:
+    """第 2 层枚举由配置驱动：DATASET_*_DOMAIN=itops 决定本域取值与中文说明。"""
+    from mcp_itops import main as itops
+
+    tool = itops.mcp._tool_manager.get_tool("itops_query_dataset")
+    enum = tool.parameters["properties"]["dataset_id"]["enum"]
+    assert "incidents" in enum and "assets" in enum, enum
+    assert "orders" not in enum, "非本域数据集不得出现在领域枚举里"
+    desc = tool.parameters["properties"]["dataset_id"].get("description", "")
+    assert "incidents=" in desc, f"参数描述应带中文说明：{desc}"
+    os.environ["DATASET_TICKETS_DOMAIN"] = "finance"
+    try:
+        try:
+            itops._guard_domain("tickets")
+            raise AssertionError("越域未拦截")
+        except Exception as e:
+            assert "data.query_dataset" in str(e) or "第 3 层" in str(e), e
+    finally:
+        os.environ.pop("DATASET_TICKETS_DOMAIN", None)
+    print("PASS  it_ops·数据集枚举配置驱动（含越域引导）")
+
+
+def test_gateway_identity_channels() -> None:
+    """审批令牌的两条通道与真实身份：请求头优先，AI 侧无令牌即无法自批。"""
+    import mcp_gateway.main as gw
+    from mcp_shared.http_kit import actor_hint, approval_hint
+
+    os.environ["MCP_APPROVAL_TOKEN"] = "hdr-secret"
+    try:
+        # 1) 无令牌（AI 通道的典型情形）→ 必须拒
+        try:
+            gw._require_approve_authority("apr_x", None)
+            raise AssertionError("无令牌竟然放行")
+        except Exception as e:
+            assert "审批令牌" in str(e), e
+
+        # 2) 请求头带令牌（审批人通道）→ 放行，且不需要把令牌写进入参
+        tok = approval_hint.set("hdr-secret")
+        try:
+            gw._require_approve_authority("apr_x", None)
+        finally:
+            approval_hint.reset(tok)
+
+        # 3) 参数带令牌同样可用（运维脚本）
+        gw._require_approve_authority("apr_x", "hdr-secret")
+
+        # 4) 错令牌仍拒
+        tok2 = approval_hint.set("wrong")
+        try:
+            try:
+                gw._require_approve_authority("apr_x", None)
+                raise AssertionError("错令牌竟然放行")
+            except Exception as e:
+                assert "审批令牌" in str(e), e
+        finally:
+            approval_hint.reset(tok2)
+
+        # 5) 身份：X-Sg-Actor 优先于 AI 自报的 requested_by
+        assert gw._actor("ai-agent") == "ai-agent"
+        t3 = actor_hint.set("zhangsan@corp")
+        try:
+            assert gw._actor("ai-agent") == "zhangsan@corp"
+            assert gw._identity_extras().get("principal") == "zhangsan@corp"
+        finally:
+            actor_hint.reset(t3)
+    finally:
+        os.environ.pop("MCP_APPROVAL_TOKEN", None)
+    print("PASS  网关·审批令牌双通道与真实身份（请求头优先）")
+
+
 if __name__ == "__main__":
     test_lower_common()
     test_middle_itops()
     test_gateway_aggregation_flow()
+    test_gateway_kv_and_schema()
     test_itops_persistence()
+    test_itops_dataset_enum_from_config()
     test_shared_config()
     test_shared_dsrouting()
+    test_shared_limits()
+    test_shared_audit()
+    test_http_frontend_guards()
+    test_downstream_failure_class()
+    test_gateway_identity_channels()
     print("\n全部冒烟测试通过 ✅")

@@ -32,6 +32,8 @@ class ToolRoute:
     endpoint: str | None = None  # exec_kind="http" 时的下游 MCP 地址
     headers: dict[str, str] | None = None  # 跨机调用下游时的附加 HTTP 头（如 Bearer 鉴权）
     input_schema: dict[str, Any] | None = None  # 下游 tools/list 拉取的入参 schema（工具发现用）
+    read_only: bool = False  # 下游 annotations.readOnlyHint（决定是否可安全重试）
+    open_world: bool | None = None  # 下游是否可能触达本工具之外的资源（审批提示用）
 
 
 class Router:
@@ -56,7 +58,9 @@ class Router:
     def resolve(self, server: str, tool: str) -> ToolRoute | None:
         return self._routes.get((server, tool))
 
-    def execute(self, server: str, tool: str, args: dict[str, Any]) -> Any:
+    def execute(self, server: str, tool: str, args: dict[str, Any],
+                *, read_only: bool = False, call_id: str | None = None,
+                timeout: float | None = None) -> Any:
         route = self.resolve(server, tool)
         if route is None:
             raise LookupError(f"未注册的路由: {server}.{tool}")
@@ -65,6 +69,9 @@ class Router:
         if route.exec_kind == "http":
             if not route.endpoint:
                 raise RuntimeError(f"路由 {server}.{tool} 未配置 endpoint")
-            logger.info("执行(HTTP) %s.%s -> %s", server, tool, route.endpoint)
-            return call_downstream_http(route.endpoint, tool, args, headers=route.headers)
+            logger.info("执行(HTTP) %s.%s -> %s call_id=%s", server, tool, route.endpoint, call_id)
+            return call_downstream_http(
+                route.endpoint, tool, args, headers=route.headers,
+                read_only=read_only or route.read_only, call_id=call_id, timeout=timeout,
+            )
         raise RuntimeError(f"未知执行类型: {route.exec_kind}")
