@@ -122,6 +122,26 @@ func Keys(prefix string) []string {
 	return out
 }
 
+// parseValue 取值最终形态：剥引号并去掉行内注释（与 Python 侧 config._parse_value 同规则）。
+// 模板里 `KEY=value   # 说明` 被取消注释后，若不剥注释，中文说明会混进值里——
+// HTTP 头不允许非 ASCII，网关连本服务会直接失败。
+func parseValue(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return ""
+	}
+	if q := v[:1]; q == `"` || q == "'" {
+		if end := strings.Index(v[1:], q); end >= 0 {
+			return v[1 : end+1]
+		}
+		return strings.TrimPrefix(v, q)
+	}
+	if i := strings.Index(v, " #"); i >= 0 {
+		v = v[:i]
+	}
+	return strings.TrimSpace(v)
+}
+
 // ConfigPath 定位配置文件，找不到返回 ""。
 func ConfigPath() string {
 	if p := os.Getenv("GO_DATAHUB_CONFIG"); p != "" {
@@ -173,9 +193,8 @@ func parseFile(path string) map[string]string {
 			continue
 		}
 		k = strings.TrimSpace(k)
-		v = strings.Trim(strings.TrimSpace(v), `"'`)
 		if k != "" {
-			m[k] = v
+			m[k] = parseValue(v)
 		}
 	}
 	return m

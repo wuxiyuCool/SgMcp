@@ -97,6 +97,11 @@ def run_server(
         health_info=health_info,
     )
     if token:
+        try:
+            token.encode("ascii")
+        except UnicodeEncodeError:
+            print(f"[警告] {token_env} 含非 ASCII 字符——客户端将无法通过鉴权。"
+                  "多半是把中文注释写进了配置值，请把注释单独放一行", flush=True)
         print(f"[{getattr(mcp, 'name', 'server')}] 已启用 Bearer 鉴权（{token_env}）；/healthz 免鉴权")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

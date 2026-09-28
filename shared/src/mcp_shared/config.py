@@ -59,10 +59,28 @@ def _parse(path: Path) -> dict[str, str]:
         if not sep:
             continue
         key = key.strip()
-        val = val.strip().strip('"').strip("'")
         if key:
-            values[key] = val
+            values[key] = _parse_value(val)
     return values
+
+
+def _parse_value(val: str) -> str:
+    """取值的最终形态：剥首尾空白与引号，并去掉行内注释。
+
+    踩过的坑：配置模板里写着 `KEY=value        # 中文说明`，用户取消注释整行时把说明
+    一起留成了值——HTTP 头不允许非 ASCII，网关连下游直接 UnicodeEncodeError，
+    表现为"AI 看不到任何工具"，排查方向还被带偏到令牌不匹配上。
+    规则（与 dotenv 一致）：引号内的 `#` 属于值本身；未加引号时空白+`#` 之后视为注释。
+    """
+    v = val.strip()
+    if v[:1] in ('"', "'"):
+        quote = v[0]
+        end = v.find(quote, 1)
+        return v[1:end] if end > 0 else v[1:]
+    cut = v.find(" #")
+    if cut >= 0:
+        v = v[:cut]
+    return v.strip()
 
 
 def load_platform_env(override: bool = False) -> dict[str, str]:

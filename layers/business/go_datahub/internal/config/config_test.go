@@ -55,3 +55,31 @@ func TestMissingFileIsNoop(t *testing.T) {
 		t.Error("不存在的配置不应产生值")
 	}
 }
+
+// TestParseValueInlineComment 行内注释必须剥掉：`KEY=value   # 中文说明` 里说明混进值后，
+// HTTP 头（非 ASCII）会让网关连本服务直接失败。
+func TestParseValueInlineComment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "datahub.env")
+	content := "GO_DATAHUB_TOKEN=abc123   # 网关到本服务的令牌\n" +
+		`QUOTED="abc123 # 保留"` + "\n" +
+		"SINGLE='abc123'\n" +
+		"BARE=abc123\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GO_DATAHUB_CONFIG", path)
+	Reload()
+	t.Cleanup(Reload)
+
+	for key, want := range map[string]string{
+		"GO_DATAHUB_TOKEN": "abc123",
+		"QUOTED":           "abc123 # 保留", // 引号内 # 属于值
+		"SINGLE":           "abc123",
+		"BARE":             "abc123",
+	} {
+		if got := Value(key); got != want {
+			t.Errorf("%s = %q, 期望 %q", key, got, want)
+		}
+	}
+}

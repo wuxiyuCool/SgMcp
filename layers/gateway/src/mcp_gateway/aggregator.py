@@ -173,6 +173,23 @@ class Aggregator:
             result = await client.list_tools()
         return list(result.tools)
 
+    @staticmethod
+    def header_config_error(spec: "DownstreamSpec") -> str | None:
+        """请求头值必须是 ASCII：混进中文（通常是行内注释被当成值）时提前报错。
+
+        不拦的话异常是 `UnicodeEncodeError: 'ascii' codec can't encode ...`，
+        分类只会给出"下游返回了无法处理的响应"，把人往完全错误的方向带。
+        """
+        for key, val in (spec.headers or {}).items():
+            try:
+                val.encode("ascii")
+            except UnicodeEncodeError:
+                bad = "".join(ch for ch in val if ord(ch) > 127)[:8]
+                return (f"config_error: 下游 {spec.name} 的请求头 {key} 含非 ASCII 字符（{bad!r}…）——"
+                        f"多半是把中文注释写进了 config/platform.env 的值里；"
+                        f"请把注释单独放一行后重启网关")
+        return None
+
     def describe_failure(self, exc: BaseException, spec: "DownstreamSpec",
                          status_sink: list[int] | None = None) -> str:
         """聚合失败转成人能照着做的一句话（含 kind 与真实 HTTP 状态），而不是裸 ExceptionGroup。"""
@@ -196,6 +213,12 @@ class Aggregator:
         while True:
             still_pending: list[DownstreamSpec] = []
             for spec in pending:
+                bad_header = self.header_config_error(spec)
+                if bad_header:
+                    logger.error("%s", bad_header)
+                    still_pending.append(spec)
+                    report.failed[spec.name] = bad_header
+                    continue
                 status_sink: list[int] = []
                 try:
                     tools = asyncio.run(self._list_downstream(spec, status_sink))

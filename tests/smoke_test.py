@@ -555,6 +555,92 @@ def test_itops_persistence() -> None:
 
 
 
+def test_config_inline_comments() -> None:
+    """.env 值里的行内注释必须剥掉：中文注释混进令牌值会让下游聚合全线失败。"""
+    import tempfile
+
+    from mcp_shared import config
+
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "platform.env"
+        lines = [
+            "TOK_PLAIN=abc123   # 网关到 it_ops 的令牌",
+            'TOK_QUOTED="abc123 # 保留"',
+            "TOK_SQ='abc123'",
+            "TOK_URL=http://127.0.0.1:9300/mcp   # 本机",
+            "TOK_BARE=abc123",
+        ]
+        f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.environ["MCP_CONFIG_FILE"] = str(f)
+        try:
+            config._reset()
+            vals = config.load_platform_env()
+            assert vals["TOK_PLAIN"] == "abc123", vals
+            assert vals["TOK_QUOTED"] == "abc123 # 保留", "引号内的 # 属于值本身"
+            assert vals["TOK_SQ"] == "abc123"
+            assert vals["TOK_URL"] == "http://127.0.0.1:9300/mcp"
+            assert vals["TOK_BARE"] == "abc123"
+            # 所有解析出的值都必须能进 HTTP 头（ASCII）
+            for k, v in vals.items():
+                v.encode("ascii")
+        finally:
+            os.environ.pop("MCP_CONFIG_FILE", None)
+            config._reset()
+
+    # 网关侧：非 ASCII 头值要给出配置错误指引，而不是撞 UnicodeEncodeError
+    import mcp_gateway.main as gw
+    from mcp_gateway.aggregator import Aggregator, DownstreamSpec
+
+    bad = DownstreamSpec("x", "http://127.0.0.1:1/mcp", {"Authorization": "Bearer 令牌abc"})
+    msg = Aggregator.header_config_error(bad)
+    assert msg and "config_error" in msg and "非 ASCII" in msg, msg
+    assert Aggregator.header_config_error(DownstreamSpec("x", "u", {"Authorization": "Bearer abc"})) is None
+    assert Aggregator.header_config_error(DownstreamSpec("x", "u", None)) is None
+    print("PASS  config·行内注释剥离 + 非 ASCII 头值给配置错误")
+
+
+def test_config_inline_comments() -> None:
+    """.env 值里的行内注释必须剥掉：中文注释混进令牌值会让下游聚合全线失败。"""
+    import tempfile
+
+    from mcp_shared import config
+
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "platform.env"
+        f.write_text(
+            'TOK_PLAIN=abc123   # 网关到 it_ops 的令牌\n'
+            'TOK_QUOTED="abc123 # 保留"\n'
+            "TOK_SQ='abc123'\n"
+            "TOK_URL=http://127.0.0.1:9300/mcp   # 本机\n"
+            "TOK_BARE=abc123\n",
+            encoding="utf-8",
+        )
+        os.environ["MCP_CONFIG_FILE"] = str(f)
+        try:
+            config._reset()
+            vals = config.load_platform_env()
+            assert vals["TOK_PLAIN"] == "abc123", vals
+            assert vals["TOK_QUOTED"] == "abc123 # 保留", "引号内的 # 属于值本身"
+            assert vals["TOK_SQ"] == "abc123"
+            assert vals["TOK_URL"] == "http://127.0.0.1:9300/mcp"
+            assert vals["TOK_BARE"] == "abc123"
+            for k in ("TOK_PLAIN", "TOK_URL", "TOK_BARE", "TOK_SQ"):
+                vals[k].encode("ascii")   # 剥完注释后必须能进 HTTP 头
+        finally:
+            os.environ.pop("MCP_CONFIG_FILE", None)
+            config._reset()
+
+    # 网关侧：非 ASCII 头值要给出配置错误指引，而不是撞 UnicodeEncodeError
+    from mcp_gateway.aggregator import Aggregator, DownstreamSpec
+
+    bad = DownstreamSpec("x", "http://127.0.0.1:1/mcp", {"Authorization": "Bearer 令牌abc"})
+    msg = Aggregator.header_config_error(bad)
+    assert msg and "config_error" in msg and "非 ASCII" in msg, msg
+    assert Aggregator.header_config_error(DownstreamSpec("x", "u", {"Authorization": "Bearer abc"})) is None
+    assert Aggregator.header_config_error(DownstreamSpec("x", "u", None)) is None
+    print("PASS  config·行内注释剥离 + 非 ASCII 头值给配置错误")
+
+
 def test_shared_limits() -> None:
     """轻活层护栏：文本规模 / ReDoS / 路径围栏（AI 入参不可信的兜底）。"""
     import tempfile
@@ -907,6 +993,7 @@ if __name__ == "__main__":
     test_itops_persistence()
     test_itops_dataset_enum_from_config()
     test_shared_config()
+    test_config_inline_comments()
     test_shared_dsrouting()
     test_shared_limits()
     test_shared_audit()
