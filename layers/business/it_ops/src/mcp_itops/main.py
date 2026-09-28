@@ -27,6 +27,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
+from mcp_itops import itom
 from mcp_itops.store import LocalStoreUnavailable, local_store, new_incident
 from mcp_shared import run_server
 from mcp_shared.config import get as cfg
@@ -274,6 +275,181 @@ def list_assets(asset_type: Literal["laptop", "server", "network", "software"] |
     """查询资产清单（对象数组）。asset_type 可选过滤：laptop/server/network/software，
     留空或传 null 返回全部。"""
     return _local().list_assets(asset_type=asset_type)
+
+
+# ---------------------------------------------------------------------------
+# ITOM 平台（itom.shougang.com.cn）真实对接：预设账户，AI 只流转 account_ref
+# 口令永远在服务端 config/platform.env，不进对话、不进审计、不回传调用方
+# ---------------------------------------------------------------------------
+def _itom(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except itom.ItomError as e:
+        raise ToolError(str(e)) from e
+
+
+@mcp.tool(name="itops_itom_accounts")
+def itom_accounts() -> list[dict[str, Any]]:
+    """列出服务端已配置的 ITOM 账户（只有引用名、备注、打码工号和登录状态）。
+
+    口令不在返回里，也不要向用户索要口令——用户只需要从这份清单里挑一个
+    account_ref。返回示例：
+    [{"account_ref": "wangxu", "note": "运维中心", "user_id": "w***u",
+      "credential": "password", "logged_in": false}]
+    """
+    return _itom(itom.accounts_summary)
+
+
+@mcp.tool(name="itops_itom_login")
+def itom_login(account_ref: str) -> dict[str, Any]:
+    """用服务端预存的凭据登录 ITOM，返回会话状态（token 本身不外泄）。
+
+    account_ref 必须来自 itops_itom_accounts；登录态在服务端缓存，过期自动重登，
+    所以后续调用不必每次都先登录。
+    """
+    return _itom(itom.login_status, account_ref)
+
+
+@mcp.tool(name="itops_itom_logout")
+def itom_logout(account_ref: str | None = None) -> dict[str, Any]:
+    """清掉服务端的 ITOM 会话（换账号、凭据改了、或排查平台侧 session 时用）。
+
+    account_ref 留空=清掉全部会话。只影响本进程缓存，不注销平台侧登录。
+    """
+    return {"ok": True, "cleared": _itom(itom.reset, account_ref) if account_ref else itom.reset()}
+
+
+@mcp.tool(name="itops_itom_get")
+def itom_get(account_ref: str, path: str, params: dict[str, Any] | None = None,
+             method: Literal["GET", "POST"] = "GET",
+             body: dict[str, Any] | None = None,
+             fields: list[str] | None = None, max_rows: int = 0) -> dict[str, Any]:
+    """带 ITOM 登录态发**只读**请求（path 只能是站内相对路径）。
+
+    参数：
+    - account_ref: itops_itom_accounts 里的引用名
+    - path: 形如 /event-manage/findByPage（自动拼到 MCP_ITOM_URL 后面；禁止 //、..、查询串）
+    - params: 查询参数；登录态（uid/token/cookie）由服务端自动注入，不要自己传
+    - method: GET 或 POST。平台的分页查询用 POST 承载只读语义，所以这里允许 POST，
+      但路径末段必须是只读形态（find/get/list/query/search/view 等），否则拒绝
+    - body: POST 的业务字段，只写内层即可（服务端自动补 reqHeader/reqBody 信封），如
+      {"createdDtGt": "2026-08-28 14:09:54", "createdDtLt": "2026-09-29 14:09:54", "pageSize": "20"}
+    - fields: 字段白名单。平台的列表一行有 90+ 列（含报障人手机号），不投影就是几百 KB
+      灌进对话；查已知列表请优先用对应的业务工具（如 itops_itom_incidents 已带默认投影）
+    - max_rows: 返回行数上限（0=不限），超出会在 truncated 里提示怎么翻页
+
+    返回 {"ok": true, "status": 200, "retCode": "0000000", "data": ...}；
+    列表类响应会归一成 {"rows", "returned", "total", "rows_key"}。
+    写操作请用 itops_itom_call（需人工审批），不要用本工具绕过。
+    """
+    return _itom(itom.request_json, account_ref, method, path, params=params, body=body,
+                 read_channel=True, fields=fields, max_rows=max_rows)
+
+
+@mcp.tool(name="itops_itom_call")
+def itom_call(account_ref: str, path: str, method: Literal["POST", "PUT", "PATCH", "DELETE"] = "POST",
+              body: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    """向 ITOM 平台发起写操作（建单/流转/更新），经网关调用会被挂起为审批单。
+
+    参数同 itops_itom_get：body 只写业务字段（服务端补 reqHeader/reqBody 信封），
+    登录态不用自己传；只读查询（findByPage 这类）请用 itops_itom_get，不必走审批。
+    ⚠️ 该工具会真实改动生产 ITOM 数据，默认在 MCP_APPROVAL_TOOLS 名单内：
+    经网关调用时返回 request_id="apr_xxx" 且尚未执行，需审批人 approve_request 才落地。
+    """
+    return _itom(itom.request_json, account_ref, method, path, params=params, body=body)
+
+
+@mcp.tool(name="itops_itom_incidents")
+def itom_incidents(account_ref: str, days: int = 7, system_type: str | None = None,
+                   event_no: str | None = None, page_num: int = 1,
+                   page_size: int = 20) -> dict[str, Any]:
+    """查 ITOM 事件单列表（真实生产数据），已按业务列投影，不含手机号等个人信息。
+
+    参数：
+    - account_ref: itops_itom_accounts 里的引用名
+    - days: 回溯天数（平台按创建时间过滤，默认 7 天；不给窗口平台不返回数据）
+    - system_type: 系统类型代码（如 "SG062"=采购管理系统，实测生效）
+    - event_no: 事件单号精确查（如 "SG260927001"）
+    - page_num / page_size: 分页，page_size 上限 100
+
+    返回 data={"rows":[{eventNo,eventState,eventStateName,eventLevel,eventLevelName,
+    eventNature,eventNatureName,problemDesc,systemTypeName,systemSubclassName,dealStaffName,
+    createdByName,createdDt,responseTime,solveTime,...}],"returned":20,"total":120,
+    "rows_key":"resultData"}——码值都带中文含义，直接引用 xxxName 字段即可，不要自己解读数字码。
+    注意：平台的 eventState 过滤入参无效（传任何值都是 0 行），problemDesc 只做整句精确匹配，
+    所以**状态统计请对返回的 rows 自行分组**，别指望本工具按状态过滤。
+    """
+    return _itom(itom.incidents, account_ref, days=days, system_type=system_type,
+                 event_no=event_no, page_num=page_num, page_size=page_size)
+
+
+@mcp.tool(name="itops_itom_incident_form")
+def itom_incident_form() -> list[dict[str, Any]]:
+    """「新增事件单」表单说明书：每个必填字段的含义、取值来源与引导顺序。
+
+    引导式建单的正确流程：先调本工具拿到字段清单，再按 dept → group → system →
+    subclass → menu 的**父子顺序**用 itops_itom_options 逐级列候选给用户选，
+    报修人/处理人用姓名（或工号）由服务端查档案回填电话，最后调 itops_itom_create_incident。
+    """
+    return list(itom.INCIDENT_FORM)
+
+
+@mcp.tool(name="itops_itom_options")
+def itom_options(account_ref: str, kind: str, parent: str | None = None,
+                 keyword: str | None = None, limit: int = 50,
+                 role: str | None = None) -> list[dict[str, Any]]:
+    """列出 ITOM 某个下拉的候选项（精简投影，不含身份证等敏感列）。
+
+    参数：
+    - kind: dept 部门分类 / group 小组 / system 系统分类 / subclass 系统子类 / menu 报修菜单 /
+      custom 报修人档案 / staff 处理人 / level|nature|role|state|category|solveMode 码值字典
+    - parent: 上一级选中的代码。group 传部门 orgCode，system 传 groupCode，
+      subclass/menu 传上级 sysSid，staff 传**一级系统**的 sysSid（传子类 sid 查不到人）
+    - keyword: 名称过滤（custom 是平台精确匹配；同名多条会都返回）
+    - role: 仅 kind=staff 必填（1 一线/2 二线/3 系统负责人），平台按系统+角色两键取人
+
+    把返回的 name 列给用户选，选中项的 code/sid 再传给 itops_itom_create_incident。
+    """
+    return _itom(itom.options, account_ref, kind, parent=parent, keyword=keyword,
+                 limit=_clamp_limit(limit), role=role)
+
+
+@mcp.tool(name="itops_itom_create_incident")
+def itom_create_incident(account_ref: str, dept: str, group: str, system: str, subclass: str,
+                         menu: str, reporter: str, level: str, nature: str, role: str,
+                         handler: str, description: str, reporter_phone: str | None = None,
+                         reporter_hint: str | None = None, handler_hint: str | None = None,
+                         repair_dept_code: str | None = None,
+                         confirm: bool = False) -> dict[str, Any]:
+    """新增 ITOM 事件单。**默认只返回预览不提交**，用户确认后再带 confirm=true 调用。
+
+    各参数传**用户说的名称**（也可传代码），服务端逐级解析成 code/sid 后拼请求体：
+    dept 部门分类、group 小组、system 系统分类、subclass 系统子类、menu 报修菜单、
+    reporter 报修人姓名（自动回填电话/报修部门/作业区/岗位）、level 事件等级（可传"低"）、
+    nature 事件性质（可传"故障"）、role 人员角色、handler 处理人姓名或工号
+    （自动回填处理人电话）、description 问题描述。
+    平台有重名数据：解析到多条会**直接报错并列出候选**让你回问用户，
+    不要改成猜值或取第一条；消歧可用 reporter_hint/handler_hint 传部门等区分信息。
+
+    返回 {ok, preview:true, resolved, payload} 表示等待确认；confirm=true 才真实建单
+    （经网关调用还会先走人工审批）。缺必填（如报修人无档案电话）会返回引导性错误。
+    """
+    prepared = _itom(itom.prepare_incident, account_ref, dept=dept, group=group, system=system,
+                     subclass=subclass, menu=menu, reporter=reporter, level=level, nature=nature,
+                     role=role, handler=handler, description=description,
+                     reporter_phone=reporter_phone, reporter_hint=reporter_hint,
+                     handler_hint=handler_hint, repair_dept_code=repair_dept_code)
+    if not confirm:
+        return {"ok": True, "preview": True, "submitted": False,
+                "account_ref": account_ref, "resolved": prepared["resolved"],
+                "payload": prepared["payload"], "warnings": prepared["warnings"],
+                "next": "把 payload 的关键字段与 warnings 念给用户确认，"
+                        "无 warnings 且用户同意后再带 confirm=true 重新调用才会建单"}
+    if prepared["warnings"]:
+        raise ToolError("建单前仍有未确认项，请先解决再带 confirm=true 调用："
+                        + "；".join(prepared["warnings"]))
+    result = _itom(itom.submit_incident, account_ref, prepared["payload"])
+    return {**result, "preview": False, "submitted": True}
 
 
 # ---------------------------------------------------------------------------

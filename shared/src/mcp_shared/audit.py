@@ -26,9 +26,12 @@ from mcp_shared.config import audit_dir
 logger = logging.getLogger("mcp_shared.audit")
 
 # 键名包含这些片段即视为敏感值，整体遮蔽（密码零传输约定在审计侧的落地）
+# phone/mobile/tel/idno 是业务平台（ITOM 建单）会带的个人信息：报障人与处理人手机号、
+# 身份证号——它们会作为正常入参出现，同样不能进审计原文
 SENSITIVE_KEYS = frozenset({
     "token", "password", "passwd", "pwd", "secret", "dsn", "authorization",
     "api_key", "apikey", "access_key", "credential", "cookie", "private_key",
+    "phone", "mobile", "tel", "idno", "idcard", "id_no",
 })
 
 MAX_STR = 400  # 审计里长文本截断（完整值属调用方，日志不做大 payload 存档）

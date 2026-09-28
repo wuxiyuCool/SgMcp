@@ -598,49 +598,475 @@ def test_itops_degrades_without_sqlite() -> None:
     print("PASS  it_ops·缺 sqlite3 时优雅降级（服务起得来，api/sql 通道照常）")
 
 
+def test_itom_account_ref_client() -> None:
+    """ITOM 客户端：口令只在服务端配置里流转，AI 侧只见 account_ref；
+    登录/token 注入/401 自动重登/站内路径围栏都不许外泄凭据。"""
+    import json as _json
 
-def test_config_inline_comments() -> None:
-    """.env 值里的行内注释必须剥掉：中文注释混进令牌值会让下游聚合全线失败。"""
-    import tempfile
+    import httpx2 as _httpx
 
-    from mcp_shared import config
+    from mcp_itops import itom
 
-    with tempfile.TemporaryDirectory() as td:
-        f = Path(td) / "platform.env"
-        lines = [
-            "TOK_PLAIN=abc123   # 网关到 it_ops 的令牌",
-            'TOK_QUOTED="abc123 # 保留"',
-            "TOK_SQ='abc123'",
-            "TOK_URL=http://127.0.0.1:9300/mcp   # 本机",
-            "TOK_BARE=abc123",
-        ]
-        f.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        os.environ["MCP_CONFIG_FILE"] = str(f)
+    class Resp:
+        def __init__(self, status=200, payload=None, text="", cookies=None):
+            self.status_code, self._payload, self.text = status, payload, text
+            self.cookies = cookies or {}
+
+        def json(self):
+            if self._payload is None:
+                raise ValueError("no json")
+            return self._payload
+
+    class FakeHttp:
+        HTTPError = _httpx.HTTPError
+
+        def __init__(self):
+            self.calls: list[dict] = []
+            self.script: list[Resp] = []
+
+        def request(self, method, url, *, params=None, json=None, headers=None, timeout=None):
+            self.calls.append({"method": method, "url": url, "params": params,
+                               "json": json, "headers": dict(headers or {})})
+            assert self.script, f"没有预置响应，请求={method} {url}"
+            return self.script.pop(0)
+
+    saved = {k: os.environ.get(k) for k in (
+        "MCP_ITOM_URL", "MCP_ITOM_ACCOUNTS", "MCP_ITOM_WANGXU_USER_ID",
+        "MCP_ITOM_WANGXU_PASSWORD", "MCP_ITOM_WANGXU_ORG_SID",
+        "MCP_ITOM_WANGXU_ORG_POSITION_SID", "MCP_ITOM_WANGXU_NOTE",
+        "MCP_ITOM_OPS01_TOKEN", "MCP_ITOM_UID_PARAM", "MCP_ITOM_RANDOM_QUERY",
+        "MCP_ITOM_READ_SEGMENTS", "MCP_ITOM_TOKEN_HEADER")}
+    real_http = itom.httpx2
+    try:
+        os.environ.update({
+            "MCP_ITOM_URL": "https://itom.test/api",
+            "MCP_ITOM_UID_PARAM": "",          # 本例测的是「token 进请求头」的默认形态
+            "MCP_ITOM_RANDOM_QUERY": "",
+            "MCP_ITOM_READ_SEGMENTS": "",
+            "MCP_ITOM_TOKEN_HEADER": "Authorization",
+            "MCP_ITOM_ACCOUNTS": "wangxu,ops01",
+            "MCP_ITOM_WANGXU_USER_ID": "wangxu",
+            "MCP_ITOM_WANGXU_PASSWORD": "s3cr3t|中文",
+            "MCP_ITOM_WANGXU_ORG_SID": "266",
+            "MCP_ITOM_WANGXU_ORG_POSITION_SID": "1154",
+            "MCP_ITOM_WANGXU_NOTE": "运维中心",
+            "MCP_ITOM_OPS01_TOKEN": "static-tok",
+        })
+        itom._sessions.clear()
+        itom._last_source.clear()
+        fake = FakeHttp()
+        itom.httpx2 = fake
+
+        # 1) 账户清单：有引用名与备注，没有口令；在册但没配全的要显式可见
+        os.environ["MCP_ITOM_ACCOUNTS"] = "wangxu,ops01,ghost"
+        rows = itom.accounts_summary()
+        assert [r["account_ref"] for r in rows] == ["wangxu", "ops01", "ghost"], rows
+        assert rows[0]["user_id"] == "w***u", rows[0]
+        assert rows[2].get("configured") is False and "USER_ID" in rows[2]["reason"], rows[2]
+        assert "s3cr3t" not in _json.dumps(rows, ensure_ascii=False), rows
+
+        # 2) 未知引用名 → 引导性错误（列出可用），不是 KeyError
         try:
-            config._reset()
-            vals = config.load_platform_env()
-            assert vals["TOK_PLAIN"] == "abc123", vals
-            assert vals["TOK_QUOTED"] == "abc123 # 保留", "引号内的 # 属于值本身"
-            assert vals["TOK_SQ"] == "abc123"
-            assert vals["TOK_URL"] == "http://127.0.0.1:9300/mcp"
-            assert vals["TOK_BARE"] == "abc123"
-            # 所有解析出的值都必须能进 HTTP 头（ASCII）
-            for k, v in vals.items():
-                v.encode("ascii")
-        finally:
-            os.environ.pop("MCP_CONFIG_FILE", None)
-            config._reset()
+            itom.account("zhangsan")
+        except itom.ItomError as e:
+            assert "wangxu, ops01" in str(e), e
+        else:
+            raise AssertionError("未知引用名应当报错")
 
-    # 网关侧：非 ASCII 头值要给出配置错误指引，而不是撞 UnicodeEncodeError
-    import mcp_gateway.main as gw
-    from mcp_gateway.aggregator import Aggregator, DownstreamSpec
+        # 3) 登录：请求体带口令（服务端→平台，正常），返回状态里绝不带 token
+        fake.script = [Resp(payload={"reqHeader": {}, "reqBody": {"token": "tk-123"}})]
+        st = itom.login_status("wangxu")
+        assert st["ok"] and st["token_source"] == "token" and st["has_token"], st
+        assert "tk-123" not in _json.dumps(st, ensure_ascii=False), st
+        call = fake.calls[-1]
+        assert call["url"] == "https://itom.test/api/auth/login/login?uid=null", call
+        assert call["json"]["reqBody"]["passwd"] == "s3cr3t|中文", call["json"]
+        assert call["json"]["reqBody"]["orgSid"] == "266"
 
-    bad = DownstreamSpec("x", "http://127.0.0.1:1/mcp", {"Authorization": "Bearer 令牌abc"})
-    msg = Aggregator.header_config_error(bad)
-    assert msg and "config_error" in msg and "非 ASCII" in msg, msg
-    assert Aggregator.header_config_error(DownstreamSpec("x", "u", {"Authorization": "Bearer abc"})) is None
-    assert Aggregator.header_config_error(DownstreamSpec("x", "u", None)) is None
-    print("PASS  config·行内注释剥离 + 非 ASCII 头值给配置错误")
+        # 4) 后续请求自动带 Authorization；token 不回显在返回值里
+        fake.script = [Resp(payload={"data": [{"id": 1}]})]
+        out = itom.request_json("wangxu", "GET", "/incident/list", params={"page": 1})
+        assert fake.calls[-1]["headers"]["Authorization"] == "tk-123", fake.calls[-1]["headers"]
+        assert fake.calls[-1]["params"] == {"page": 1}
+        assert out["data"]["rows"] == [{"id": 1}], out["data"]
+        assert "tk-123" not in _json.dumps(out, ensure_ascii=False)
+
+        # 5) 平台侧提前失效：401 → 自动重登一次 → 重试成功
+        fake.script = [Resp(status=401, payload={"message": "session expired"}),
+                       Resp(payload={"reqBody": {"token": "tk-456"}}),
+                       Resp(payload={"ok": 1})]
+        itom._sessions["wangxu"].obtained_at = time.time()
+        out = itom.request_json("wangxu", "GET", "/incident/list")
+        assert out["data"] == {"ok": 1}, out
+        assert [c["url"].split("/api")[-1] for c in fake.calls[-3:]] == [
+            "/incident/list", "/auth/login/login?uid=null", "/incident/list"], fake.calls[-3:]
+        assert fake.calls[-1]["headers"]["Authorization"] == "tk-456"
+
+        # 6) 路径围栏：绝对 URL / .. / 查询串 / 协议相对 一律拒（挡 SSRF 与越界）
+        for bad in ("http://evil.test/x", "/a/../../etc", "/a?b=1", "//evil.test", "incident/list"):
+            try:
+                itom.request_json("wangxu", "GET", bad)
+            except itom.ItomError:
+                continue
+            raise AssertionError(f"path={bad} 应当被拒")
+
+        # 7) static token 账户：不触发登录请求，直接带令牌
+        fake.calls.clear()
+        fake.script = [Resp(payload={"x": 1})]
+        st = itom.login_status("ops01")
+        assert st["credential"] == "token" and st["token_source"] == "static", st
+        assert not fake.calls, "配了 TOKEN 的账户不该发登录请求"
+        fake.script = [Resp(payload={"x": 1})]
+        itom.request_json("ops01", "GET", "/todo/list")
+        assert fake.calls[-1]["headers"]["Authorization"] == "static-tok", fake.calls[-1]["headers"]
+
+        # 8) 纯 cookie 会话（Java 平台不给 token 的写法）也能登录
+        itom._sessions.clear()
+        os.environ["MCP_ITOM_WANGXU_PASSWORD"] = "s3cr3t|中文"
+        fake.script = [Resp(payload={"reqBody": {"success": "true"}}, cookies={"JSESSIONID": "abc"})]
+        st = itom.login_status("wangxu")
+        assert st["token_source"] == "cookie" and not st["has_token"], st
+        assert st["cookie_names"] == ["JSESSIONID"], st
+        fake.script = [Resp(payload={"x": 1})]
+        itom.request_json("wangxu", "GET", "/todo/list")
+        assert fake.calls[-1]["headers"]["cookie"] == "JSESSIONID=abc", fake.calls[-1]["headers"]
+    finally:
+        itom.httpx2 = real_http
+        itom._sessions.clear()
+        itom._last_source.clear()
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("PASS  it_ops·ITOM 预设账户客户端（凭据不外泄 / token 注入 / 401 重登 / 路径围栏）")
+
+
+def test_itom_platform_contract() -> None:
+    """按 ITOM 实测形态锁定契约：reqHeader/reqBody 请求信封、rspBody 响应信封、
+    HTTP 200 + retCode≠0 要判失败、uid 走查询参数、只读 POST 判定与字段投影（PII 不外泄）。"""
+    import json as _json
+
+    from mcp_itops import itom
+
+    class Resp:
+        def __init__(self, status=200, payload=None, text="", cookies=None):
+            self.status_code, self._payload, self.text = status, payload, text
+            self.cookies = cookies or {}
+
+        def json(self):
+            if self._payload is None:
+                raise ValueError("no json")
+            return self._payload
+
+    class FakeHttp:
+        # 只当 httpx2.HTTPError 的类型占位：不能是 Exception 本身，否则测试里的
+        # AssertionError 会被 itom 的错误分支吞掉，把"没预置响应"伪装成兜底成功
+        HTTPError = type("FakeHTTPError", (BaseException,), {})
+
+        def __init__(self):
+            self.calls: list[dict] = []
+            self.script: list[Resp] = []
+
+        def request(self, method, url, *, params=None, json=None, headers=None, timeout=None):
+            self.calls.append({"method": method, "url": url, "params": params,
+                               "json": json, "headers": dict(headers or {})})
+            assert self.script, f"没有预置响应，请求={method} {url}"
+            return self.script.pop(0)
+
+    saved = {k: os.environ.get(k) for k in (
+        "MCP_ITOM_URL", "MCP_ITOM_ACCOUNTS", "MCP_ITOM_ITOMA_USER_ID",
+        "MCP_ITOM_ITOMA_PASSWORD", "MCP_ITOM_UID_PARAM", "MCP_ITOM_READ_SEGMENTS",
+        "MCP_ITOM_RANDOM_QUERY", "MCP_ITOM_TOKEN_HEADER")}
+    real_http = itom.httpx2
+    fake = FakeHttp()
+    try:
+        os.environ.update({
+            "MCP_ITOM_URL": "https://itom.test/api",
+            "MCP_ITOM_ACCOUNTS": "itoma",
+            "MCP_ITOM_ITOMA_USER_ID": "itoma",
+            "MCP_ITOM_ITOMA_PASSWORD": "pw",
+            "MCP_ITOM_UID_PARAM": "uid",
+        })
+        itom._sessions.clear()
+        itom._last_source.clear()
+        itom.httpx2 = fake
+
+        # 1) 登录：token 键是平台自定义的 gm_auth_token，会话靠 JSESSIONID
+        fake.script = [Resp(payload={"retCode": "0000000", "retDesc": "OK", "timestamp": "t",
+                                    "rspBody": {"gm_auth_token": "gm-1", "userId": "itoma"}},
+                            cookies={"JSESSIONID": "js-1"})]
+        st = itom.login_status("itoma")
+        assert st["token_source"] == "gm_auth_token" and st["has_token"], st
+        assert st["cookie_names"] == ["JSESSIONID"], st
+        assert "gm-1" not in _json.dumps(st, ensure_ascii=False)
+
+        # 2) 业务请求：服务端补 reqHeader/reqBody 信封，uid 走查询参数，不多发 Authorization
+        rows = [{"eventNo": "SG1", "problemDesc": "入库单提取不了", "dealStaffPhone": "15000000000"},
+                {"eventNo": "SG2", "problemDesc": "网络故障", "dealStaffPhone": "13900000000"}]
+        fake.script = [Resp(payload={"retCode": "0000000", "retDesc": "OK",
+                                    "rspBody": {"pageNum": 1, "total": 2, "resultData": rows}})]
+        out = itom.request_json("itoma", "POST", "/event-manage/findByPage",
+                                body={"pageSize": "20"}, fields=["eventNo", "problemDesc"])
+        call = fake.calls[-1]
+        assert call["json"] == {"reqHeader": {"operTitle": ""}, "reqBody": {"pageSize": "20"}}, call["json"]
+        assert call["params"]["uid"] == "gm-1", call["params"]
+        assert "Authorization" not in call["headers"], call["headers"]
+        assert call["headers"]["cookie"] == "JSESSIONID=js-1"
+        d = out["data"]
+        assert d["rows"] == [{"eventNo": "SG1", "problemDesc": "入库单提取不了"},
+                             {"eventNo": "SG2", "problemDesc": "网络故障"}], d
+        assert (d["total"], d["rows_key"], d["returned"]) == (2, "resultData", 2), d
+        # 手机号等 PII 不在投影里，就不该出现在返回中
+        assert "15000000000" not in _json.dumps(out, ensure_ascii=False)
+
+        # 3) HTTP 200 + retCode 非成功码 = 失败；但不是掉线的文案就不该乱重登
+        logins = sum(1 for c in fake.calls if "/auth/login" in c["url"])
+        fake.script = [Resp(payload={"retCode": "9999999", "retDesc": "参数不合法", "rspBody": None})]
+        try:
+            itom.request_json("itoma", "POST", "/event-manage/findByPage", body={})
+        except itom.ItomError as e:
+            assert "retCode=9999999" in str(e) and "参数不合法" in str(e), e
+        else:
+            raise AssertionError("retCode 失败必须报错")
+        assert sum(1 for c in fake.calls if "/auth/login" in c["url"]) == logins, "业务错误不该触发重登"
+
+        # 4) 会话失效（HTTP 200 + retCode 的掉线文案）→ 自动重登一次再重试，调用方无需先调 login
+        fake.script = [Resp(payload={"retCode": "9999999", "retDesc": "会话已失效，请重新登录", "rspBody": None}),
+                       Resp(payload={"retCode": "0000000", "rspBody": {"gm_auth_token": "gm-2"}},
+                            cookies={"JSESSIONID": "js-2"}),
+                       Resp(payload={"retCode": "0000000", "rspBody": {"resultData": [{"eventNo": "SG9"}]}})]
+        out = itom.request_json("itoma", "POST", "/event-manage/findByPage",
+                                body={}, fields=["eventNo"])
+        assert out["ok"] and out["relogged"] is True and out["data"]["rows"] == [{"eventNo": "SG9"}], out
+        assert fake.calls[-1]["params"]["uid"] == "gm-2", fake.calls[-1]["params"]
+        assert fake.calls[-1]["headers"]["cookie"] == "JSESSIONID=js-2"
+
+        # 5) TTL 内复用会话：连续调用不重复登录
+        logins = sum(1 for c in fake.calls if "/auth/login" in c["url"])
+        for _ in range(3):
+            fake.script = [Resp(payload={"retCode": "0000000", "rspBody": {}})]
+            itom.request_json("itoma", "POST", "/event-manage/findByPage", body={})
+        assert sum(1 for c in fake.calls if "/auth/login" in c["url"]) == logins, "TTL 内不该重复登录"
+
+        # 6) 只读通道只放行 GET 或只读形态路径；写形态必须走审批工具
+        fake.script = [Resp(payload={"retCode": "0000000", "rspBody": {"ok": 1}})]
+        try:
+            itom.request_json("itoma", "POST", "/event-manage/updateEvent", body={},
+                              read_channel=True)
+        except itom.ItomError as e:
+            assert "不像只读接口" in str(e) and "itops_itom_call" in str(e), e
+        else:
+            raise AssertionError("写形态路径不该走只读通道")
+        assert itom.read_like("/event-manage/findByPage") and not itom.read_like("/event-manage/updateEvent")
+        os.environ["MCP_ITOM_READ_SEGMENTS"] = "updateEvent"
+        assert itom.read_like("/event-manage/updateEvent"), "追加白名单应生效"
+
+        # 7) 已是完整信封时不重复包裹；cache buster 开关按需
+        fake.script = [Resp(payload={"retCode": "0000000", "rspBody": {}})]
+        itom.request_json("itoma", "POST", "/event-manage/findByPage",
+                          body={"reqHeader": {"operTitle": "x"}, "reqBody": {"a": 1}})
+        assert fake.calls[-1]["json"] == {"reqHeader": {"operTitle": "x"}, "reqBody": {"a": 1}}
+        os.environ["MCP_ITOM_RANDOM_QUERY"] = "1"
+        fake.script = [Resp(payload={"retCode": "0000000", "rspBody": {}})]
+        itom.request_json("itoma", "POST", "/event-manage/findByPage", body={})
+        qp = fake.calls[-1]["params"]
+        assert any(k.startswith("0.") for k in qp) and qp["uid"] == "gm-2", qp
+
+        # 8) 码值字典：内置快照兜底 → 平台字典覆盖 → 行内补中文（未知码值不编造）
+        itom._dict_cache.clear()
+        assert itom.code_table("EVENT_LEVEL") == {"1": "低", "2": "中", "3": "高", "4": "紧急"}
+        fake.script = [
+            Resp(payload={"retCode": "0000000",
+                          "rspBody": {"resultData": [{"typeSid": 20052, "typeCode": "EVENT_LEVEL"}]}}),
+            Resp(payload={"retCode": "0000000",
+                          "rspBody": {"resultData": [{"typeCode": "1", "typeName": "低"},
+                                                     {"typeCode": "5", "typeName": "特急"}]}}),
+        ]
+        assert itom.code_table("EVENT_LEVEL", "itoma") == {"1": "低", "5": "特急"}, "平台字典应覆盖快照"
+        calls_before = len(fake.calls)
+        assert itom.code_table("EVENT_LEVEL", "itoma") == {"1": "低", "5": "特急"}
+        assert len(fake.calls) == calls_before, "码表结果要缓存，别每次都查两趟接口"
+        rows = itom.decode_rows([{"eventState": "3", "eventLevel": "9", "eventNature": None}])
+        assert rows[0]["eventStateName"] == "已解决", rows[0]
+        assert "eventLevelName" not in rows[0] and "eventNatureName" not in rows[0], \
+            "未知/空码值不该编造中文"
+        # 事件单列表默认把状态/等级/性质翻译成中文（复用刚缓存的码表，不再打接口）
+        fresh = time.time()
+        itom._dict_cache.update({
+            "EVENT_STATUS": ({"3": "已解决"}, fresh),
+            "EVENT_LEVEL": ({"1": "低", "4": "紧急"}, fresh),
+            "EVENT_NATURE": ({"2": "服务请求"}, fresh),
+        })
+        fake.script = [Resp(payload={"retCode": "0000000", "rspBody": {"total": 1, "resultData": [
+            {"eventNo": "SG1", "eventState": "3", "eventLevel": "4", "eventNature": "2"}]}})]
+        calls_before = len(fake.calls)
+        listed = itom.incidents("itoma", days=7, page_size=1)["data"]["rows"]
+        assert (listed[0]["eventStateName"], listed[0]["eventLevelName"],
+                listed[0]["eventNatureName"]) == ("已解决", "紧急", "服务请求"), listed
+        assert len(fake.calls) == calls_before + 1, "命中码表缓存时不该再查字典接口"
+    finally:
+        itom.httpx2 = real_http
+        itom._sessions.clear()
+        itom._last_source.clear()
+        itom._dict_cache.clear()
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("PASS  it_ops·ITOM 平台契约（信封/retCode/uid 参数/只读判定/字段投影）")
+
+
+
+def test_itom_guided_incident_build() -> None:
+    """引导式建单：候选发现带父级+角色、重名必须回问、payload 与平台前端形态一致，
+    且档案接口返回的身份证号/token 必须被剔除。"""
+    import json as _json
+
+    from mcp_itops import itom
+
+    class Resp:
+        def __init__(self, payload=None, status=200):
+            self.status_code, self._payload, self.text, self.cookies = status, payload, "", {}
+
+        def json(self):
+            return self._payload
+
+    class FakeHttp:
+        HTTPError = type("FakeHTTPError", (BaseException,), {})
+
+        def __init__(self):
+            self.calls: list[dict] = []
+            self.script: list[Resp] = []
+
+        def request(self, method, url, *, params=None, json=None, headers=None, timeout=None):
+            self.calls.append({"url": url, "json": json, "params": params,
+                               "headers": dict(headers or {})})
+            assert self.script, f"没有预置响应，请求={method} {url}"
+            return self.script.pop(0)
+
+    def rows(*items) -> Resp:
+        return Resp(payload={"retCode": "0000000", "rspBody": {"resultData": list(items)}})
+
+    saved = {k: os.environ.get(k) for k in (
+        "MCP_ITOM_URL", "MCP_ITOM_ACCOUNTS", "MCP_ITOM_GUIDED_TOKEN", "MCP_ITOM_UID_PARAM")}
+    real_http = itom.httpx2
+    fake = FakeHttp()
+    try:
+        os.environ.update({
+            "MCP_ITOM_URL": "https://itom.test/api", "MCP_ITOM_ACCOUNTS": "guided",
+            "MCP_ITOM_GUIDED_TOKEN": "tk", "MCP_ITOM_UID_PARAM": "uid",
+        })
+        itom.httpx2 = fake
+        itom._sessions.clear()
+        # 码表预置，避免测解析逻辑时还要脚本网关字典请求
+        fresh = time.time()
+        itom._dict_cache.update({
+            "EVENT_LEVEL": ({"1": "低", "2": "中", "3": "高", "4": "紧急"}, fresh),
+            "EVENT_NATURE": ({"1": "故障", "2": "服务请求"}, fresh),
+            "SYS_USER_TYPE": ({"1": "一线人员", "2": "二线人员"}, fresh),
+        })
+
+        # 1) staff 必须带 role，否则平台返回 0 人
+        try:
+            itom.options("guided", "staff", parent=33298)
+        except itom.ItomError as e:
+            assert "role" in str(e), e
+        else:
+            raise AssertionError("staff 缺 role 应报错")
+
+        # 2) 档案接口的敏感列必须被剔掉（平台 auth-user 类接口会带 idNo/token）
+        fake.script = [Resp(payload={"retCode": "0000000", "rspBody": {"resultData": [
+            {"userId": "wuxy1613", "userName": "吴希禹", "mobilePhone": "18700000000",
+             "sysUserType": 1, "isDefault": 1, "idNo": "520201199604201613",
+             "token": "d0e74945-secret"}]}})]
+        staff = itom.options("guided", "staff", parent=33298, role="1")
+        assert fake.calls[-1]["json"]["reqBody"] == {
+            "pageSize": "50", "sysSid": 33298, "sysUserType": "1"}, fake.calls[-1]["json"]
+        assert staff[0]["userName"] == "吴希禹"
+        blob = _json.dumps(staff, ensure_ascii=False)
+        assert "520201199604201613" not in blob and "d0e74945" not in blob, "敏感列泄漏"
+
+        # 3) 重名必须回问，hint 能唯一命中才继续
+        dup = [Resp(payload={"retCode": "0000000", "rspBody": {"resultData": [
+            {"sid": 1, "customName": "鲁红文", "mobilePhone": "1771", "departentName": "焦化事业部"},
+            {"sid": 2, "customName": "鲁红文", "mobilePhone": "1772", "departentName": "质检监督部",
+             "operationName": "原燃料检测中心"}]}})]
+        fake.script = list(dup)
+        try:
+            itom.resolve("guided", "custom", "鲁红文")
+        except itom.ItomError as e:
+            assert "同名记录" in str(e) and "焦化事业部" in str(e), str(e)[:200]
+        else:
+            raise AssertionError("重名应报歧义")
+        fake.script = list(dup)
+        picked = itom.resolve("guided", "custom", "鲁红文", hint="原燃料检测中心")
+        assert picked["sid"] == 2, picked
+
+        # 4) 完整引导装配：逐级带父级请求，payload 覆盖平台必填列
+        fake.script = [
+            rows({"orgCode": "600003010102", "orgDesc": "智能应用事业部", "orgSid": 424}),
+            rows({"orgCode": "60000301010201", "orgDesc": "信息化维护班", "orgSid": 425}),
+            rows({"sysSid": 33298, "sysCode": "SG057", "sysName": "实验室管理系统", "sysLevel": 1}),
+            rows({"sysSid": 33311, "sysCode": "SG057003", "sysName": "原料分析中心", "sysLevel": 2}),
+            rows({"sysSid": 33375, "sysCode": "SG057003001", "sysName": "外部委托查询", "sysLevel": 3}),
+            rows({"sid": 2, "customName": "鲁红文", "mobilePhone": "17708580769",
+                  "departentName": "质检监督部", "operationName": "原燃料检测中心", "postName": "办公室"}),
+            rows({"userId": "wuxy1613", "userName": "吴希禹", "mobilePhone": "18786696624",
+                  "sysUserType": 1}),
+            rows({"orgCode": "600031", "orgDesc": "质检监督部", "orgSid": 646}),
+        ]
+        pre = itom.prepare_incident(
+            "guided", dept="智能应用事业部", group="信息化维护班", system="实验室管理系统",
+            subclass="原料分析中心", menu="外部委托查询", reporter="鲁红文", level="低",
+            nature="故障", role="一线人员", handler="吴希禹", description="权限查不到质检信息")
+        payload = pre["payload"]
+        assert (payload["deptCode"], payload["groupSid"], payload["systemTypeSid"]) == (
+            "600003010102", 425, 33298), payload
+        assert (payload["systemSubclassSid"], payload["repairMenu"], payload["dealStaff"]) == (
+            33311, "SG057003001", "wuxy1613"), payload
+        assert (payload["eventLevel"], payload["eventNature"], payload["dealStaffRole"]) == (
+            "1", "1", "1"), payload
+        assert payload["repairDeptCode"] == "600031" and not pre["warnings"], pre["warnings"]
+        assert payload["repairStaffPhone"] == "17708580769" and payload["dealStaffPhone"] == "18786696624"
+        # 父级顺序：group 带部门码、system 带组码、subclass/menu 带上级 sysSid
+        bodies = [c["json"]["reqBody"] for c in fake.calls[-8:]]
+        assert bodies[1]["orgCode"] == "600003010102" and bodies[2]["groupCode"] == "60000301010201"
+        assert bodies[3]["parentSid"] == 33298 and bodies[4]["parentSid"] == 33311
+        assert bodies[6]["sysSid"] == 33298 and bodies[6]["sysUserType"] == "1"
+
+        # 5) 报修部门解析不出来时进 warnings（不阻断预览，但阻断 confirm 提交）
+        fake.script = [
+            rows({"orgCode": "600003010102", "orgDesc": "智能应用事业部", "orgSid": 424}),
+            rows({"orgCode": "60000301010201", "orgDesc": "信息化维护班", "orgSid": 425}),
+            rows({"sysSid": 33298, "sysCode": "SG057", "sysName": "实验室管理系统", "sysLevel": 1}),
+            rows({"sysSid": 33311, "sysCode": "SG057003", "sysName": "原料分析中心", "sysLevel": 2}),
+            rows({"sysSid": 33375, "sysCode": "SG057003001", "sysName": "外部委托查询", "sysLevel": 3}),
+            rows({"sid": 2, "customName": "张三", "mobilePhone": "1772", "departentName": "质检监督部"}),
+            rows({"userId": "wuxy1613", "userName": "吴希禹", "mobilePhone": "187", "sysUserType": 1}),
+            # 报修部门按名称查到两条同名不同级 → 不猜，进 warnings
+            rows({"orgCode": "600031", "orgDesc": "质检监督部", "orgSid": 646, "parentOrgCode": "600"},
+                 {"orgCode": "30003001", "orgDesc": "质检监督部", "orgSid": 9, "parentOrgCode": "30000001"}),
+        ]
+        pre2 = itom.prepare_incident(
+            "guided", dept="智能应用事业部", group="信息化维护班", system="实验室管理系统",
+            subclass="原料分析中心", menu="外部委托查询", reporter="张三", level="低",
+            nature="故障", role="一线人员", handler="吴希禹", description="x")
+        assert pre2["payload"]["repairDeptCode"] is None
+        assert any("报修部门代码未解析" in w for w in pre2["warnings"]), pre2["warnings"]
+    finally:
+        itom.httpx2 = real_http
+        itom._sessions.clear()
+        itom._dict_cache.pop("EVENT_LEVEL", None)
+        itom._dict_cache.pop("EVENT_NATURE", None)
+        itom._dict_cache.pop("SYS_USER_TYPE", None)
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("PASS  it_ops·ITOM 引导式建单（父级级联/重名回问/敏感列剔除/payload 对齐平台）")
 
 
 def test_config_inline_comments() -> None:
@@ -1036,6 +1462,9 @@ if __name__ == "__main__":
     test_gateway_kv_and_schema()
     test_itops_persistence()
     test_itops_degrades_without_sqlite()
+    test_itom_account_ref_client()
+    test_itom_platform_contract()
+    test_itom_guided_incident_build()
     test_itops_dataset_enum_from_config()
     test_shared_config()
     test_config_inline_comments()

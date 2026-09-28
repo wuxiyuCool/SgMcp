@@ -42,7 +42,11 @@ DEFAULT_DOWNSTREAMS = (
 
 # 默认需审批工具（工具名带层级前缀：itops_=领域工具 / data_=全局数据平台；
 # 匹配时点号会先归一为下划线，兼容旧写法；可用 MCP_APPROVAL_TOOLS 覆盖）
-DEFAULT_APPROVAL_TOOLS = frozenset({"itops_create_change", "data_submit_collect_job"})
+DEFAULT_APPROVAL_TOOLS = frozenset({
+    "itops_create_change", "data_submit_collect_job",
+    # 写真实生产 ITOM 数据的透传口（只读的 itops_itom_get 不在名单内）
+    "itops_itom_call", "itops_itom_create_incident",
+})
 
 
 @dataclass

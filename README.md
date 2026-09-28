@@ -51,7 +51,7 @@ AI ──MCP──▶ 网关（唯一入口）
 - **启动竞态容忍**：下游未就绪时每秒重试（窗口 `MCP_DISCOVERY_RETRY_SECONDS`，
   默认 6s）；彻底缺席则跳过告警照常启动，上线后调 `refresh_routes` 工具补拉。
 - **审批策略外置**：需 HITL 审批的工具名由 `MCP_APPROVAL_TOOLS` 配置
-  （默认 `itops_create_change,data_submit_collect_job`；支持 `data_batch_*` 前缀通配
+  （默认 `itops_create_change,data_submit_collect_job,itops_itom_call`；支持 `data_batch_*` 前缀通配
   与 `go_datahub:data_submit_collect_job` 形式的 server 限定）。
 - 详见 `docs/architecture.md` §2 与 `mcp_gateway/aggregator.py`。
 

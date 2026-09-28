@@ -312,5 +312,19 @@ $env:MCP_GODATAHUB_TOKEN = "<与 Go 侧一致的 token>"   # 不设则不带 Aut
   驱动报错经 `dbhub.Scrub` 把 DSN/密码替换为 `***` 才返回。
   由此密码不进入 AI 客户端上下文、网关审批单（tool_args）、审计日志与错误回显。
   （兼容：仍可直接传裸 `dsn`，仅建议本机调试用。）
+- **业务平台账户引用机制（同 dsn_ref，密码零传输）**：ITOM 等业务系统的账号口令只存
+  `platform.env` 的 `MCP_ITOM_<引用名>_USER_ID/_PASSWORD`，MCP 工具参数用
+  `account_ref:"wangxu"` 引用；`itops_itom_accounts` 只回引用名/备注/打码工号，
+  登录换来的 token 留在服务端进程内缓存（TTL 内多次调用只登一次；平台提前失效——
+  401/403 或 HTTP 200 + retCode 的掉线文案——会自动重登一次再重试），
+  既不进对话与工具入参，也不出现在任何返回值里。
+  由此口令与 token 都不进入 AI 上下文、审批单 tool_args、审计日志与错误回显。
+  （对话里收集用户口令的方案已在评审时否掉：会话记录与模型上下文无法遮蔽，
+  等于把一台机器的凭据面扩大成每个会话。）
+  ITOM 实测形态已锁定：登录返回 `rspBody.gm_auth_token` + `Set-Cookie: JSESSIONID`，
+  业务接口把该 token 当**查询参数 uid** 发出；平台的失败是 HTTP 200 + `retCode≠0000000`，
+  必须判 retCode；列表单行 137 列含手机号，所以工具默认按业务列投影再返回。
+  细节与开关见 `docs/develop-deploy.md` §2.6。
 - 回归覆盖：`go test ./internal/config/`（解析/优先级/引号剥离）、`tests/smoke_test.py`
-  的 config 段、`tests/ops`「未知 dsn_ref 不泄露凭证」与审计脱敏断言、ops-check 全量守护套件。
+  的 config 段、`tests/ops`「未知 dsn_ref 不泄露凭证」与审计脱敏断言、ops-check 全量守护套件，
+  以及 `test_itom_account_ref_client`（返回值不含口令/token、401 自动重登、站内路径围栏）。

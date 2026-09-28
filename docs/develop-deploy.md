@@ -63,10 +63,15 @@ AI 客户端只需记忆 3 个 route_* 工具（见 §2.5）；下列方法是�
 `hash_text` `base64_codec` `uuid_generate` `random_string` `json_tool`
 `datetime_convert`（时区转换+偏移）`url_parse` `regex_find` `text_stats` `server_self_check`（下层自检）
 
-**it_ops（中层·业务，13）**：`itops_create_incident` `itops_list_incidents` `itops_update_incident_status`
-`itops_create_change`【需审批】 `itops_get_change` `itops_register_asset` `itops_list_assets`
-`itops_export_assets_to_warehouse` `itops_query_warehouse_assets` `itops_batch_process`
-`itops_list_datasets` `itops_query_dataset` `itops_list_data_tables`
+**it_ops（中层·业务，22）**：
+- 本地/路由工单台帐（13）：`itops_create_incident` `itops_list_incidents` `itops_update_incident_status`
+  `itops_create_change`【需审批】 `itops_get_change` `itops_register_asset` `itops_list_assets`
+  `itops_export_assets_to_warehouse` `itops_query_warehouse_assets` `itops_batch_process`
+  `itops_list_datasets` `itops_query_dataset` `itops_list_data_tables`
+- ITOM 平台真实对接（9，凭据只在服务端，见 §2.6）：`itops_itom_accounts` `itops_itom_login`
+  `itops_itom_logout` `itops_itom_get`（只读，允许只读形态的 POST） `itops_itom_incidents`（事件单列表，带字段投影+码值中文）
+  `itops_itom_incident_form`（建单字段说明书） `itops_itom_options`（下拉候选发现）
+  `itops_itom_create_incident`（引导式建单，默认只出预览）【需审批】 `itops_itom_call`（通用写透传）【需审批】
 
 **go_datahub（中层·重活，17）**：
 - 采集 job：`data_list_sources` `data_submit_collect_job`【需审批】 `data_get_job_status` `data_list_jobs` `data_cancel_job`
@@ -146,6 +151,122 @@ mcp.AddTool(server, &mcp.Tool{
 route_* 工具由 `aggregator.on_sync → rebuild_route_tools()` 在每轮聚合后整体重建，
 枚举始终与下游最新工具表一致。新增下游 server 时同样自动生成对应 route 工具，
 无需改网关代码。
+
+### 2.6 对接真实业务平台（ITOM 预设账户模式）
+
+场景：让 MCP 直接调用 ITOM（`itom.shougang.com.cn`）这类需要登录的生产系统。
+凭据模型与 `dsn_ref` 同构——**口令只在服务端，AI 只见引用名**：
+
+```bash
+# config/platform.env（不进版本库）
+MCP_ITOM_URL=https://itom.shougang.com.cn/api
+MCP_ITOM_ACCOUNTS=wangxu,ops01
+MCP_ITOM_WANGXU_USER_ID=<工号>
+MCP_ITOM_WANGXU_PASSWORD=<口令>
+MCP_ITOM_WANGXU_ORG_SID=266
+MCP_ITOM_WANGXU_ORG_POSITION_SID=1154
+# 该平台的凭据走查询参数而不是请求头（实测必须配）
+MCP_ITOM_UID_PARAM=uid
+```
+
+调用顺序（AI 侧）：`itops_itom_accounts` → 选 `account_ref` → 直接 `itops_itom_incidents`/
+`itops_itom_get`/`itops_itom_call`。**首次调用会自动登录，之后 TTL 内复用会话不再登录**
+（实测同一进程内 3 次查询只发了 1 次登录请求，后续单次约 0.5s）；平台提前判会话失效时
+（401/403，或 HTTP 200 + retCode 的掉线文案）自动重登一次再重试，返回里带 `relogged: true`。
+`itops_itom_login` 只在想看会话状态或强制换会话时才调。
+实现见 `mcp_itops/itom.py`：会话缓存按 account_ref 存在进程内（含 token 与 JSESSIONID），
+不落盘、不外传；并发调用共享同一会话。
+
+打通新接口时不要靠猜——用 `itops_itom_get` 照着浏览器 Network 里的相对路径试：
+
+```
+route_it_ops(method="itops_itom_get", params={"account_ref": "wangxu", "path": "/<模块>/<方法>"})
+```
+
+常见对不上的地方，都有对应开关，不用改代码：
+
+| 现象 | 开关 |
+|------|------|
+| 登录成功但报"没找到 token"，错误里已列出实际键名 | `MCP_ITOM_TOKEN_KEY=<那个键名>` |
+| 平台只发 `Set-Cookie`（JSESSIONID 型会话） | 无需配置，cookie 自动随请求带上 |
+| 后续请求 401/403，但浏览器正常 | 令牌头名/前缀不对：`MCP_ITOM_TOKEN_HEADER`、`MCP_ITOM_TOKEN_SCHEME=Bearer` |
+| 403 且登录就失败（平台 WAF 挑客户端） | 照抄浏览器请求头：`MCP_ITOM_USER_AGENT`、`MCP_ITOM_REFERER` |
+| 平台登录接口路径不是 `/auth/login/login?uid=null` | `MCP_ITOM_LOGIN_PATH` |
+| 机器上不想存明文口令 | 该账户改配 `MCP_ITOM_<引用名>_TOKEN=<长期令牌>`，跳过登录 |
+
+`path` 只接受站内相对路径（禁 `//`、`..`、查询串，查询参数走 `params`），
+所以这个透传口不能用来访问 MCP_ITOM_URL 之外的主机。
+
+**实测契约（2026-09-28 对生产 ITOM 取证，已写进 `test_itom_platform_contract`）**：
+
+| 环节 | 平台形态 | 客户端处理 |
+|------|----------|------------|
+| 登录 | 成功返回 `{retCode,retDesc,timestamp,rspBody:{gm_auth_token,…}}` + `Set-Cookie: JSESSIONID` | token 键按"以 token 结尾"自动命中 `gm_auth_token`，`MCP_ITOM_TOKEN_KEY` 可锁定 |
+| 凭据位置 | 业务接口的 `uid=<gm_auth_token>` 在**查询串**里，不在请求头 | `MCP_ITOM_UID_PARAM=uid`，此时不发 Authorization |
+| 会话 | 同时依赖 JSESSIONID | cookie 随进程内会话缓存自动带 |
+| 请求信封 | `{"reqHeader":{"operTitle":""},"reqBody":{业务字段}}` | 调用方只写内层，服务端补壳（已是完整壳则原样发） |
+| 响应信封 | 业务数据在 `rspBody`，列表在 `rspBody.resultData` | 自动剥壳 + 归一成 `{rows,returned,total,rows_key}` |
+| 失败形态 | **HTTP 200 + retCode≠0000000** | 判为工具错误并带 retDesc，避免 AI 拿空数据继续编 |
+| 分页 | `pageNum`/`pageSize` 生效（实测两页数据不同） | `page_num`/`page_size`，上限 100 |
+| 过滤 | `systemType`、`eventNo` 生效；`eventState` 传任何值都 0 行；`problemDesc` 只整句精确匹配 | 工具只暴露生效的两个；状态统计请对返回 rows 自行分组 |
+| 行宽 | 单行 **137 列**，含报障人/处理人手机号，20 行 ≈ 57 KB | 默认投影 16 个业务列（≈9 KB，`itops_itom_incidents` 内置），`fields` 可覆盖 |
+
+`itops_itom_incidents(account_ref, days, system_type, event_no, page_num, page_size)` 是把上面
+全部规则包好的业务工具——AI 侧要事件单数据就用它，别自己拼 findByPage 的日期格式。
+
+**码值字典**（`/base-dict-data/findByParams`，两级查询：先 `typeCode=<表名>` 拿父项 `typeSid`，
+再 `parentSid=<typeSid>` 拿子项）。`itom.py` 的 `CODE_TABLES` 是 2026-09-28 的取证快照，
+运行时优先读平台字典（按表名缓存 1 小时，取不到才退回快照）；列表返回会自动补
+`eventStateName/eventLevelName/eventNatureName`，所以 AI 看到的是"已解决/低/故障"而不是"3/1/1"。
+
+| 表名 | 码值 → 含义 |
+|------|-------------|
+| `EVENT_LEVEL`（事件等级） | 1 低 / 2 中 / 3 高 / 4 紧急 |
+| `EVENT_NATURE`（事件性质） | 1 故障 / 2 服务请求 / 3 监控告警 / 4 信息安全 |
+| `EVENT_STATUS`（事件状态，列表里的 `eventState`） | 1 已分配 / 2 处理中 / 3 已解决 / 4 记录解决方案 / 5 回访 / 6 遗留 / 7 关闭 / 8 置废 / 9 用户新建 / 10 用户提报 / 11 监控新建 |
+| `EVENT_CATEGORY` | 1 软件 / 2 硬件 |
+| `SYS_USER_TYPE`（`dealStaffRole`） | 1 一线人员 / 2 二线人员 / 3 系统负责人 |
+| `SOLVE_MODE` | 1 电话指导 / 2 远程解决 / 3 现场解决 |
+| `SOLVE_TYPE` | A 技术类 / B 一二级类 / C 业务类 / D·J 系统集成类 / E 其他类 / F 安装类 / G 调试类 / H 配置类 / I 天车类 / K 发布类 / L 硬件损坏类 / M·N 信息安全类 |
+| `CHANGE_ORDER_REASON` | 1 用户提报错误 / 2 遗留重新分配 / 3 服务台分配错误 / 4 其他系统问题 / 5 内部转单 |
+| `IS_SOLVED` / `IS_SATISFIED` / `IS_MONITOR` | **0 是 / 1 否**（反直觉，别按 1=是 填） |
+
+冷启动时字典查询会给首个列表请求加约 4–5 秒（每张表两次接口，之后 1 小时内命中缓存）。
+
+### 2.6.1 引导式建单（新增事件单 saveData）
+
+表单 16 个必填项**全部可由接口选出**，AI 侧的固定流程是：
+
+```
+itops_itom_incident_form()                      # 读字段说明书
+itops_itom_options(kind="dept")                 # 部门分类
+  → options(kind="group", parent=<部门 orgCode>)
+  → options(kind="system", parent=<组 groupCode>)
+  → options(kind="subclass", parent=<系统 sysSid>)
+  → options(kind="menu", parent=<子类 sysSid>)
+  → options(kind="custom", keyword=<报修人姓名>)     # 报修人档案
+  → options(kind="staff", parent=<系统 sysSid>, role=<1|2|3>)   # 处理人，缺 role 平台返回 0 人
+itops_itom_create_incident(...名称...)          # 默认只回预览 payload
+itops_itom_create_incident(..., confirm=true)   # 用户确认后才真实建单（经网关还要审批）
+```
+
+三条硬规则，都是实测出来的坑：
+
+- **重名一律回问，绝不挑第一个**。`customName=鲁红文` 平台返回 5 条（部门/电话各不同，
+  其中两条电话还一样），`质检监督部` 作为报修部门有 3 个不同层级的 orgCode。
+  `resolve()` 命中多条直接报 `ItomError` 并**逐行列出区分字段**，让 AI 拿回去问用户；
+  消歧可传 `reporter_hint` / `handler_hint`。报修部门解析不出来会进 `warnings`，
+  而 `warnings` 非空时 `confirm=true` 会被拦住——不给"带着未确认项就提交"的路径。
+- **处理人只走 `/bs-system-class-staff/findByParamsForEvent`**（sysSid+sysUserType 两个键，
+  sysSid 必须是一级系统）。不要用 `/auth/auth-user/findByParamsForET`：它返回 75 列，
+  含 `idNo` 身份证号和用户 `token`。
+- **敏感列双层拦截**：`itom.SCRUB_COLUMNS`（idno/token/cookie/…）在返回前递归剔除，
+  `mcp_shared.audit.SENSITIVE_KEYS` 新增 `phone/mobile/tel/idno/idcard`，
+  所以报修人与处理人手机号既不进 AI 上下文也不进审计原文。
+
+预览 payload 与平台前端提交形态逐字段一致（实测 `deptCode/deptSid/groupSid/systemTypeSid/
+systemSubclassSid/repairMenuSid/dealStaff/dealStaffPhone` 全部自动填好），
+`itops_itom_create_incident` 已在 `MCP_APPROVAL_TOOLS` 默认名单内。
 
 ## 3. 本地开发调试（Windows）
 

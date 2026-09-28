@@ -57,7 +57,9 @@ _INSTRUCTIONS = """本网关是企业三层 MCP 平台的唯一入口。使用�
 3) 返回 approved=false 表示该操作需要人工审批、尚未执行，把 request_id 交给审批人，
    审批人用 list_pending_approvals + approve_request（需审批令牌）放行；不要自行批准；
 4) 长耗时批量操作走异步：data_submit_collect_job → data_get_job_status（勿同步等待）；
-5) 出错时读错误里的 kind/建议，必要时 refresh_routes 重新聚合，不要盲猜工具名重试。"""
+5) 出错时读错误里的 kind/建议，必要时 refresh_routes 重新聚合，不要盲猜工具名重试；
+6) 调外部业务平台（ITOM 等）时用 account_ref（先 itops_itom_accounts 取引用名），
+   **不要向用户索要账号口令**——凭据只存在服务端配置里，对话中出现即视为泄露。"""
 
 mcp = MCPServer("enterprise-gateway", instructions=_INSTRUCTIONS)
 
