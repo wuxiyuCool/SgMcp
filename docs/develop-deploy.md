@@ -302,6 +302,7 @@ unit 只注入路径/用户；监听、token、DSN 全由 `config/datahub.env` �
 | curl 超时 / refused | 未用 `HOST=0.0.0.0` 启动，或防火墙未放行 |
 | 加了 `Authorization` 反而连不上（平台报 500） | 令牌值不一致（401）。用 `curl -w "%{http_code}"` 看真实码；注意别同时配「认证方式=API Key」和自定义 `Authorization`，两个头会互相覆盖 |
 | `unrecognized arguments: --host` | venv 里是旧 server_kit：覆盖源码（editable）或 force-reinstall mcp-shared |
+| `ModuleNotFoundError: No module named '_sqlite3'` | 源码编译的 Python 缺 sqlite 扩展（编译机没装 sqlite-devel）。it_ops 现在照样启动，只是 `channel=local` 返回可读错误、api/sql 通道不受影响；要恢复本地工单/变更/资产台账，用发行版自带 python3 重建 venv（路径不变，systemd 不用改）或重编译解释器 |
 | 改了源码但服务器行为没变（离线安装） | wheel 是拷贝安装，需 `--force-reinstall` 重装对应包 |
 | Linux 报 `bad interpreter: /usr/bin/env bash^M` | .sh 被转成 CRLF：仓库已用 .gitattributes 强制 LF，重新导出即可 |
 | 网关调用报 `Error executing tool gateway_call` | 看 message：未注册路由→错误里已列出该 server 可用工具；AI 端应改用对应域的 **`route_*`** 工具（method 枚举不会猜错名），或先调 **`list_routes`** 确认 server/tool |

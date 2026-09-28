@@ -1,21 +1,33 @@
-"""SQLite 持久化存储：工单/变更/资产跨重启保留。
+"""local 通道的存储：工单/变更/资产跨重启保留。
 
 数据库路径：环境变量 MCP_ITOPS_DB（可写入 config/platform.env），
 默认 <工作目录>/data/itops.db。记录整体以 JSON 存 data 列，
 status/asset_type 等提升为索引列做过滤——既保留任意扩展字段（**extra），
 又能按条件查询。
+
+sqlite3 是 stdlib 里的 C 扩展，源码编译的 Python 若缺 sqlite-devel 就没有它。
+这里容忍缺失：导入不报错、服务照常起（api/sql 通道可用），
+只有在真正走 local 通道时才抛 LocalStoreUnavailable。
 """
 
 from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    import sqlite3
+except ImportError:  # 解释器未编译 _sqlite3
+    sqlite3 = None  # type: ignore[assignment]
+
+
+class LocalStoreUnavailable(RuntimeError):
+    """解释器缺 sqlite3 扩展（或库文件不可写）时，local 通道不可用。"""
 
 
 def _now() -> str:
@@ -38,15 +50,42 @@ CREATE INDEX IF NOT EXISTS idx_assets_type ON assets(asset_type);
 """
 
 
+def new_incident(title: str, priority: str, reporter: str, **extra: Any) -> dict[str, Any]:
+    """构造工单记录（纯函数）。
+
+    sql/api 通道只需要这份记录作为待提交的行，不该因为解释器缺 sqlite3 而失败，
+    所以建记录的动作不放进 SqliteStore。
+    """
+    return {
+        "id": _new_id("INC"),
+        "title": title,
+        "priority": priority,
+        "reporter": reporter,
+        "status": "new",
+        "created_at": _now(),
+        **extra,
+    }
+
+
 class SqliteStore:
     """线程安全的 SQLite 仓库（SDK 同步工具可能跑在 worker 线程）。"""
 
     def __init__(self, path: str | None = None) -> None:
+        if sqlite3 is None:
+            raise LocalStoreUnavailable(
+                "local 通道不可用：服务端 Python 解释器没有编译 sqlite3 扩展（_sqlite3），"
+                "本地工单/变更/资产台账无法落地。请改用 channel=api（外部 ITSM）或 "
+                "channel=sql（业务库）；确需本地持久化则用带 sqlite3 的解释器"
+                "（如发行版自带 python3）重建 venv。"
+            )
         db = path or os.environ.get("MCP_ITOPS_DB") or str(Path("data") / "itops.db")
-        Path(db).parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
-        self._conn = sqlite3.connect(db, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            Path(db).parent.mkdir(parents=True, exist_ok=True)
+            self._lock = threading.RLock()
+            self._conn = sqlite3.connect(db, check_same_thread=False)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        except OSError as e:
+            raise LocalStoreUnavailable(f"local 通道不可用：无法打开数据库 {db}（{e}）") from e
         with self._lock:
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
@@ -79,15 +118,7 @@ class SqliteStore:
 
     # ---- 工单（Incident / Ticket）----
     def create_incident(self, title: str, priority: str, reporter: str, **extra: Any) -> dict[str, Any]:
-        rec = {
-            "id": _new_id("INC"),
-            "title": title,
-            "priority": priority,
-            "reporter": reporter,
-            "status": "new",
-            "created_at": _now(),
-            **extra,
-        }
+        rec = new_incident(title, priority, reporter, **extra)
         self._insert("incidents", rec, {"status": rec["status"]})
         return dict(rec)
 
@@ -144,5 +175,17 @@ class SqliteStore:
         return self._fetch_all("assets", "asset_type", asset_type)
 
 
-# 全局单例
-store = SqliteStore()
+# 按需创建：解释器缺 sqlite3 时不能在导入期抛异常，否则整个 server 起不来
+_store: SqliteStore | None = None
+
+
+def local_store() -> SqliteStore:
+    global _store
+    if _store is None:
+        _store = SqliteStore()
+    return _store
+
+
+def local_store_available() -> bool:
+    """探测 local 通道是否可用（供 healthz / 运维检查用，不建库连接）。"""
+    return sqlite3 is not None

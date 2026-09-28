@@ -27,7 +27,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
-from mcp_itops.store import store
+from mcp_itops.store import LocalStoreUnavailable, local_store, new_incident
 from mcp_shared import run_server
 from mcp_shared.config import get as cfg
 from mcp_shared.dsrouting import domain_datasets, list_datasets, route_db, route_table, table_of
@@ -48,6 +48,15 @@ def _clamp_limit(limit: int) -> int:
     except (TypeError, ValueError):
         return 100
     return max(1, min(n, _MAX_LIMIT))
+
+
+def _local():
+    """取 local 通道存储；解释器没带 sqlite3 时转成可读工具错误（服务本身照常启动）。"""
+    try:
+        return local_store()
+    except LocalStoreUnavailable as e:
+        raise ToolError(str(e)) from e
+
 
 mcp = MCPServer("it-ops")
 
@@ -94,7 +103,7 @@ def _call_heavy_internal(path: str, json_body: dict[str, Any] | None = None,
 
 # ---------------------------------------------------------------------------
 # IT 运维业务工具（对 AI 暴露，itops_* 前缀）
-# 事件单支持三种落地通道：local=本地 SQLite 持久化（零外部依赖）；sql=经业务名路由写入
+# 事件单支持三种落地通道：local=本地 SQLite 持久化（需解释器带 stdlib sqlite3）；sql=经业务名路由写入
 # 数据库（内部直调重活层 batch/import|query）；api=调外部 ITSM 系统 REST API。
 # ---------------------------------------------------------------------------
 @mcp.tool(name="itops_create_incident")
@@ -108,7 +117,7 @@ def create_incident(title: str, priority: str = "medium", reporter: str = "agent
     - priority: 枚举 low/medium/high/critical，默认 medium（其他值报错）
     - reporter: 报障人标识，默认 agent
     - channel: 落地通道枚举 local/sql/api，默认 local
-      local=本地 SQLite 持久化（默认，零外部依赖，数据跨服务重启保留，ID 可长期引用；库路径可用 MCP_ITOPS_DB 覆盖）；
+      local=本地 SQLite 持久化（默认，仅需 stdlib sqlite3，数据跨服务重启保留，ID 可长期引用；库路径可用 MCP_ITOPS_DB 覆盖）；
       sql=按数据集路由写库（需 DATASET_INCIDENTS_* 配置，工单落 incidents 表，持久化）；
       api=调外部 ITSM 系统 REST（需 MCP_ITSM_API_URL 配置）
     - tenant_id: 租户标识，默认 default（仅 sql 通道参与路由）
@@ -121,8 +130,8 @@ def create_incident(title: str, priority: str = "medium", reporter: str = "agent
     check_text(title, limit=500, what="title")
     check_text(reporter, limit=100, what="reporter")
     if channel == "local":
-        return store.create_incident(title=title, priority=priority, reporter=reporter)
-    rec = store.create_incident(title=title, priority=priority, reporter=reporter)
+        return _local().create_incident(title=title, priority=priority, reporter=reporter)
+    rec = new_incident(title=title, priority=priority, reporter=reporter)
     if channel == "sql":
         db_type, dsn_ref = route_db("incidents", tenant_id)
         result = _call_heavy_internal("/internal/v1/batch/import", json_body={
@@ -146,7 +155,7 @@ def list_incidents(status: str | None = None, channel: Literal["local", "sql", "
     塌缩成单个对象，破坏调用方的解包约定。
     """
     if channel == "local":
-        return store.list_incidents(status=status)
+        return _local().list_incidents(status=status)
     if channel == "sql":
         db_type, dsn_ref = route_db("incidents", tenant_id)
         limit = _clamp_limit(limit)
@@ -216,7 +225,7 @@ def update_incident_status(incident_id: str,
 
     工单不存在时返回可读错误"工单不存在: xxx"。
     """
-    rec = store.update_incident_status(incident_id, status)
+    rec = _local().update_incident_status(incident_id, status)
     if rec is None:
         raise LookupError(f"工单不存在: {incident_id}")
     return rec
@@ -235,7 +244,7 @@ def create_change(title: str, change_type: Literal["standard", "emergency"] = "s
     request_id="apr_xxx" 且尚未执行），需审批人 approve_request 后才真正创建。
     """
     check_text(title, limit=500, what="title")
-    rec = store.create_change(title=title, change_type=change_type, implementer=implementer, risk=risk)
+    rec = _local().create_change(title=title, change_type=change_type, implementer=implementer, risk=risk)
     rec["approval_required"] = True  # 交由上层审批的标记
     return rec
 
@@ -243,7 +252,7 @@ def create_change(title: str, change_type: Literal["standard", "emergency"] = "s
 @mcp.tool(name="itops_get_change")
 def get_change(change_id: str) -> dict[str, Any]:
     """查询变更单详情。"""
-    rec = store.get_change(change_id)
+    rec = _local().get_change(change_id)
     if rec is None:
         raise LookupError(f"变更单不存在: {change_id}")
     return rec
@@ -257,14 +266,14 @@ def register_asset(name: str, asset_type: Literal["laptop", "server", "network",
     参数：name=资产名（如 "srv-ops-01"）；
     asset_type=枚举 laptop/server/network/software；owner=负责人。
     """
-    return store.create_asset(name=name, asset_type=asset_type, owner=owner)
+    return _local().create_asset(name=name, asset_type=asset_type, owner=owner)
 
 
 @mcp.tool(name="itops_list_assets")
 def list_assets(asset_type: Literal["laptop", "server", "network", "software"] | None = None) -> list[dict[str, Any]]:
     """查询资产清单（对象数组）。asset_type 可选过滤：laptop/server/network/software，
     留空或传 null 返回全部。"""
-    return store.list_assets(asset_type=asset_type)
+    return _local().list_assets(asset_type=asset_type)
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +287,7 @@ def export_assets_to_warehouse(dsn_ref: str, table: str = "cmdb_assets", asset_t
     dsn_ref 为重活层 config/datahub.env 里登记的 DSN 引用名（如 warehouse_pg），
     可用 data_list_dsn_refs 查看；table 需已存在（可用 data_list_tables 确认）。
     """
-    rows = store.list_assets(asset_type=asset_type)
+    rows = _local().list_assets(asset_type=asset_type)
     check_list_size(rows, limit=50000, what="待归档资产行")
     if not rows:
         return {"ok": True, "exported": 0, "message": "无资产可归档"}

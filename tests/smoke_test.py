@@ -541,9 +541,11 @@ def test_shared_dsrouting() -> None:
 
 def test_itops_persistence() -> None:
     """SQLite store：写入后用"新进程"重开同一库文件，记录仍在（跨重启持久化）。"""
-    import sqlite3  # noqa: F401  确保 stdlib 可用
-    from mcp_itops.store import SqliteStore
+    from mcp_itops.store import SqliteStore, local_store_available
 
+    if not local_store_available():
+        print("SKIP  it_ops·SQLite 跨重启持久化（该解释器未编译 sqlite3）")
+        return
     db = os.environ["MCP_ITOPS_DB"]
     s1 = SqliteStore(db)
     rec = s1.create_incident(title="持久化验证", priority="low", reporter="smoke")
@@ -552,6 +554,48 @@ def test_itops_persistence() -> None:
     found = [i for i in s2.list_incidents(status="in_progress") if i["id"] == rec["id"]]
     assert found and found[0]["title"] == "持久化验证", found
     print(f"PASS  it_ops·SQLite 跨重启持久化（{rec['id']} 重开库仍可查）")
+
+
+def test_itops_degrades_without_sqlite() -> None:
+    """解释器缺 _sqlite3 时 it_ops 必须照常启动：只有 local 通道报可读错误，
+    api/sql 通道不受影响（否则一个 stdlib 扩展缺失会拖垮整个下游聚合）。"""
+    import importlib
+
+    from mcp_itops import store as itops_store
+
+    real = itops_store.sqlite3
+    itops_store.sqlite3 = None
+    itops_store._store = None
+    try:
+        # 1) 建记录是纯函数：不依赖 sqlite，api/sql 通道拿得到同样的行
+        rec = itops_store.new_incident(title="API 通道工单", priority="high", reporter="smoke")
+        assert rec["id"].startswith("INC-") and rec["status"] == "new", rec
+
+        # 2) 模块能重新导入（旧写法在这里直接 ModuleNotFoundError → 服务崩溃循环）
+        importlib.reload(importlib.import_module("mcp_itops.main"))
+        from mcp_itops import main as itops
+
+        # 3) local 通道 → 引导性错误；api 通道 → 走到 ITSM 配置检查，说明没被 sqlite 卡住
+        def expect_error(tool: str, args: dict, needle: str) -> None:
+            r = asyncio.run(_call(itops.mcp, tool, args))
+            assert r.is_error, f"{tool} {args} 应当报错"
+            text = " ".join(c.text for c in r.content)
+            assert needle in text, f"{tool} {args}: 期望 {needle}，实际 {text}"
+
+        expect_error("itops_create_incident", {"title": "本地工单"}, "local 通道不可用")
+
+        # api 通道绕开了本地存储：报错只可能来自 ITSM 配置/调用，不该再提 local 通道
+        r = asyncio.run(_call(itops.mcp, "itops_create_incident", {"title": "接口工单", "channel": "api"}))
+        assert "local 通道不可用" not in " ".join(c.text for c in r.content)
+
+        # 4) 变更单/资产没有别的通道，也必须给可读错误而不是 500
+        expect_error("itops_create_change", {"title": "变更"}, "local 通道不可用")
+        expect_error("itops_list_assets", {}, "local 通道不可用")
+    finally:
+        itops_store.sqlite3 = real
+        itops_store._store = None
+        importlib.reload(importlib.import_module("mcp_itops.main"))
+    print("PASS  it_ops·缺 sqlite3 时优雅降级（服务起得来，api/sql 通道照常）")
 
 
 
@@ -991,6 +1035,7 @@ if __name__ == "__main__":
     test_gateway_aggregation_flow()
     test_gateway_kv_and_schema()
     test_itops_persistence()
+    test_itops_degrades_without_sqlite()
     test_itops_dataset_enum_from_config()
     test_shared_config()
     test_config_inline_comments()
