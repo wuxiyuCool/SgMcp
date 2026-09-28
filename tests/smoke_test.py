@@ -665,6 +665,13 @@ def test_http_frontend_guards() -> None:
                 "headers": [(k.encode(), v.encode()) for k, v in (headers or {}).items()],
                 "client": client}
 
+    # 三种写法都要认（企业平台常把裸令牌直接塞进自定义请求头）
+    for variant in ("sekret", "Bearer sekret", "bearer  sekret", "  Bearer sekret  ", "Token sekret"):
+        assert http_kit._credential_matches(variant, "sekret"), variant
+    assert not http_kit._credential_matches("Basic sekret", "sekret")
+    assert not http_kit._credential_matches("", "sekret")
+    assert http_kit._credential_matches(None, "")  # 未启用鉴权
+
     front = http_kit.HttpFrontend(inner, server_name="t", token="sekret", rate_limit_per_second=2)
 
     async def run(sc):
@@ -687,6 +694,9 @@ def test_http_frontend_guards() -> None:
         assert r["status"] == 401
         r = await run(scope("/healthz"))
         assert r["status"] == 200 and calls["n"] == 0, "/healthz 免鉴权且不转发"
+        # 裸令牌也应放行（换个客户端，避免占掉下面限流用例的配额）
+        r = await run(scope("/mcp", {"authorization": "sekret"}, client=("10.0.0.9", 1)))
+        assert r["status"] == 200, "裸令牌（无 Bearer 前缀）被拒"
         for _ in range(2):
             r = await run(scope("/mcp", {"authorization": "Bearer sekret"}))
             assert r["status"] == 200
@@ -697,7 +707,7 @@ def test_http_frontend_guards() -> None:
         assert r["status"] == 200, "限流应按客户端分桶"
 
     asyncio.run(flow())
-    assert calls["n"] == 3, calls
+    assert calls["n"] == 4, calls
     print("PASS  shared·http 前置层（Bearer / healthz / 限流分桶）")
 
 

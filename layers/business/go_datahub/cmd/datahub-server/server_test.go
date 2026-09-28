@@ -469,3 +469,21 @@ func TestDbQueryPreviewGuards(t *testing.T) {
 		t.Fatalf("未知 dsn_ref 处理异常: %s", contentText(res))
 	}
 }
+
+// TestCredentialOf 鉴权头三种写法都要认（企业平台常把裸令牌直接塞进自定义请求头）。
+func TestCredentialOf(t *testing.T) {
+	for _, tc := range []struct{ header, want string }{
+		{"Bearer abc123", "abc123"},
+		{"bearer abc123", "abc123"},
+		{"BEARER  abc123", "abc123"},
+		{"abc123", "abc123"},
+		{"  abc123  ", "abc123"},
+		{"Token abc123", "abc123"},
+		{"Basic abc123", "Basic abc123"}, // 非 Bearer/Token 方案原样比对，不猜
+		{"", ""},
+	} {
+		if got := credentialOf(tc.header); got != tc.want {
+			t.Errorf("credentialOf(%q) = %q, 期望 %q", tc.header, got, tc.want)
+		}
+	}
+}

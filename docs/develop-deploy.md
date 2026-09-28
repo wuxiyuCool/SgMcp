@@ -284,6 +284,9 @@ unit 只注入路径/用户；监听、token、DSN 全由 `config/datahub.env` �
 >   改 `MCP_HOST=0.0.0.0` 对外服务（推荐），或配 `MCP_ALLOWED_HOSTS=<该地址>:*`。
 > - 有 `Invalid Origin header` → 同理补 `MCP_ALLOWED_ORIGINS=<scheme>://<地址>:<端口>`。
 > - 都没有、日志里是 401 → 才是 `MCP_GATEWAY_TOKEN` 不匹配。
+> **注意：实测该平台「测试连接」会把 401 与 421 都显示成 `status 500: Internal Server Error`**，
+> 所以「加了指令头反而连不上」通常是头的**值**不对（令牌不一致），不是格式问题——
+> `Authorization` 现在三种写法都认：`Bearer xxx` / `bearer xxx` / 裸 `xxx`。
 > 自查命令（绕开 MCP 协议直接看状态码）：
 > ```bash
 > curl -s -o /dev/null -w "HTTP %{http_code}" -X POST http://<网关>:9000/mcp \
@@ -297,6 +300,7 @@ unit 只注入路径/用户；监听、token、DSN 全由 `config/datahub.env` �
 |------|-----------|
 | 客户端连不上，curl `/mcp` 返回 400 Missing session ID | 服务正常！检查 URL 是否带 `/mcp` |
 | curl 超时 / refused | 未用 `HOST=0.0.0.0` 启动，或防火墙未放行 |
+| 加了 `Authorization` 反而连不上（平台报 500） | 令牌值不一致（401）。用 `curl -w "%{http_code}"` 看真实码；注意别同时配「认证方式=API Key」和自定义 `Authorization`，两个头会互相覆盖 |
 | `unrecognized arguments: --host` | venv 里是旧 server_kit：覆盖源码（editable）或 force-reinstall mcp-shared |
 | 改了源码但服务器行为没变（离线安装） | wheel 是拷贝安装，需 `--force-reinstall` 重装对应包 |
 | Linux 报 `bad interpreter: /usr/bin/env bash^M` | .sh 被转成 CRLF：仓库已用 .gitattributes 强制 LF，重新导出即可 |

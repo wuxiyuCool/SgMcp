@@ -48,6 +48,27 @@ def _peer_ip(scope: Scope) -> str:
     return str(client[0]) if client and client[0] else "unknown"
 
 
+def extract_credential(value: str) -> str:
+    """从 Authorization 头取凭据本体，容忍三种写法。
+
+    企业 AI 平台的自定义请求头经常直接填裸令牌（不写 `Bearer ` 前缀）或大小写混用，
+    严格只认 `Bearer <token>` 会让运维排查半天、最后以为令牌配错了。
+    这里统一：`Bearer x` / `bearer  x` / `x` 都取到 x。
+    """
+    v = (value or "").strip()
+    head, sep, rest = v.partition(" ")
+    if sep and head.lower() in ("bearer", "token"):
+        return rest.strip()
+    return v
+
+
+def _credential_matches(header_value: str | None, expected: str) -> bool:
+    """常数时间比较（防时序侧信道）。"""
+    if not expected:
+        return True
+    return hmac.compare_digest(extract_credential(header_value or ""), expected)
+
+
 def client_identity(scope: Scope, trusted_proxies: tuple | list = _TRUSTED_DEFAULT) -> str:
     """限流分桶标识：可信反代之后取 X-Forwarded-For 首项，否则取真实连接 IP。"""
     peer = _peer_ip(scope)
@@ -127,8 +148,13 @@ class HttpFrontend:
             return
 
         if self.token and not self._authorized(scope):
-            await _respond(send, 401, {"ok": False, "error": "unauthorized"},
-                           extra_headers=[(b"www-authenticate", b"Bearer")])
+            await _respond(send, 401, {
+                "ok": False,
+                "error": "unauthorized",
+                # 有些 AI 平台把 401 显示成 status 500，正文里留一句可执行的排查指引
+                "hint": "请在请求头 Authorization 里带上网关令牌（Bearer xxx 或裸令牌均可）；"
+                        "若客户端把错误显示成 500，用 curl -w '%{http_code}' 看真实状态码",
+            }, extra_headers=[(b"www-authenticate", b"Bearer")])
             return
 
         if self._limiter is not None:
@@ -166,8 +192,7 @@ class HttpFrontend:
             call_id_hint.reset(c_tok)
 
     def _authorized(self, scope: Scope) -> bool:
-        got = _headers(scope).get("authorization", "")
-        return hmac.compare_digest(got, f"Bearer {self.token}")
+        return _credential_matches(_headers(scope).get("authorization", ""), self.token or "")
 
     async def _healthz(self, send: Send) -> None:
         body: dict[str, Any] = {

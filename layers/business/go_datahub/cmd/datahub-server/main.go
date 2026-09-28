@@ -754,14 +754,27 @@ func srvDone(srv *http.Server, ctx context.Context, logger *log.Logger) <-chan s
 	return done
 }
 
-// bearerAuth 校验 Authorization: Bearer 头（常数时间比较，防时序侧信道）。
+// bearerAuth 校验 Authorization 头（常数时间比较，防时序侧信道）。
 func bearerAuth(token string, next http.Handler) http.Handler {
-	want := "Bearer " + token
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte(want)) != 1 {
+		if subtle.ConstantTimeCompare([]byte(credentialOf(r.Header.Get("Authorization"))), []byte(token)) != 1 {
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// credentialOf 取 Authorization 头的凭据本体，容忍 `Bearer x` / `bearer x` / 裸 `x` 三种写法
+// —— 企业 AI 平台的自定义请求头经常不带 scheme 前缀，严格匹配只会让人误判令牌配错。
+func credentialOf(header string) string {
+	v := strings.TrimSpace(header)
+	i := strings.IndexByte(v, ' ')
+	if i > 0 {
+		scheme := v[:i]
+		if strings.EqualFold(scheme, "Bearer") || strings.EqualFold(scheme, "Token") {
+			return strings.TrimSpace(v[i+1:])
+		}
+	}
+	return v
 }

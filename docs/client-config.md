@@ -35,7 +35,9 @@ AI 客户端（Claude Desktop、IDE 插件等）只需连接**上层网关**，�
 
 网关 HTTP 地址：`http://127.0.0.1:9000/mcp`。
 
-网关侧配置了 `MCP_GATEWAY_TOKEN` 时，客户端必须带 Bearer 头（否则 401）：
+网关侧配置了 `MCP_GATEWAY_TOKEN` 时，客户端必须带令牌（否则 401）。`Authorization` 头的
+`Bearer ` 前缀可写可不写（`Bearer xxx` / `bearer xxx` / 直接 `xxx` 都认，大小写不敏感），
+因为不少企业 AI 平台的「自定义请求头」只能填裸值：
 
 ```json
 {
@@ -47,6 +49,8 @@ AI 客户端（Claude Desktop、IDE 插件等）只需连接**上层网关**，�
   }
 }
 ```
+（写成不带前缀的裸令牌值同样能连。若平台把 401 显示成 `status 500`，先按
+`develop-deploy.md` §6 用 curl 看真实状态码，别怀疑令牌本身。）
 
 ## 方式三：审批人专用客户端（与 AI 客户端分开）
 
@@ -88,6 +92,8 @@ AI 侧配置保持只有 `Authorization`，看不到审批令牌：
   }
 }
 ```
+（写成不带前缀的裸令牌值同样能连。若平台把 401 显示成 `status 500`，先按
+`develop-deploy.md` §6 用 curl 看真实状态码，别怀疑令牌本身。）
 
 > 令牌生成（PowerShell）：
 > `-join ((48..57)+(97..122) | Get-Random -Count 32 | ForEach-Object {[char]$_})`
