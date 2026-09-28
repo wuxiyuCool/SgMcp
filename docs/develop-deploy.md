@@ -24,12 +24,12 @@ SgMcp/
 │   │       └── approvals.py         #   HITL 审批闸门
 │   ├── common/                      # 【下层·通用工具】:9100
 │   │   └── src/mcp_common_server/
-│   │       └── tools.py             # ★ 通用工具写这里（now/echo/hash_text/json_tool/datetime_convert…）
+│   │       └── tools.py             # ★ 通用工具写这里（util_get_time/util_get_encoded/util_get_json…）
 │   ├── business/
 │   │   ├── it_ops/                  # 【中层·IT运维 Python】:9200
 │   │   │   └── src/mcp_itops/
-│   │   │       ├── main.py          # ★ 工单/变更/资产工具写这里
-│   │   │       └── store.py         #   数据层（试点为内存 store，接真实库改这里）
+│   │   │       ├── main.py          # ★ ITOM 对接工具写这里
+│   │   │       └── itom.py          #   平台客户端（会话/信封/解析，无本地存储）
 │   │   ├── purchasing/              # 【中层·采购 预留】结构同 it_ops
 │   │   ├── manufacturing/           # 【中层·制造 预留】
 │   │   └── go_datahub/              # 【中层·数据重活 Go】:9300（独立机部署）
@@ -47,7 +47,7 @@ SgMcp/
 │   │           └── datahub.env.example  # 监听/令牌/DSN_<名称> 注册表
 ├── tests/
 │   ├── smoke_test.py                # 协议级冒烟（内存 Client，不起网络）
-│   └── ops/run_ops_test.py          # 真实 HTTP 链路 52 项断言（含企业化守护套件，可进 CI）
+│   └── ops/run_ops_test.py          # 真实 HTTP 链路 29 项断言（含企业化守护套件，可进 CI）
 └── scripts/
     ├── setup.ps1 / run-demo.ps1 / ops-check.ps1      # Windows 开发
     └── serversctl.sh                                 # Linux 启停（start|stop|restart|status）
@@ -59,19 +59,18 @@ SgMcp/
 
 AI 客户端只需记忆 3 个 route_* 工具（见 §2.5）；下列方法是各域 `method` 枚举取值。
 
-**common-tools（下层·轻活，15）**：`now` `timestamp` `echo` `slugify` `generate_id`
-`hash_text` `base64_codec` `uuid_generate` `random_string` `json_tool`
-`datetime_convert`（时区转换+偏移）`url_parse` `regex_find` `text_stats` `server_self_check`（下层自检）
+**common-tools（下层·轻活，8）**：`util_get_time`（当前时间/时区换算/偏移）
+`util_create_id`（prefixed/uuid/random）`util_get_encoded`（md5~sha512/base64/slug）
+`util_get_json` `util_get_url` `util_search_text` `util_calc_stats` `util_get_status`（下层自检）
+（echo/timestamp 等纯测试工具已按治理规范清退：无明确业务场景、AI 可用其他方式替代）
 
-**it_ops（中层·业务，22）**：
-- 本地/路由工单台帐（13）：`itops_create_incident` `itops_list_incidents` `itops_update_incident_status`
-  `itops_create_change`【需审批】 `itops_get_change` `itops_register_asset` `itops_list_assets`
-  `itops_export_assets_to_warehouse` `itops_query_warehouse_assets` `itops_batch_process`
-  `itops_list_datasets` `itops_query_dataset` `itops_list_data_tables`
-- ITOM 平台真实对接（9，凭据只在服务端，见 §2.6）：`itops_itom_accounts` `itops_itom_login`
-  `itops_itom_logout` `itops_itom_get`（只读，允许只读形态的 POST） `itops_itom_incidents`（事件单列表，带字段投影+码值中文）
-  `itops_itom_incident_form`（建单字段说明书） `itops_itom_options`（下拉候选发现）
-  `itops_itom_create_incident`（引导式建单，默认只出预览）【需审批】 `itops_itom_call`（通用写透传）【需审批】
+**it_ops（中层·业务，8）**：ITOM 平台真实对接（凭据只在服务端，见 §2.6）：
+- 发现/自检：`itops_list_itom_accounts`（账户清单，工号打码） `itops_get_itom_status`（配置/会话自检，只回形态不回值）
+- 查询：`itops_query_itom_incidents`（事件单列表，带字段投影+码值中文） `itops_list_itom_options`（表单说明书 kind=form / 下拉候选发现）
+  `itops_query_itom`（只读透传，允许只读形态的 POST）
+- 写入：`itops_submit_itom`【需审批】（通用写透传） `itops_create_itom_incident`【需审批】（引导式建单，默认只出预览）
+- 会话：`itops_delete_itom_sessions`（清进程内会话缓存；会话由服务端自动管理，日常无需调用）
+（本地 SQLite 工单/资产台帐、数仓归档、批处理演示等测试工具已清退——除 ITOM API 对接外的非生产工具全部下线）
 
 **go_datahub（中层·重活，17）**：
 - 采集 job：`data_list_sources` `data_submit_collect_job`【需审批】 `data_get_job_status` `data_list_jobs` `data_cancel_job`
@@ -128,7 +127,7 @@ mcp.AddTool(server, &mcp.Tool{
 
 - 工具名**不含点号**，用层级前缀：`itops_*`（IT 运维域）/ `data_*`（Go 数据域）/ 无前缀（common）
 - 审批策略在环境变量 `MCP_APPROVAL_TOOLS`（逗号分隔工具名）配置；未设置用默认集合
-  （`itops_create_change` / `data_submit_collect_job`）
+  （`itops_submit_itom` / `itops_create_itom_incident` / `data_submit_collect_job`）
 
 ### 2.5 AI 客户端暴露模型（route_* 聚合路由）
 
@@ -152,6 +151,18 @@ route_* 工具由 `aggregator.on_sync → rebuild_route_tools()` 在每轮聚合
 枚举始终与下游最新工具表一致。新增下游 server 时同样自动生成对应 route 工具，
 无需改网关代码。
 
+**与规范 §五「元工具模式」的映射**（等价实现；命名保留现状，避免破坏已接入平台的配置）：
+
+| 规范元工具 | 本实现 | 说明 |
+|---|---|---|
+| `discover_tools(domain?)` | `route_<域>`（method 枚举即发现）+ `list_routes(server?)` + `list_tool_catalog` | 每域一个 route 工具，枚举带【只读】/【需审批】标注 |
+| `get_tool_schema(tool_name)` | `list_tool_catalog(server?, keyword?)` | 逐工具参数说明书与调用示例 |
+| `execute_tool(name, args)` | `gateway_call(server, tool, arguments)` + `route_*` | 网关按注册表自动路由，等价于前缀推导 tool_routes |
+| `refresh_registry()` | `refresh_routes()` | 运行时补拉下游工具表并重建 route 枚举 |
+
+AI 单次可见工具 = 3 个 route_* + 网关治理/审批工具若干，**<25 满足治理线**；
+下游 33 个业务工具不占 AI 工具列表位（route_* 的 method 是字符串 enum）。
+
 ### 2.6 对接真实业务平台（ITOM 预设账户模式）
 
 场景：让 MCP 直接调用 ITOM（`itom.shougang.com.cn`）这类需要登录的生产系统。
@@ -169,24 +180,26 @@ MCP_ITOM_WANGXU_ORG_POSITION_SID=1154
 MCP_ITOM_UID_PARAM=uid
 ```
 
-调用顺序（AI 侧）：`itops_itom_accounts` → 选 `account_ref` → 直接 `itops_itom_incidents`/
-`itops_itom_get`/`itops_itom_call`。**首次调用会自动登录，之后 TTL 内复用会话不再登录**
+调用顺序（AI 侧）：`itops_list_itom_accounts` → 选 `account_ref` → 直接 `itops_query_itom_incidents`/
+`itops_query_itom`/`itops_submit_itom`。**首次调用会自动登录，之后 TTL 内复用会话不再登录**
 （实测同一进程内 3 次查询只发了 1 次登录请求，后续单次约 0.5s）；平台提前判会话失效时
 （401/403，或 HTTP 200 + retCode 的掉线文案）自动重登一次再重试，返回里带 `relogged: true`。
-`itops_itom_login` 只在想看会话状态或强制换会话时才调。
+会话由服务端全自动维护，日常无需手动登录；排查会话问题用 `itops_get_itom_status`，
+强制换会话用 `itops_delete_itom_sessions`。
 实现见 `mcp_itops/itom.py`：会话缓存按 account_ref 存在进程内（含 token 与 JSESSIONID），
 不落盘、不外传；并发调用共享同一会话。
 
-打通新接口时不要靠猜——用 `itops_itom_get` 照着浏览器 Network 里的相对路径试：
+打通新接口时不要靠猜——用 `itops_query_itom` 照着浏览器 Network 里的相对路径试：
 
 ```
-route_it_ops(method="itops_itom_get", params={"account_ref": "wangxu", "path": "/<模块>/<方法>"})
+route_it_ops(method="itops_query_itom", params={"account_ref": "wangxu", "path": "/<模块>/<方法>"})
 ```
 
 常见对不上的地方，都有对应开关，不用改代码：
 
 | 现象 | 开关 |
 |------|------|
+| 业务调用回 `retCode=0200000 当前用户登录信息发生变化`（登录却总是成功） | 缺 `MCP_ITOM_UID_PARAM=uid`；先调 `itops_get_itom_status` 看 `uid_param`/`config_file`/`hint` |
 | 登录成功但报"没找到 token"，错误里已列出实际键名 | `MCP_ITOM_TOKEN_KEY=<那个键名>` |
 | 平台只发 `Set-Cookie`（JSESSIONID 型会话） | 无需配置，cookie 自动随请求带上 |
 | 后续请求 401/403，但浏览器正常 | 令牌头名/前缀不对：`MCP_ITOM_TOKEN_HEADER`、`MCP_ITOM_TOKEN_SCHEME=Bearer` |
@@ -209,9 +222,9 @@ route_it_ops(method="itops_itom_get", params={"account_ref": "wangxu", "path": "
 | 失败形态 | **HTTP 200 + retCode≠0000000** | 判为工具错误并带 retDesc，避免 AI 拿空数据继续编 |
 | 分页 | `pageNum`/`pageSize` 生效（实测两页数据不同） | `page_num`/`page_size`，上限 100 |
 | 过滤 | `systemType`、`eventNo` 生效；`eventState` 传任何值都 0 行；`problemDesc` 只整句精确匹配 | 工具只暴露生效的两个；状态统计请对返回 rows 自行分组 |
-| 行宽 | 单行 **137 列**，含报障人/处理人手机号，20 行 ≈ 57 KB | 默认投影 16 个业务列（≈9 KB，`itops_itom_incidents` 内置），`fields` 可覆盖 |
+| 行宽 | 单行 **137 列**，含报障人/处理人手机号，20 行 ≈ 57 KB | 默认投影 16 个业务列（≈9 KB，`itops_query_itom_incidents` 内置），`fields` 可覆盖 |
 
-`itops_itom_incidents(account_ref, days, system_type, event_no, page_num, page_size)` 是把上面
+`itops_query_itom_incidents(account_ref, days, system_type, event_no, page_num, page_size)` 是把上面
 全部规则包好的业务工具——AI 侧要事件单数据就用它，别自己拼 findByPage 的日期格式。
 
 **码值字典**（`/base-dict-data/findByParams`，两级查询：先 `typeCode=<表名>` 拿父项 `typeSid`，
@@ -238,16 +251,16 @@ route_it_ops(method="itops_itom_get", params={"account_ref": "wangxu", "path": "
 表单 16 个必填项**全部可由接口选出**，AI 侧的固定流程是：
 
 ```
-itops_itom_incident_form()                      # 读字段说明书
-itops_itom_options(kind="dept")                 # 部门分类
+itops_list_itom_options(kind="form")            # 读字段说明书
+itops_list_itom_options(kind="dept")            # 部门分类
   → options(kind="group", parent=<部门 orgCode>)
   → options(kind="system", parent=<组 groupCode>)
   → options(kind="subclass", parent=<系统 sysSid>)
   → options(kind="menu", parent=<子类 sysSid>)
   → options(kind="custom", keyword=<报修人姓名>)     # 报修人档案
   → options(kind="staff", parent=<系统 sysSid>, role=<1|2|3>)   # 处理人，缺 role 平台返回 0 人
-itops_itom_create_incident(...名称...)          # 默认只回预览 payload
-itops_itom_create_incident(..., confirm=true)   # 用户确认后才真实建单（经网关还要审批）
+itops_create_itom_incident(...名称...)          # 默认只回预览 payload
+itops_create_itom_incident(..., confirm=true)   # 用户确认后才真实建单（经网关还要审批）
 ```
 
 三条硬规则，都是实测出来的坑：
@@ -266,7 +279,7 @@ itops_itom_create_incident(..., confirm=true)   # 用户确认后才真实建单
 
 预览 payload 与平台前端提交形态逐字段一致（实测 `deptCode/deptSid/groupSid/systemTypeSid/
 systemSubclassSid/repairMenuSid/dealStaff/dealStaffPhone` 全部自动填好），
-`itops_itom_create_incident` 已在 `MCP_APPROVAL_TOOLS` 默认名单内。
+`itops_create_itom_incident` 已在 `MCP_APPROVAL_TOOLS` 默认名单内。
 
 ## 3. 本地开发调试（Windows）
 
@@ -274,7 +287,7 @@ systemSubclassSid/repairMenuSid/dealStaff/dealStaffPhone` 全部自动填好）�
 powershell -File scripts/setup.ps1        # 建 .venv + editable 安装（或 uv sync --all-packages，
                                           # 内网需 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/）
 powershell -File scripts/run-demo.ps1     # 一键起 common:9100 / itops:9200 / gateway:9000 (+本地 Go)
-powershell -File scripts/ops-check.ps1    # 一键自检：起服务→52 项断言（含 guard 守护套件）→停服务
+powershell -File scripts/ops-check.ps1    # 一键自检：起服务→29 项断言（含 guard 守护套件）→停服务
 python tests/smoke_test.py                # 改代码后的秒级协议冒烟
 cd layers/business/go_datahub; go test ./...   # Go 侧内存链路测试
 ```
@@ -423,7 +436,7 @@ unit 只注入路径/用户；监听、token、DSN 全由 `config/datahub.env` �
 | curl 超时 / refused | 未用 `HOST=0.0.0.0` 启动，或防火墙未放行 |
 | 加了 `Authorization` 反而连不上（平台报 500） | 令牌值不一致（401）。用 `curl -w "%{http_code}"` 看真实码；注意别同时配「认证方式=API Key」和自定义 `Authorization`，两个头会互相覆盖 |
 | `unrecognized arguments: --host` | venv 里是旧 server_kit：覆盖源码（editable）或 force-reinstall mcp-shared |
-| `ModuleNotFoundError: No module named '_sqlite3'` | 源码编译的 Python 缺 sqlite 扩展（编译机没装 sqlite-devel）。it_ops 现在照样启动，只是 `channel=local` 返回可读错误、api/sql 通道不受影响；要恢复本地工单/变更/资产台账，用发行版自带 python3 重建 venv（路径不变，systemd 不用改）或重编译解释器 |
+| `ModuleNotFoundError: No module named '_sqlite3'` | 历史问题：源码编译的 Python 缺 sqlite 扩展。本地台账下线后 it_ops 已不依赖 sqlite3，出现该报错说明跑的是旧版代码，`git pull` 重装即可 |
 | 改了源码但服务器行为没变（离线安装） | wheel 是拷贝安装，需 `--force-reinstall` 重装对应包 |
 | Linux 报 `bad interpreter: /usr/bin/env bash^M` | .sh 被转成 CRLF：仓库已用 .gitattributes 强制 LF，重新导出即可 |
 | 网关调用报 `Error executing tool gateway_call` | 看 message：未注册路由→错误里已列出该 server 可用工具；AI 端应改用对应域的 **`route_*`** 工具（method 枚举不会猜错名），或先调 **`list_routes`** 确认 server/tool |

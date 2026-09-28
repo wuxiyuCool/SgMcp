@@ -58,10 +58,21 @@ _INSTRUCTIONS = """本网关是企业三层 MCP 平台的唯一入口。使用�
    审批人用 list_pending_approvals + approve_request（需审批令牌）放行；不要自行批准；
 4) 长耗时批量操作走异步：data_submit_collect_job → data_get_job_status（勿同步等待）；
 5) 出错时读错误里的 kind/建议，必要时 refresh_routes 重新聚合，不要盲猜工具名重试；
-6) 调外部业务平台（ITOM 等）时用 account_ref（先 itops_itom_accounts 取引用名），
+6) 调外部业务平台（ITOM 等）时用 account_ref（先 itops_list_itom_accounts 取引用名），
    **不要向用户索要账号口令**——凭据只存在服务端配置里，对话中出现即视为泄露。"""
 
 mcp = MCPServer("enterprise-gateway", instructions=_INSTRUCTIONS)
+
+# 工具注解（规范 §八：读写分离，写路径显式 readOnlyHint=false）。
+# route_* 聚合工具与 gateway_call 能触达下游写方法，一律标非只读。
+from mcp_types import ToolAnnotations  # noqa: E402
+
+_GW_RO = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True,
+                         open_world_hint=False)
+_GW_WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False,
+                            open_world_hint=True)
+_GW_REFRESH = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True,
+                              open_world_hint=False)
 
 # 路由表初始为空，由聚合器在启动时（main / 手动 sync）填充
 router = Router()
@@ -145,7 +156,7 @@ def _resolve_route(server: str, tool: str) -> ToolRoute | None:
 
     def tail_forms(r: ToolRoute) -> set[str]:
         """剥层级前缀后的尾段形态（仅剥已知层级前缀 itops_/data_ 或点号前缀，
-        防止 generate_id 这类普通名被误剥成 id 造成误匹配）。"""
+        防止 util_create_id 这类普通名被误剥成 id 造成误匹配）。"""
         out = {r.tool}
         for sep in (".",):
             if sep in r.tool:
@@ -347,7 +358,7 @@ def _dispatch(route: ToolRoute, args_obj: dict[str, Any], requested_by: str,
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=_GW_RO)
 def list_pending_approvals(limit: int = 50) -> list[dict[str, Any]]:
     """列出所有待审批事项（审批人视角）。
 
@@ -360,7 +371,7 @@ def list_pending_approvals(limit: int = 50) -> list[dict[str, Any]]:
     return [_approval_view(r) for r in items]
 
 
-@mcp.tool()
+@mcp.tool(annotations=_GW_RO)
 def list_approvals(status: Literal["pending", "approved", "rejected", "timeout", "cancelled", "exec_failed", "all"] = "all",
                    limit: int = 20) -> list[dict[str, Any]]:
     """审批台账：按状态查看审批单（含已决/执行失败），用于事后核查与重试。
@@ -396,7 +407,7 @@ def _approval_view(req: ApprovalRequest) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=_GW_WRITE)
 def approve_request(request_id: str, comment: str | None = None,
                     approval_token: str | None = None) -> dict[str, Any]:
     """批准一条待审批事项并立即执行到下游（需审批令牌）。
@@ -415,7 +426,7 @@ def approve_request(request_id: str, comment: str | None = None,
     return _decide(request_id, ApprovalAction.APPROVE, comment, approval_token)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_GW_WRITE)
 def reject_request(request_id: str, comment: str | None = None,
                    approval_token: str | None = None) -> dict[str, Any]:
     """驳回一条待审批事项，不执行任何下游调用（同样需要审批令牌）。"""
@@ -462,7 +473,7 @@ def _run_approved(req: ApprovalRequest) -> dict[str, Any]:
             "result": _cap_result(result), "call_id": call_id, "attempts": req.attempts}
 
 
-@mcp.tool()
+@mcp.tool(annotations=_GW_WRITE)
 def retry_execution(request_id: str, approval_token: str | None = None) -> dict[str, Any]:
     """重放一条「已批准但执行失败」（status=exec_failed）的审批单。
 
@@ -480,7 +491,7 @@ def retry_execution(request_id: str, approval_token: str | None = None) -> dict[
     return _run_approved(req)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_GW_RO)
 def list_routes(server: str | None = None, tool: str | None = None,
                 keyword: str | None = None, full_schema: bool = False) -> list[dict[str, Any]]:
     """列出网关聚合到的全部下游工具明细（server / 工具名 / 描述 / 入参 / 是否需审批）。
@@ -573,7 +584,7 @@ def _schema_params(r: ToolRoute) -> dict[str, Any]:
     return out
 
 
-@mcp.tool()
+@mcp.tool(annotations=_GW_RO)
 def list_tool_catalog(server: str | None = None, keyword: str | None = None,
                       mode: Literal["compact", "full"] = "compact") -> list[dict[str, Any]]:
     """全平台工具目录（调用视角说明书）：每个工具在哪个下游 MCP server、如何从上层网关传递调用下来。
@@ -659,7 +670,7 @@ def _catalog_tool(r: ToolRoute) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=_GW_RO)
 def list_downstreams() -> list[dict[str, Any]]:
     """列出网关配置的下游 server 清单与**聚合健康度**（诊断路由缺失时先用本工具）。
 
@@ -669,7 +680,7 @@ def list_downstreams() -> list[dict[str, Any]]:
     return aggregator.downstream_status()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_GW_REFRESH)
 def refresh_routes() -> dict[str, Any]:
     """重新连接各下游 server 拉取 tools/list，刷新网关路由表并重建 route_* 聚合路由工具。
 
@@ -684,7 +695,7 @@ def refresh_routes() -> dict[str, Any]:
             "route_tools": sorted(_ROUTE_TOOLS), "total_routes": len(router.routes)}
 
 
-@mcp.tool()
+@mcp.tool(annotations=_GW_RO)
 def describe_gateway() -> dict[str, Any]:
     """网关自身状态一览（排障与部署自检）：版本、路由数、下游健康度、生效的安全开关。
 
@@ -712,7 +723,7 @@ def describe_gateway() -> dict[str, Any]:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=_GW_RO)
 def query_audit_log(limit: int = 25, event: str | None = None, server: str | None = None,
                     tool: str | None = None, call_id: str | None = None) -> list[dict[str, Any]]:
     """查最近的调用审计（谁在何时调了什么、参数摘要、结果、耗时、错误）。
@@ -729,7 +740,7 @@ def query_audit_log(limit: int = 25, event: str | None = None, server: str | Non
     return audit.query(limit=min(int(limit), 500), **filters)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_GW_WRITE)
 def gateway_call(
     server: str,
     tool: str,
@@ -746,7 +757,7 @@ def gateway_call(
     参数要求：
     - server: 下游服务名，取值必须是 list_routes 结果中的 server 字段
     - tool:   工具名，必须与 list_routes 结果中的 tool 字段一字不差
-      （例："itops_create_incident"；不存在 create_ticket 这种名字，勿凭猜测调用；
+      （例："itops_create_itom_incident"；不存在 create_ticket 这种名字，勿凭猜测调用；
         工具名一律下划线前缀、不含点号）
     - arguments: 目标工具的入参，三种形态均可（自动识别）：
         ① 对象 {"title": "打印机故障", "priority": "high"}
@@ -756,16 +767,16 @@ def gateway_call(
            data_submit_collect_job 的 params、data_batch_import 的 rows——请改用形态①）
       无入参的工具传 {} 或省略
     - requested_by: 可选，发起人标识，用于审计
-    - idempotency_key: 可选。**写操作可能超时/断连时务必带**（如用 generate_id 生成的号）：
+    - idempotency_key: 可选。**写操作可能超时/断连时务必带**（如用 util_create_id 生成的号）：
       同一个键的重复请求不会二次执行——AI 平台的重试因此不会重复建单/重复导入。
       窗口由 MCP_IDEMPOTENCY_TTL_SECONDS 控制（默认 600，0=关闭）。
 
-    调用示例——创建高优工单：
-      {"server": "it_ops", "tool": "create_incident",
-       "arguments": {"title": "打印机故障", "priority": "high"}}
+    调用示例——查 ITOM 事件单（对象形态）：
+      {"server": "it_ops", "tool": "itops_query_itom_incidents",
+       "arguments": {"account_ref": "wangxu", "days": 7}}
 
-    示例——查当前时间（扁平串形态）：
-      {"server": "common-tools", "tool": "now", "arguments": "timezone_name=Asia/Shanghai"}
+    示例——查当前时间（扁平 kv 串形态）：
+      {"server": "common-tools", "tool": "util_get_time", "arguments": "timezone_name=Asia/Shanghai"}
 
     示例——Go 数据源清单（无入参）：
       {"server": "go_datahub", "tool": "data_list_dsn_refs", "arguments": {}}
@@ -944,7 +955,7 @@ def _route_tool_name(server: str) -> str:
 
 
 def _method_signature(r: ToolRoute) -> str:
-    """由入参 schema 生成方法签名摘要，如 itops_create_incident(title*, priority, reporter)。"""
+    """由入参 schema 生成方法签名摘要，如 itops_list_itom_options(account_ref*, kind*, parent)。"""
     props, required = _iter_props(r.input_schema or {})
     args = ", ".join(f"{k}*" if k in required else k for k in props)
     return f"{r.tool}({args})" if args else f"{r.tool}()"
@@ -1020,7 +1031,8 @@ def rebuild_route_tools() -> list[str]:
             + "\n".join(lines)
         )
         name = _route_tool_name(server)
-        mcp.add_tool(_make_route_fn(server, shown, exact), name=name, description=description)
+        mcp.add_tool(_make_route_fn(server, shown, exact), name=name,
+                      description=description, annotations=_GW_WRITE)
         _ROUTE_TOOLS[name] = server
     logger.info("重建聚合路由工具: %s", sorted(_ROUTE_TOOLS))
     return sorted(_ROUTE_TOOLS)

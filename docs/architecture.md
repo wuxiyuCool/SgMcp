@@ -64,8 +64,8 @@ AI 客户端 ──MCP──▶ [上层 gateway = MCP 聚合 + 鉴权 + 路由�
   同名 data_* 工具共用 `internal/dbhub` 核心实现：表名列名白名单 + 值参数绑定 +
   错误脱敏，参数错误 4xx、库侧失败 200 + ok=false。业务层用 httpx2 + Bearer
   直调（`MCP_GODATAHUB_TOKEN`，与 `GO_DATAHUB_TOKEN` 同值）。
-  内置示例见 it_ops 的 `itops_export_assets_to_warehouse` /
-  `itops_query_warehouse_assets`（完整三跳 `gateway → business → data`）。
+  it_ops 收敛为 ITOM 域后当前未内置直调示例；业务层将来做归档/数仓场景时按此
+  机制直调即可（完整三跳 `gateway → business → data`），AI 侧无感知。
 - 下游注册表来自环境变量（可写入 `config/platform.env`）：`MCP_DOWNSTREAMS`
   （`name=url` 逗号分隔）；`MCP_GODATAHUB_URL/TOKEN` 为 go_datahub 的兼容入口。
   未显式配置时使用默认注册表（it_ops:9200 / common:9100 / go_datahub:9300）。
@@ -85,11 +85,12 @@ AI 客户端 ──MCP──▶ [上层 gateway = MCP 聚合 + 鉴权 + 路由�
 
 ## 3. 审批流（HITL）
 
-1. AI 调用 `route_it_ops(method='itops_create_change', params={...})`
-   （或通用入口 `gateway_call(server='it_ops', tool='itops_create_change', ...)`）。
+1. AI 调用 `route_it_ops(method='itops_submit_itom', params={...})`
+   （或通用入口 `gateway_call(server='it_ops', tool='itops_submit_itom', ...)`）。
 2. 网关查聚合工具表：该工具命中审批策略 `requires_approval=True`
-   （默认集合 `itops_create_change` / `data_submit_collect_job`；`MCP_APPROVAL_TOOLS`
-   可覆盖并支持前缀通配与 `server:tool` 限定，见 `aggregator.requires_approval`）。
+   （默认集合 `itops_submit_itom` / `itops_create_itom_incident` / `data_submit_collect_job`；
+   `MCP_APPROVAL_TOOLS` 可覆盖并支持前缀通配与 `server:tool` 限定，
+   见 `aggregator.requires_approval`）。
 3. 网关创建 `ApprovalRequest`（状态 `pending`），返回审批单 ID；**不执行**。
 4. 审批人（**独立客户端，持 `MCP_APPROVAL_TOKEN`**）调 `list_pending_approvals` 查看，
    用 `approve_request` / `reject_request` 决定——AI 侧没有令牌，无法自行放行。
@@ -102,7 +103,7 @@ AI 客户端 ──MCP──▶ [上层 gateway = MCP 聚合 + 鉴权 + 路由�
 ## 4. 扩展一个新业务系统（如新增"财务"）
 
 1. 复制 `layers/business/it_ops` 目录为 `layers/business/finance`。
-2. 重命名包、写业务工具（`store.py` 换真数据源）。
+2. 重命名包、写业务工具（数据一律经真实平台 API 或 go_datahub，不做本地台账）。
 3. 起新 server（如 `finance-server --transport http --port 9400`）。
 4. 在网关侧环境变量 `MCP_DOWNSTREAMS` 追加 `finance=http://127.0.0.1:9400/mcp`
    （或运行期让 AI 调 `refresh_routes` 补拉）——**无需改网关代码**。
@@ -257,9 +258,11 @@ table = routeTable("orders", "2024-05")  # 按月分表：orders_202405
 - **Go 侧** `internal/dsrouting`：`data_batch_process`（异步 job，立即返回 task_id，
   `data_get_job_status` 轮询；任务消息记录路由明细）+ `data_list_datasets`（数据集发现）。
   批处理核心 `internal/batchproc`：simulate（演练不触库）/ real（连路由库统计目标表）。
-- **Python 侧** `mcp_shared/dsrouting.py`：`itops_batch_process`（业务层路由解析，
-  real 模式经内部 REST `/internal/v1/batch/process` 下放重活执行）+ `itops_list_datasets`。
-  两侧数据集清单一致性有测试断言（`gw_list_datasets`）。
+- **Python 侧** `mcp_shared/dsrouting.py`：同款路由约定的**纯库函数**
+  （`route_db` / `route_table` / `list_datasets` 等，供业务层将来复用），
+  当前不暴露 MCP 工具、不直调内部 REST——批处理重活统一由 AI 经网关调
+  Go 侧 `data_batch_process` 执行。数据集清单（含域归属/中文说明）由
+  `data_list_datasets` 提供并经 `gw_list_datasets` 测试断言。
 - **内部面** 对应端点：`POST /internal/v1/batch/process`、`GET /internal/v1/datasets`。
 
 ### 8.6 跨机部署（Go server 独立主机）

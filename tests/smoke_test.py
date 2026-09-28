@@ -3,8 +3,9 @@
 与旧版「直接调 Python 函数」不同，本测试让调用真实经过 MCP 协议层
 （工具 schema 生成、JSON 序列化、结果解包），更接近客户端真实行为：
 
-1. 下层 common：echo / slugify / now（含 Asia/Shanghai 时区）。
-2. 中层 it_ops：工单创建与查询。
+1. 下层 common：util_get_encoded（slug）/ util_get_time（含 Asia/Shanghai 时区）。
+2. 中层 it_ops：ITOM 工具治理（清单/注解/错误码），ITOM 平台用进程内 FakeHttp
+   仿真（契约测试不碰真实平台）。
 3. 上层 gateway：**聚合器架构**端到端——进程内起 it_ops / common 真实
    Streamable HTTP server，网关作为 MCP Client 拉取 tools/list 合并工具表，
    再经统一入口完成审批闸门完整流（只读放行 / 高风险挂起 / 批准后经 HTTP
@@ -38,24 +39,13 @@ for sub in (
 
 from mcp import Client  # noqa: E402
 
-# it_ops SQLite 与审计/审批台账隔离到系统临时目录（避免冒烟污染仓库）
+# 审计/审批台账隔离到系统临时目录（避免冒烟污染仓库）
 import tempfile  # noqa: E402
 
 _TMP = Path(tempfile.gettempdir()) / "sgmcp_smoke"
 _TMP.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("MCP_ITOPS_DB", str(_TMP / "itops.db"))
 os.environ.setdefault("MCP_AUDIT_DIR", str(_TMP / "audit"))
 os.environ.setdefault("MCP_APPROVAL_STORE", str(_TMP / "audit" / "approvals.jsonl"))
-
-# 数据集路由与域归属（与 scripts/ops-check.ps1 同一套键）：it_ops 的领域枚举与
-# 中文说明在导入期由这些配置生成，冒烟必须在 import 前放好
-os.environ.setdefault("DATASET_INCIDENTS_DBTYPE", "pg")
-os.environ.setdefault("DATASET_INCIDENTS_DSN_DEFAULT", "itsm_pg")
-os.environ.setdefault("DATASET_INCIDENTS_DOMAIN", "itops")
-os.environ.setdefault("DATASET_INCIDENTS_DESC", "IT 运维事件单（工单流水）")
-os.environ.setdefault("DATASET_ASSETS_DSN_DEFAULT", "itsm_pg")
-os.environ.setdefault("DATASET_ASSETS_DOMAIN", "itops")
-os.environ.setdefault("DATASET_ASSETS_DESC", "CMDB 资产台账")
 
 
 async def _call(server_obj, tool: str, args: dict):
@@ -87,26 +77,86 @@ def _payload(result) -> dict:
 def test_lower_common() -> None:
     from mcp_common_server import main as common
 
-    r = asyncio.run(_call(common.mcp, "echo", {"message": "ping"}))
-    assert not r.is_error and r.content[0].text == "ping"
+    # 工具数量治理：恰好 8 个 util_*（旧 13 个无前缀工具已合并下线）
+    names = asyncio.run(_list_tools(common.mcp))
+    assert names == {
+        "util_get_time", "util_create_id", "util_get_encoded", "util_get_json",
+        "util_get_url", "util_search_text", "util_calc_stats", "util_get_status",
+    }, names
 
-    r = asyncio.run(_call(common.mcp, "slugify", {"text": "Hello World!"}))
-    assert r.content[0].text == "hello-world"
+    d = _payload(asyncio.run(_call(common.mcp, "util_get_encoded",
+                                   {"text": "Hello World!", "algo": "slug"})))
+    assert d["result"] == "hello-world", d
 
-    r = asyncio.run(_call(common.mcp, "now", {"timezone_name": "Asia/Shanghai"}))
-    assert not r.is_error and "+08:00" in r.content[0].text
-    print("PASS  下层·通用工具（协议级）")
+    d = _payload(asyncio.run(_call(common.mcp, "util_get_time",
+                                   {"timezone_name": "Asia/Shanghai"})))
+    assert d["is_now"] is True and "+08:00" in d["converted"], d
+
+    # 错误契约：非法入参带 [COMMON_<CODE>]，AI 可按码纠正
+    r = asyncio.run(_call(common.mcp, "util_get_time", {"timezone_name": "北京"}))
+    assert r.is_error and "[COMMON_INVALID_INPUT]" in r.content[0].text, r.content
+    print("PASS  下层·通用工具（协议级，util.* 前缀 + 8 工具治理）")
 
 
 def test_middle_itops() -> None:
+    """协议级：ITOM 工具清单治理 + 无凭据可用的发现工具 + 错误码契约。
+
+    开发机的 config/platform.env 可能配了真实账户，这里隔离全部 MCP_ITOM_* 环境，
+    保证断言不受本机配置影响。
+    """
     from mcp_itops import main as itops
+    from mcp_shared import config as shared_config
 
-    r = asyncio.run(_call(itops.mcp, "itops_create_incident", {"title": "服务器宕机", "priority": "high"}))
-    assert not r.is_error and "INC-" in r.content[0].text
+    # 隔离本机 config/platform.env：pop 已注入的键 + 冻结懒加载（否则首次 get()
+    # 会把文件值重新注入 os.environ，隔离失效）
+    saved = {k: v for k, v in os.environ.items() if k.startswith("MCP_ITOM_")}
+    for k in saved:
+        os.environ.pop(k, None)
+    lazy_was = shared_config._loaded
+    shared_config._loaded = True
+    try:
+        # 1) 工具数量治理：恰好 8 个、命名稳定（本地台账/数仓/批处理演示工具已下线）
+        names = asyncio.run(_list_tools(itops.mcp))
+        assert names == {
+            "itops_list_itom_accounts", "itops_get_itom_status", "itops_delete_itom_sessions",
+            "itops_query_itom", "itops_submit_itom", "itops_query_itom_incidents",
+            "itops_list_itom_options", "itops_create_itom_incident",
+        }, names
 
-    r = asyncio.run(_call(itops.mcp, "itops_list_incidents", {}))
-    assert not r.is_error
-    print("PASS  中层·it_ops（协议级，itops.* 前缀）")
+        # 2) 注解读写分离：写工具 readOnlyHint=False，只读工具 True（网关重试策略依赖它）
+        tm = itops.mcp._tool_manager
+        write_tools = {"itops_submit_itom", "itops_create_itom_incident", "itops_delete_itom_sessions"}
+        for name in sorted(names):
+            ann = tm.get_tool(name).annotations
+            assert ann is not None, f"{name} 缺 annotations"
+            assert bool(ann.read_only_hint) is (name not in write_tools), name
+
+        # 3) 无凭据也能用的发现工具：账户清单（空）与自检（只回形态不回凭据）
+        rows = _payload(asyncio.run(_call(itops.mcp, "itops_list_itom_accounts", {})))
+        if isinstance(rows, dict) and set(rows) == {"result"}:
+            rows = rows["result"]
+        assert rows == [], rows
+        status = _payload(asyncio.run(_call(itops.mcp, "itops_get_itom_status", {})))
+        assert status["accounts"] == [] and status["url_set"] is False, status
+        assert status["hint"] and "MCP_ITOM_UID_PARAM" in status["hint"], status
+
+        # 4) kind=form：建单表单说明书并入 options 工具（原独立表单工具已删）
+        form = _payload(asyncio.run(_call(itops.mcp, "itops_list_itom_options",
+                                          {"account_ref": "x", "kind": "form"})))
+        if isinstance(form, dict) and set(form) == {"result"}:
+            form = form["result"]
+        fields = {f["field"] for f in form}
+        assert {"dept", "group", "system", "subclass", "menu", "reporter",
+                "handler", "description"} <= fields, fields
+
+        # 5) 错误码契约：配置缺失给 [ITOM_NOT_CONFIGURED] 前缀 + 建议，而不是裸栈
+        r = asyncio.run(_call(itops.mcp, "itops_query_itom",
+                              {"account_ref": "wangxu", "path": "/event-manage/findByPage"}))
+        assert r.is_error and "[ITOM_NOT_CONFIGURED]" in " ".join(c.text for c in r.content), r.content
+    finally:
+        os.environ.update(saved)
+        shared_config._loaded = lazy_was
+    print("PASS  中层·it_ops（8 工具治理 + 注解读写分离 + 错误码契约）")
 
 
 # ---------------------------------------------------------------------------
@@ -132,9 +182,65 @@ def _start_http_server(mcp_obj):
     return server, thread, port
 
 
+class _FakeResp:
+    """ITOM 仿真的最小 HTTP 响应（与 itom 客户端用到的属性对齐）。"""
+
+    def __init__(self, status=200, payload=None, text="", cookies=None):
+        self.status_code, self._payload, self.text = status, payload, text
+        self.cookies = cookies or {}
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+class _FakeItomHttp:
+    """进程内仿真 ITOM 平台：auto 模式下任意请求都回成功信封，可指定失败路径。
+
+    it_ops 下游与网关同进程，替换 itom.httpx2 即可让审批流「批准后真实执行」
+    走通，而不用连真实平台。
+    """
+
+    HTTPError = type("FakeHTTPError", (BaseException,), {})
+
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.fail_paths: tuple[str, ...] = ()
+
+    def request(self, method, url, *, params=None, json=None, headers=None, timeout=None):
+        self.calls.append({"method": method, "url": url, "params": params,
+                           "json": json, "headers": dict(headers or {})})
+        if any(p in url for p in self.fail_paths):
+            return _FakeResp(status=500, text="boom", payload={"error": "boom"})
+        return _FakeResp(payload={"retCode": "0000000", "retDesc": "OK",
+                                  "rspBody": {"ok": 1, "id": "E1"}})
+
+
 def test_gateway_aggregation_flow() -> None:
     import mcp_common_server.main as common
     import mcp_itops.main as itops
+    from mcp_itops import itom as itom_mod
+
+    # ITOM 仿真环境：静态令牌账户（不发登录请求）+ 任意请求回成功信封
+    itom_env_saved = {k: os.environ.get(k) for k in (
+        "MCP_ITOM_URL", "MCP_ITOM_ACCOUNTS", "MCP_ITOM_WANGXU_TOKEN",
+        "MCP_ITOM_UID_PARAM", "MCP_ITOM_RANDOM_QUERY", "MCP_ITOM_READ_SEGMENTS",
+        "MCP_ITOM_TOKEN_HEADER")}
+    os.environ.update({
+        "MCP_ITOM_URL": "https://itom.test/api",
+        "MCP_ITOM_ACCOUNTS": "wangxu",
+        "MCP_ITOM_WANGXU_TOKEN": "static-tok",
+        "MCP_ITOM_UID_PARAM": "",
+        "MCP_ITOM_RANDOM_QUERY": "",
+        "MCP_ITOM_READ_SEGMENTS": "",
+        "MCP_ITOM_TOKEN_HEADER": "Authorization",
+    })
+    real_http = itom_mod.httpx2
+    fake = _FakeItomHttp()
+    itom_mod.httpx2 = fake
+    itom_mod._sessions.clear()
+    itom_mod._last_source.clear()
 
     # 1) 起真实下游（it_ops + common，进程内 HTTP）
     itops_srv, itops_th, itops_port = _start_http_server(itops.mcp)
@@ -180,57 +286,64 @@ def test_gateway_aggregation_flow() -> None:
                 # 4) 只读工具直接放行（经 HTTP 转发到 common）
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "common-tools", "tool": "echo", "arguments": {"message": "ping"}},
+                    {"server": "common-tools", "tool": "util_get_encoded",
+                     "arguments": {"text": "Hello Gateway", "algo": "slug"}},
                 )
                 d = _payload(r)
-                assert d["approved"] is True and d["executed"] is True and d["result"] == "ping"
+                assert d["approved"] is True and d["executed"] is True \
+                    and d["result"]["result"] == "hello-gateway", d
                 print("PASS  网关·只读工具直接放行（HTTP 转发）")
 
                 # 4b) arguments 以 JSON 字符串传输（部分 AI 平台会序列化嵌套对象）→ 容错生效
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "common-tools", "tool": "echo",
-                     "arguments": '{"message": "str-args"}'},
+                    {"server": "common-tools", "tool": "util_get_encoded",
+                     "arguments": '{"text": "Str Args", "algo": "slug"}'},
                 )
                 d = _payload(r)
-                assert d["executed"] is True and d["result"] == "str-args", d
+                assert d["executed"] is True and d["result"]["result"] == "str-args", d
                 print("PASS  网关·arguments 兼容 JSON 字符串形式")
 
                 # 4c) 路由宽容解析：脏 server（大小写/连字符）与漏层级前缀的 tool 都能救回
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "Common-Tools", "tool": "echo", "arguments": {"message": "sloppy"}},
+                    {"server": "Common-Tools", "tool": "util_get_encoded",
+                     "arguments": {"text": "Sloppy Input", "algo": "slug"}},
                 )
-                assert _payload(r)["result"] == "sloppy"
+                assert _payload(r)["result"]["result"] == "sloppy-input"
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "it_ops", "tool": "create_incident",
-                     "arguments": {"title": "漏前缀容错"}},
+                    {"server": "it_ops", "tool": "query_itom",
+                     "arguments": {"account_ref": "wangxu", "path": "/event-manage/findByPage",
+                                   "method": "POST"}},
                 )
                 d = _payload(r)
-                assert d["executed"] is True and "INC-" in str(d["result"]), d
+                assert d["executed"] is True and d["result"]["ok"] is True, d
                 print("PASS  网关·server/tool 宽容解析（归一化+补层级前缀）")
 
                 # 4d) 入口精简：gateway_call 直接吃扁平 kv 串（原 gateway_call_kv 已并入）
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "common-tools", "tool": "echo", "arguments": "message=kv-args;uppercase=true"},
+                    {"server": "common-tools", "tool": "util_get_encoded",
+                     "arguments": "text=kv-args;algo=slug"},
                 )
                 d = _payload(r)
-                assert d["executed"] is True and d["result"] == "KV-ARGS", d
+                assert d["executed"] is True and d["result"]["result"] == "kv-args", d
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "it_ops", "tool": "create_incident", "arguments": "title=kv入口工单;priority=high"},
+                    {"server": "it_ops", "tool": "query_itom",
+                     "arguments": "account_ref=wangxu;path=/event-manage/findByPage;method=POST"},
                 )
                 d = _payload(r)
-                assert d["executed"] is True and "INC-" in str(d["result"]), d
-                # 下划线别名（规避平台对参数值中 "." 的序列化缺陷）：itops_create_incident
+                assert d["executed"] is True and d["result"]["ok"] is True, d
+                # 下划线别名（规避平台对参数值中 "." 的序列化缺陷）：itops_query_itom
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "it_ops", "tool": "itops_create_incident", "arguments": "title=别名调用"},
+                    {"server": "it_ops", "tool": "itops_query_itom",
+                     "arguments": {"account_ref": "wangxu", "path": "/event-manage/findByPage"}},
                 )
                 d = _payload(r)
-                assert d["executed"] is True and "INC-" in str(d["result"]), d
+                assert d["executed"] is True and d["result"]["ok"] is True, d
                 # list_routes：工具名一律无点号（规避平台 "." 序列化缺陷）+ 携带 tool_alias
                 r = await client.call_tool("list_routes", {})
                 items = _payload(r)
@@ -249,16 +362,19 @@ def test_gateway_aggregation_flow() -> None:
                 itops_tools = await _list_tools(itops.mcp)
                 enum_itops = set(gw_tools["route_it_ops"].input_schema["properties"]["method"]["enum"])
                 assert enum_itops == itops_tools, f"枚举与下游不一致: {enum_itops ^ itops_tools}"
-                assert "itops_create_change" in gw_tools["route_it_ops"].description, "描述须列出审批方法"
+                assert "itops_submit_itom" in gw_tools["route_it_ops"].description, "描述须列出审批方法"
                 # 经 route 工具直接调用（kv 扁平串入参）
                 r = await client.call_tool(
-                    "route_common_tools", {"method": "echo", "params": "message=route-fn;uppercase=true"}
+                    "route_common_tools",
+                    {"method": "util_get_encoded", "params": "text=route-fn;algo=slug"}
                 )
                 d = _payload(r)
-                assert d["executed"] is True and d["result"] == "ROUTE-FN", d
+                assert d["executed"] is True and d["result"]["result"] == "route-fn", d
                 # 经 route 工具触发审批闸门
                 r = await client.call_tool(
-                    "route_it_ops", {"method": "itops_create_change", "params": {"title": "route审批", "risk": "high"}}
+                    "route_it_ops", {"method": "itops_submit_itom",
+                                     "params": {"account_ref": "wangxu",
+                                                "path": "/event-manage/updateEvent"}}
                 )
                 d = _payload(r)
                 assert d["approved"] is False and d["executed"] is False and d["request_id"].startswith("apr_"), d
@@ -283,41 +399,47 @@ def test_gateway_aggregation_flow() -> None:
                     assert "Streamable HTTP 转发" in g["call_chain"]
                     for t in g["tools"]:
                         assert t["in_mcp"] == srv and "method" in t["example"], t
-                echo_entry = next(t for t in gmap["common-tools"]["tools"] if t["tool"] == "echo")
-                assert echo_entry["params"]["message"]["required"] is True
-                assert echo_entry["params"]["uppercase"]["type"] == "boolean"
+                slug_entry = next(t for t in gmap["common-tools"]["tools"]
+                                  if t["tool"] == "util_get_encoded")
+                assert slug_entry["params"]["text"]["required"] is True
+                assert slug_entry["params"]["algo"]["enum"] == \
+                    ["md5", "sha1", "sha256", "sha512", "base64", "slug"]
                 print("PASS  网关·list_tool_catalog（MCP 归属 + 调用链 + 参数说明书）")
 
-                # 5) 无需审批的写工具：经 HTTP 转发执行到 it_ops
+                # 5) 非审批写工具（会话清理）经 HTTP 转发执行到 it_ops
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "it_ops", "tool": "itops_create_incident",
-                     "arguments": {"title": "聚合器冒烟", "priority": "high"}},
+                    {"server": "it_ops", "tool": "itops_delete_itom_sessions",
+                     "arguments": {"account_ref": "wangxu"}},
                 )
                 d = _payload(r)
-                assert d["executed"] is True and "INC-" in str(d["result"]), d
-                print("PASS  网关·写工具经 HTTP 转发执行")
+                assert d["executed"] is True and d["result"]["ok"] is True, d
+                print("PASS  网关·非审批写工具经 HTTP 转发执行")
 
                 # 6) 高风险写操作：挂起，创建审批单，不执行
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "it_ops", "tool": "itops_create_change", "arguments": {"title": "升级库", "risk": "high"}},
+                    {"server": "it_ops", "tool": "itops_submit_itom",
+                     "arguments": {"account_ref": "wangxu",
+                                   "path": "/event-manage/updateEvent"}},
                 )
                 d = _payload(r)
                 assert d["approved"] is False and d["executed"] is False
                 rid = d["request_id"]
                 print(f"PASS  网关·高风险写操作挂起（request_id={rid}）")
 
-                # 7) 批准后才真正执行（HTTP 转发到 it_ops）
+                # 7) 批准后才真正执行（HTTP 转发到 it_ops → ITOM 仿真回成功）
                 r = await client.call_tool("approve_request", {"request_id": rid})
                 d = _payload(r)
-                assert d["executed"] is True and "CHG-" in str(d["result"])
+                assert d["executed"] is True and d["result"]["ok"] is True, d
                 print("PASS  网关·批准后经 HTTP 转发执行")
 
                 # 8) 驳回：不执行
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "it_ops", "tool": "itops_create_change", "arguments": {"title": "再试一次"}},
+                    {"server": "it_ops", "tool": "itops_submit_itom",
+                     "arguments": {"account_ref": "wangxu",
+                                   "path": "/event-manage/updateEvent"}},
                 )
                 rid2 = _payload(r)["request_id"]
                 r = await client.call_tool("reject_request", {"request_id": rid2, "comment": "风险过高"})
@@ -351,9 +473,9 @@ def test_gateway_aggregation_flow() -> None:
                 # 12) 工具名写错时给相近候选（省 AI 往返）
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "it_ops", "tool": "create_inciden", "arguments": {"title": "typo"}},
+                    {"server": "it_ops", "tool": "query_itomm", "arguments": {}},
                 )
-                assert r.is_error and "itops_create_incident" in str(r.content), \
+                assert r.is_error and "itops_query_itom" in str(r.content), \
                     f"未命中时应给出相近工具名: {r.content}"
                 print("PASS  网关·未命中路由给相近工具名")
 
@@ -362,8 +484,9 @@ def test_gateway_aggregation_flow() -> None:
                 try:
                     r = await client.call_tool(
                         "gateway_call",
-                        {"server": "it_ops", "tool": "itops_create_change",
-                         "arguments": {"title": "令牌保护"}},
+                        {"server": "it_ops", "tool": "itops_submit_itom",
+                         "arguments": {"account_ref": "wangxu",
+                                       "path": "/event-manage/updateEvent"}},
                     )
                     rid3 = _payload(r)["request_id"]
                     r = await client.call_tool("approve_request", {"request_id": rid3})
@@ -378,51 +501,54 @@ def test_gateway_aggregation_flow() -> None:
                     os.environ.pop("MCP_APPROVAL_TOKEN", None)
 
                 # 14) 批准后下游执行失败 → 单据置 exec_failed（可重放），不静默丢单
-                r = await client.call_tool(
-                    "gateway_call",
-                    {"server": "it_ops", "tool": "itops_create_change",
-                     "arguments": {"title": "超长标题" + "呀" * 600}},
-                )
-                rid4 = _payload(r)["request_id"]
-                r = await client.call_tool("approve_request", {"request_id": rid4})
-                assert r.is_error, "下游必然失败的场景竟然执行成功"
-                st = _payload(await client.call_tool("list_approvals",
-                                                     {"request_id_filter": rid4})) \
-                    if False else None
-                r = await client.call_tool("list_approvals", {"status": "exec_failed"})
-                failed_ids = [x["id"] for x in _items(_payload(r))]
-                assert rid4 in failed_ids, f"执行失败的审批单应可查（exec_failed）: {failed_ids}"
-                assert "attempts" in next(x for x in _items(_payload(r)) if x["id"] == rid4)
+                fake.fail_paths = ("/boom",)
+                try:
+                    r = await client.call_tool(
+                        "gateway_call",
+                        {"server": "it_ops", "tool": "itops_submit_itom",
+                         "arguments": {"account_ref": "wangxu",
+                                       "path": "/boom/updateEvent"}},
+                    )
+                    rid4 = _payload(r)["request_id"]
+                    r = await client.call_tool("approve_request", {"request_id": rid4})
+                    assert r.is_error, "下游必然失败的场景竟然执行成功"
+                    r = await client.call_tool("list_approvals", {"status": "exec_failed"})
+                    failed_ids = [x["id"] for x in _items(_payload(r))]
+                    assert rid4 in failed_ids, f"执行失败的审批单应可查（exec_failed）: {failed_ids}"
+                    assert "attempts" in next(x for x in _items(_payload(r)) if x["id"] == rid4)
+                finally:
+                    fake.fail_paths = ()
                 print("PASS  网关·批准但下游失败 → exec_failed 可追溯/可重放")
 
                 # 15) 幂等键：同一 key 的重复写请求不会二次执行（AI 重试安全）
+                # 用非审批写工具 delete_itom_sessions：submit_itom 会先挂审批单
+                # （返回 request_id 而非执行结果），不适合直接验证结果级幂等
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "it_ops", "tool": "itops_create_incident",
-                     "arguments": {"title": "幂等验证"}, "idempotency_key": "smoke-key-1"},
+                    {"server": "it_ops", "tool": "itops_delete_itom_sessions",
+                     "arguments": {"account_ref": "wangxu"},
+                     "idempotency_key": "smoke-key-1"},
                 )
-                first = _payload(r)["result"]["id"]
+                first = _payload(r)
+                assert first.get("executed") is True, first
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "it_ops", "tool": "itops_create_incident",
-                     "arguments": {"title": "幂等验证"}, "idempotency_key": "smoke-key-1"},
+                    {"server": "it_ops", "tool": "itops_delete_itom_sessions",
+                     "arguments": {"account_ref": "wangxu"},
+                     "idempotency_key": "smoke-key-1"},
                 )
                 again = _payload(r)
-                assert again["result"]["id"] == first and again.get("idempotent_replay") is True, again
-                print("PASS  网关·idempotency_key 幂等重放（重试不重复建单）")
+                assert again["result"] == first["result"] \
+                    and again.get("idempotent_replay") is True, again
+                print("PASS  网关·idempotency_key 幂等重放（重试不重复执行）")
 
                 # 16) 结果规模上限：超限截断并引导改用过滤/异步（护住上下文与 token）
                 gw.MAX_RESULT_ITEMS = 3
                 try:
-                    for i in range(6):
-                        await client.call_tool(
-                            "gateway_call",
-                            {"server": "it_ops", "tool": "itops_create_incident",
-                             "arguments": {"title": f"批量{i}", "priority": "low"}},
-                        )
                     r = await client.call_tool(
                         "gateway_call",
-                        {"server": "it_ops", "tool": "itops_list_incidents", "arguments": {}},
+                        {"server": "it_ops", "tool": "itops_list_itom_options",
+                         "arguments": {"account_ref": "wangxu", "kind": "form"}},
                     )
                     capped = _payload(r)["result"]
                     assert isinstance(capped, dict) and capped["truncated"] is True, capped
@@ -435,18 +561,21 @@ def test_gateway_aggregation_flow() -> None:
                 # 17) 扁平 kv 串的数值语义：前导零编号与版本号不被改坏
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "it_ops", "tool": "itops_create_incident",
-                     "arguments": "title='编号 007 与版本 1.10';priority=high"},
+                    {"server": "common-tools", "tool": "util_calc_stats",
+                     "arguments": "text='编号 007 与版本 1.10'"},
                 )
                 d = _payload(r)
-                assert d["executed"] is True and "007" in str(d["result"]["title"]), d
+                assert d["executed"] is True and d["result"]["chars"] == 15 \
+                    and d["result"]["chars_no_space"] == 12, \
+                    f"007/1.10 应原样透传不被误转数值: {d}"
                 print("PASS  网关·kv 引号保原样（007/1.10 不被误转数值）")
 
                 # 18) 审计落盘：调用与审批可回查，敏感入参已脱敏
                 r = await client.call_tool(
                     "gateway_call",
-                    {"server": "common-tools", "tool": "echo",
-                     "arguments": {"message": "hi", "token": "super-secret-value"}},
+                    {"server": "common-tools", "tool": "util_get_encoded",
+                     "arguments": {"text": "hi", "algo": "slug",
+                                   "token": "super-secret-value"}},
                 )
                 _payload(r)
                 r = await client.call_tool("query_audit_log", {"limit": 50})
@@ -455,8 +584,9 @@ def test_gateway_aggregation_flow() -> None:
                 assert any(e["event"] in {"approval_created", "approval_decided"} for e in events)
                 leaked = [e for e in events if "super-secret-value" in json.dumps(e, ensure_ascii=False)]
                 assert not leaked, f"审计日志泄露敏感入参: {leaked}"
-                echoed = next(e for e in events if e.get("tool") == "echo" and "args" in e)
-                assert echoed["args"]["token"] == "***", echoed
+                masked = next(e for e in events
+                              if e.get("tool") == "util_get_encoded" and "args" in e)
+                assert masked["args"]["token"] == "***", masked
                 print(f"PASS  网关·审计落盘（{len(events)} 条事件，敏感键已遮蔽）")
 
                 # 19) describe_gateway：部署自检（安全开关一目了然）
@@ -474,6 +604,17 @@ def test_gateway_aggregation_flow() -> None:
             th.join(timeout=5)
         os.environ.pop("MCP_DOWNSTREAMS", None)
         os.environ.pop("MCP_DISCOVERY_RETRY_SECONDS", None)
+        # 环境与仿真 HTTP 必须还原：泄漏的 MCP_ITOM_WANGXU_TOKEN 会让后续测试里
+        # 的 wangxu 变成静态令牌账户（_session 直接返回、不再走真实登录），
+        # 进而破坏 test_itom_account_ref_client 的登录断言
+        for k, v in itom_env_saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        itom_mod.httpx2 = real_http
+        itom_mod._sessions.clear()
+        itom_mod._last_source.clear()
 
 
 def test_shared_config() -> None:
@@ -537,65 +678,6 @@ def test_shared_dsrouting() -> None:
         for k in ("DATASET_ORDERS_DBTYPE", "DATASET_ORDERS_DSN_T1", "DATASET_ORDERS_DSN_DEFAULT"):
             os.environ.pop(k, None)
     print("PASS  shared·dsrouting 业务名路由（租户/兜底/按月分表）")
-
-
-def test_itops_persistence() -> None:
-    """SQLite store：写入后用"新进程"重开同一库文件，记录仍在（跨重启持久化）。"""
-    from mcp_itops.store import SqliteStore, local_store_available
-
-    if not local_store_available():
-        print("SKIP  it_ops·SQLite 跨重启持久化（该解释器未编译 sqlite3）")
-        return
-    db = os.environ["MCP_ITOPS_DB"]
-    s1 = SqliteStore(db)
-    rec = s1.create_incident(title="持久化验证", priority="low", reporter="smoke")
-    s1.update_incident_status(rec["id"], "in_progress")
-    s2 = SqliteStore(db)  # 模拟服务重启后的全新实例
-    found = [i for i in s2.list_incidents(status="in_progress") if i["id"] == rec["id"]]
-    assert found and found[0]["title"] == "持久化验证", found
-    print(f"PASS  it_ops·SQLite 跨重启持久化（{rec['id']} 重开库仍可查）")
-
-
-def test_itops_degrades_without_sqlite() -> None:
-    """解释器缺 _sqlite3 时 it_ops 必须照常启动：只有 local 通道报可读错误，
-    api/sql 通道不受影响（否则一个 stdlib 扩展缺失会拖垮整个下游聚合）。"""
-    import importlib
-
-    from mcp_itops import store as itops_store
-
-    real = itops_store.sqlite3
-    itops_store.sqlite3 = None
-    itops_store._store = None
-    try:
-        # 1) 建记录是纯函数：不依赖 sqlite，api/sql 通道拿得到同样的行
-        rec = itops_store.new_incident(title="API 通道工单", priority="high", reporter="smoke")
-        assert rec["id"].startswith("INC-") and rec["status"] == "new", rec
-
-        # 2) 模块能重新导入（旧写法在这里直接 ModuleNotFoundError → 服务崩溃循环）
-        importlib.reload(importlib.import_module("mcp_itops.main"))
-        from mcp_itops import main as itops
-
-        # 3) local 通道 → 引导性错误；api 通道 → 走到 ITSM 配置检查，说明没被 sqlite 卡住
-        def expect_error(tool: str, args: dict, needle: str) -> None:
-            r = asyncio.run(_call(itops.mcp, tool, args))
-            assert r.is_error, f"{tool} {args} 应当报错"
-            text = " ".join(c.text for c in r.content)
-            assert needle in text, f"{tool} {args}: 期望 {needle}，实际 {text}"
-
-        expect_error("itops_create_incident", {"title": "本地工单"}, "local 通道不可用")
-
-        # api 通道绕开了本地存储：报错只可能来自 ITSM 配置/调用，不该再提 local 通道
-        r = asyncio.run(_call(itops.mcp, "itops_create_incident", {"title": "接口工单", "channel": "api"}))
-        assert "local 通道不可用" not in " ".join(c.text for c in r.content)
-
-        # 4) 变更单/资产没有别的通道，也必须给可读错误而不是 500
-        expect_error("itops_create_change", {"title": "变更"}, "local 通道不可用")
-        expect_error("itops_list_assets", {}, "local 通道不可用")
-    finally:
-        itops_store.sqlite3 = real
-        itops_store._store = None
-        importlib.reload(importlib.import_module("mcp_itops.main"))
-    print("PASS  it_ops·缺 sqlite3 时优雅降级（服务起得来，api/sql 通道照常）")
 
 
 def test_itom_account_ref_client() -> None:
@@ -665,7 +747,10 @@ def test_itom_account_ref_client() -> None:
         assert rows[2].get("configured") is False and "USER_ID" in rows[2]["reason"], rows[2]
         assert "s3cr3t" not in _json.dumps(rows, ensure_ascii=False), rows
 
-        # 2) 未知引用名 → 引导性错误（列出可用），不是 KeyError
+        # 2) 未知引用名 → 引导性错误（列出可用），不是 KeyError；
+        #    "default"/空 是模型的习惯写法，单账户清单下落到第一个引用名
+        assert itom.account("default").ref == "wangxu", "default 应落到清单首个账户"
+        assert itom.account("").ref == "wangxu"
         try:
             itom.account("zhangsan")
         except itom.ItomError as e:
@@ -675,8 +760,10 @@ def test_itom_account_ref_client() -> None:
 
         # 3) 登录：请求体带口令（服务端→平台，正常），返回状态里绝不带 token
         fake.script = [Resp(payload={"reqHeader": {}, "reqBody": {"token": "tk-123"}})]
-        st = itom.login_status("wangxu")
-        assert st["ok"] and st["token_source"] == "token" and st["has_token"], st
+        sess = itom._session(itom.account("wangxu"))
+        st = {"token_source": itom._last_source.get("wangxu", "cookie"),
+              "has_token": bool(sess.token), "cookie_names": sorted(sess.cookies)}
+        assert st["token_source"] == "token" and st["has_token"], st
         assert "tk-123" not in _json.dumps(st, ensure_ascii=False), st
         call = fake.calls[-1]
         assert call["url"] == "https://itom.test/api/auth/login/login?uid=null", call
@@ -712,9 +799,9 @@ def test_itom_account_ref_client() -> None:
 
         # 7) static token 账户：不触发登录请求，直接带令牌
         fake.calls.clear()
-        fake.script = [Resp(payload={"x": 1})]
-        st = itom.login_status("ops01")
-        assert st["credential"] == "token" and st["token_source"] == "static", st
+        acct = itom.account("ops01")
+        sess = itom._session(acct)
+        assert acct.static_token == "static-tok" and sess.token == "static-tok", sess
         assert not fake.calls, "配了 TOKEN 的账户不该发登录请求"
         fake.script = [Resp(payload={"x": 1})]
         itom.request_json("ops01", "GET", "/todo/list")
@@ -724,9 +811,9 @@ def test_itom_account_ref_client() -> None:
         itom._sessions.clear()
         os.environ["MCP_ITOM_WANGXU_PASSWORD"] = "s3cr3t|中文"
         fake.script = [Resp(payload={"reqBody": {"success": "true"}}, cookies={"JSESSIONID": "abc"})]
-        st = itom.login_status("wangxu")
-        assert st["token_source"] == "cookie" and not st["has_token"], st
-        assert st["cookie_names"] == ["JSESSIONID"], st
+        sess = itom._session(itom.account("wangxu"))
+        assert itom._last_source.get("wangxu") == "cookie" and not sess.token, sess
+        assert sorted(sess.cookies) == ["JSESSIONID"], sess
         fake.script = [Resp(payload={"x": 1})]
         itom.request_json("wangxu", "GET", "/todo/list")
         assert fake.calls[-1]["headers"]["cookie"] == "JSESSIONID=abc", fake.calls[-1]["headers"]
@@ -792,11 +879,19 @@ def test_itom_platform_contract() -> None:
         itom._last_source.clear()
         itom.httpx2 = fake
 
+        # 0) 自检只回形态不回值：uid 注入、账户清单、缺开关时的 hint
+        sc = itom.selfcheck()
+        assert sc["uid_param"] == "uid" and sc["hint"] is None, sc
+        assert sc["accounts"] == ["itoma"] and sc["token_header"] is None, sc
+        assert "pw" not in _json.dumps(sc, ensure_ascii=False), "自检不得回凭据"
+
         # 1) 登录：token 键是平台自定义的 gm_auth_token，会话靠 JSESSIONID
         fake.script = [Resp(payload={"retCode": "0000000", "retDesc": "OK", "timestamp": "t",
                                     "rspBody": {"gm_auth_token": "gm-1", "userId": "itoma"}},
                             cookies={"JSESSIONID": "js-1"})]
-        st = itom.login_status("itoma")
+        sess = itom._session(itom.account("itoma"))
+        st = {"token_source": itom._last_source.get("itoma", "cookie"),
+              "has_token": bool(sess.token), "cookie_names": sorted(sess.cookies)}
         assert st["token_source"] == "gm_auth_token" and st["has_token"], st
         assert st["cookie_names"] == ["JSESSIONID"], st
         assert "gm-1" not in _json.dumps(st, ensure_ascii=False)
@@ -832,6 +927,8 @@ def test_itom_platform_contract() -> None:
         assert sum(1 for c in fake.calls if "/auth/login" in c["url"]) == logins, "业务错误不该触发重登"
 
         # 4) 会话失效（HTTP 200 + retCode 的掉线文案）→ 自动重登一次再重试，调用方无需先调 login
+        assert itom._auth_expired({"retDesc": "当前用户登录信息发生变化请重新登录"}, {}), \
+            "平台真实掉线文案必须命中重登词表"
         fake.script = [Resp(payload={"retCode": "9999999", "retDesc": "会话已失效，请重新登录", "rspBody": None}),
                        Resp(payload={"retCode": "0000000", "rspBody": {"gm_auth_token": "gm-2"}},
                             cookies={"JSESSIONID": "js-2"}),
@@ -855,7 +952,7 @@ def test_itom_platform_contract() -> None:
             itom.request_json("itoma", "POST", "/event-manage/updateEvent", body={},
                               read_channel=True)
         except itom.ItomError as e:
-            assert "不像只读接口" in str(e) and "itops_itom_call" in str(e), e
+            assert "不像只读接口" in str(e) and "itops_submit_itom" in str(e), e
         else:
             raise AssertionError("写形态路径不该走只读通道")
         assert itom.read_like("/event-manage/findByPage") and not itom.read_like("/event-manage/updateEvent")
@@ -1280,7 +1377,8 @@ def test_downstream_failure_class() -> None:
     assert retries_for("data_list_tables", read_only=True) >= 1
     os.environ["MCP_DOWNSTREAM_TIMEOUT_DATA_SLOW_TOOL"] = "3"
     try:
-        assert timeout_for("data_slow_tool") == 3.0 and timeout_for("other") == 60.0
+        assert timeout_for("data_slow_tool") == 3.0 and timeout_for("other") == 120.0, \
+            "默认下游超时应为规范要求的 120s"
     finally:
         os.environ.pop("MCP_DOWNSTREAM_TIMEOUT_DATA_SLOW_TOOL")
 
@@ -1324,26 +1422,23 @@ def test_gateway_kv_and_schema() -> None:
     print("PASS  网关·入参形态归一（kv 引号 / JSON / 脏参数可读报错）")
 
 
-def test_itops_dataset_enum_from_config() -> None:
-    """第 2 层枚举由配置驱动：DATASET_*_DOMAIN=itops 决定本域取值与中文说明。"""
+def test_tool_governance() -> None:
+    """工具数量治理回归：本地台账/数仓/批处理演示工具与 common 测试工具不再注册。"""
+    from mcp_common_server import main as common
     from mcp_itops import main as itops
 
-    tool = itops.mcp._tool_manager.get_tool("itops_query_dataset")
-    enum = tool.parameters["properties"]["dataset_id"]["enum"]
-    assert "incidents" in enum and "assets" in enum, enum
-    assert "orders" not in enum, "非本域数据集不得出现在领域枚举里"
-    desc = tool.parameters["properties"]["dataset_id"].get("description", "")
-    assert "incidents=" in desc, f"参数描述应带中文说明：{desc}"
-    os.environ["DATASET_TICKETS_DOMAIN"] = "finance"
-    try:
-        try:
-            itops._guard_domain("tickets")
-            raise AssertionError("越域未拦截")
-        except Exception as e:
-            assert "data.query_dataset" in str(e) or "第 3 层" in str(e), e
-    finally:
-        os.environ.pop("DATASET_TICKETS_DOMAIN", None)
-    print("PASS  it_ops·数据集枚举配置驱动（含越域引导）")
+    itops_names = asyncio.run(_list_tools(itops.mcp))
+    removed = {"itops_create_incident", "itops_list_incidents", "itops_update_incident_status",
+               "itops_create_change", "itops_get_change", "itops_register_asset",
+               "itops_list_assets", "itops_export_assets_to_warehouse",
+               "itops_query_warehouse_assets", "itops_batch_process", "itops_list_datasets",
+               "itops_query_dataset", "itops_list_data_tables", "itops_itom_login"}
+    assert not (itops_names & removed), f"已下线工具仍在注册: {itops_names & removed}"
+    assert len(itops_names) <= 8, f"领域工具数超上限: {sorted(itops_names)}"
+
+    common_names = asyncio.run(_list_tools(common.mcp))
+    assert "echo" not in common_names and "timestamp" not in common_names, common_names
+    print(f"PASS  工具治理·it_ops={len(itops_names)} 个 / common={len(common_names)} 个（测试工具已清退）")
 
 
 def test_external_host_allowed() -> None:
@@ -1460,12 +1555,10 @@ if __name__ == "__main__":
     test_middle_itops()
     test_gateway_aggregation_flow()
     test_gateway_kv_and_schema()
-    test_itops_persistence()
-    test_itops_degrades_without_sqlite()
     test_itom_account_ref_client()
     test_itom_platform_contract()
     test_itom_guided_incident_build()
-    test_itops_dataset_enum_from_config()
+    test_tool_governance()
     test_shared_config()
     test_config_inline_comments()
     test_shared_dsrouting()

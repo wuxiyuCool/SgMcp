@@ -1,6 +1,8 @@
 """【中层·制造】制造系统 MCP server 入口（预留）。
 
-尚未实现业务工具，仅给出可运行骨架；扩展方式参考 it_ops 目录。
+尚未接入业务工具：测试用占位工具已按《MCP 服务开发规范》移除——
+没有业务价值的工具不该进聚合目录（AI 会看到并可能误调）。
+扩展方式参考 it_ops 目录（命名 {domain}_{action}_{resource}、写工具挂审批、每域 ≤ 8 个）。
 """
 
 from __future__ import annotations
@@ -10,12 +12,6 @@ from mcp.server import MCPServer
 from mcp_shared import run_server
 
 mcp = MCPServer("manufacturing")
-
-
-@mcp.tool()
-def hello() -> str:
-    """制造系统预留占位：返回欢迎信息。"""
-    return "制造系统 MCP 预留，暂未接入业务工具。参考 it_ops 目录扩展。"
 
 
 def main() -> None:

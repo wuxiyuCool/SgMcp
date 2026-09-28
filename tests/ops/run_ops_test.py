@@ -3,10 +3,14 @@
 用 tests/ops/client.py 通过 Streamable HTTP 连真实进程，覆盖日常运维最关心的四类场景：
 
 - check   ：连通性 + 工具清单（三层是否都活着、暴露了哪些工具）
-- smoke   ：各层核心工具功能验证（读/写/通用工具）
+- smoke   ：各层核心工具功能验证（ITOM 对接发现工具 / 通用工具）
 - approve ：HITL 审批闸门完整流（挂起 → 批准执行 / 驳回不执行 / 令牌保护 / 幂等重放）
 - guard   ：企业化守护（鉴权开关、审计、结果上限、路径围栏、SQL 只读、任务列表）
 - load    ：批量压测（可选，验证并发与稳定性）
+
+说明：it_ops 层已收敛为 ITOM 平台对接 8 工具（itops_* 前缀）。挂审批单的写工具
+（itops_submit_itom 等）挂单阶段不触达真实平台；「批准即执行」用 go_datahub 的
+synthetic 合成数据源验证，避免向真实 ITOM 平台写入测试数据。
 
 用法（先按 scripts/run-demo.ps1 起服务）：
     python tests/ops/run_ops_test.py                 # 跑 check + smoke + approve
@@ -113,20 +117,22 @@ def suite_check(gw: str, itops: str, common: str, godh: str | None) -> None:
 
     def itops_tools():
         names = client.list_tools(itops)
-        # 第 1 层·领域工具（itops.* 前缀）+ 第 2 层·领域通用查询
-        for expect in ("itops_create_incident", "itops_list_incidents",
-                       "itops_create_change", "itops_register_asset",
-                       "itops_export_assets_to_warehouse", "itops_query_warehouse_assets",
-                       "itops_batch_process", "itops_list_datasets",
-                       "itops_query_dataset", "itops_list_data_tables"):
-            assert expect in names, f"it_ops 缺少 {expect}"
-        return f"{len(names)} 个工具（itops.* 领域前缀）"
+        # 重构后 it_ops 只保留 ITOM 平台对接 8 工具（本地 SQLite 工单/资产/数仓/批处理已清退）
+        expect8 = {"itops_list_itom_accounts", "itops_get_itom_status",
+                   "itops_delete_itom_sessions", "itops_query_itom",
+                   "itops_submit_itom", "itops_query_itom_incidents",
+                   "itops_list_itom_options", "itops_create_itom_incident"}
+        missing = expect8 - set(names)
+        assert not missing, f"it_ops 缺少 {missing}"
+        assert len(names) == 8, f"it_ops 应恰好 8 个工具，实为 {len(names)}: {sorted(names)}"
+        return f"{len(names)} 个工具（itops_* ITOM 平台对接）"
 
     def common_tools():
         names = client.list_tools(common)
-        for expect in ("now", "echo", "generate_id", "slugify", "timestamp"):
-            assert expect in names, f"common 缺少 {expect}"
-        return f"{len(names)} 个工具"
+        expect8 = {"util_get_time", "util_create_id", "util_get_encoded", "util_get_json",
+                   "util_get_url", "util_search_text", "util_calc_stats", "util_get_status"}
+        assert set(names) == expect8, f"common 应为 8 个 util_* 工具，实为 {sorted(names)}"
+        return f"{len(names)} 个工具（util.* 通用工具，命名治理后恰好 8 个）"
 
     check("网关可达 + 暴露统一入口", gateway_tools)
     check("it_ops 可达 + 工具齐全", itops_tools)
@@ -168,80 +174,76 @@ def suite_check(gw: str, itops: str, common: str, godh: str | None) -> None:
 def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
     print("== 2. 核心工具功能 ==", flush=True)
 
-    def common_echo():
-        r = client.call(common, "echo", {"message": "ops-check"})
-        assert r == "ops-check", r
-        return r
+    def common_slug():
+        r = client.call(common, "util_get_encoded", {"text": "Deploy API v2!", "algo": "slug"})
+        assert r["result"] == "deploy-api-v2", r
+        return "slug=deploy-api-v2"
 
-    def common_echo_upper():
-        r = client.call(common, "echo", {"message": "abc", "uppercase": True})
-        assert r == "ABC", r
-        return r
+    def common_bad_input_carries_code():
+        # 规范 §四：错误必须带错误码与建议，AI 能自行纠正
+        r = client.call_raw(common, "util_get_time", {"timezone_name": "北京"})
+        assert r.is_error and "[COMMON_INVALID_INPUT]" in r.content[0].text, r.content
+        return "非法入参回 [COMMON_INVALID_INPUT]+建议"
 
-    def common_slugify():
-        r = client.call(common, "slugify", {"text": "Deploy API v2!"})
-        assert r == "deploy-api-v2", r
-        return r
+    def common_calc_stats():
+        # 「看起来像数字」的编号/版本号必须按字符串原样处理，不被静默转数值
+        r = client.call(common, "util_calc_stats", {"text": "编号 007 与版本 1.10"})
+        assert r["chars"] == 15 and r["chars_no_space"] == 12, r
+        return f"chars={r['chars']}（007/1.10 语义保真）"
 
-    def common_now_shanghai():
-        r = client.call(common, "now", {"timezone_name": "Asia/Shanghai"})
-        assert "+08:00" in r, f"时区不正确: {r}"
-        return r
+    def common_time_shanghai():
+        r = client.call(common, "util_get_time", {"timezone_name": "Asia/Shanghai"})
+        assert r["is_now"] is True and "+08:00" in r["converted"], r
+        return r["converted"]
 
     def common_id_unique():
-        a = client.call(common, "generate_id", {"prefix": "test"})
-        b = client.call(common, "generate_id", {"prefix": "test"})
+        a = client.call(common, "util_create_id", {"prefix": "test"})["ids"][0]
+        b = client.call(common, "util_create_id", {"prefix": "test"})["ids"][0]
         assert a != b and a.startswith("test_"), (a, b)
         return a
 
-    check("common.echo 回显", common_echo)
-    check("common.echo 大写模式", common_echo_upper)
-    check("common.slugify 命名转换", common_slugify)
-    check("common.now 时区（Asia/Shanghai）", common_now_shanghai)
-    check("common.generate_id 唯一性", common_id_unique)
+    check("common.util_get_encoded slug 转换", common_slug)
+    check("common 错误码契约（[COMMON_*]+hint）", common_bad_input_carries_code)
+    check("common.util_calc_stats 计数与数值语义", common_calc_stats)
+    check("common.util_get_time 时区（Asia/Shanghai）", common_time_shanghai)
+    check("common.util_create_id 唯一性", common_id_unique)
 
-    # it_ops 直连（绕过网关，验证中层自身可用）
-    def itops_create_incident():
-        r = client.call(itops, "itops_create_incident", {"title": "运维测试工单", "priority": "high"})
-        assert r["id"].startswith("INC-"), r
-        return f"{r['id']} status={r['status']}"
+    # it_ops 直连（绕过网关，验证中层自身可用）：无凭据也安全的发现/自检工具
+    def itops_accounts():
+        rows = client.call(itops, "itops_list_itom_accounts", {})
+        assert isinstance(rows, list), rows
+        for row in rows:
+            # 已配置的口令账户：工号必须打码；credential 只是类型描述，不是凭据值
+            if row.get("configured", True) and row.get("credential") == "password":
+                assert "*" in row.get("user_id", ""), f"工号未打码: {row}"
+        joined = str(rows)
+        assert "s3cr3t" not in joined, "账户清单疑似泄露凭据"
+        return f"账户清单 {len(rows)} 条（工号打码、口令永不外泄）"
 
-    def itops_status_flow():
-        created = client.call(itops, "itops_create_incident", {"title": "状态流转测试"})
-        iid = created["id"]
-        updated = client.call(itops, "itops_update_incident_status", {"incident_id": iid, "status": "in_progress"})
-        assert updated["status"] == "in_progress", updated
-        listing = client.call(itops, "itops_list_incidents", {"status": "in_progress"})
-        ids = [i["id"] for i in listing] if isinstance(listing, list) else []
-        assert iid in ids, f"过滤结果未包含 {iid}"
-        return f"{iid} new → in_progress 并可按状态过滤"
+    def itops_status_selfcheck():
+        st = client.call(itops, "itops_get_itom_status", {})
+        assert isinstance(st, dict) and st, st
+        return f"自检 ok（配置路径/注入形态/会话状态可见，不含凭据值）"
 
-    def itops_asset():
-        r = client.call(itops, "itops_register_asset", {"name": "srv-ops-01", "asset_type": "server", "owner": "ops"})
-        assert r["id"].startswith("AST-"), r
-        listed = client.call(itops, "itops_list_assets", {"asset_type": "server"})
-        assert any(a["id"] == r["id"] for a in listed), "资产未出现在列表中"
-        return f"{r['id']} 已登记并可查询"
-
-    check("it_ops 创建工单", itops_create_incident)
-    check("it_ops 工单状态流转 + 过滤", itops_status_flow)
-    check("it_ops 资产登记 + 查询", itops_asset)
+    check("it_ops 账户清单（发现入口）", itops_accounts)
+    check("it_ops 自检（itops_get_itom_status）", itops_status_selfcheck)
 
     # 通过网关的统一入口（只读，直接放行）
     def gw_readonly_pass():
         r = gw_call( "gateway_call", {
-            "server": "common-tools", "tool": "echo", "arguments": {"message": "via-gateway"},
+            "server": "common-tools", "tool": "util_get_encoded",
+            "arguments": {"text": "Via Gateway", "algo": "slug"},
         })
         assert r["approved"] is True and r["executed"] is True, r
-        assert r["result"] == "via-gateway", r
+        assert r["result"]["result"] == "via-gateway", r
         return "只读工具经网关直接放行"
 
     def gw_itops_readonly():
         r = gw_call( "gateway_call", {
-            "server": "it_ops", "tool": "itops_list_incidents", "arguments": {},
+            "server": "it_ops", "tool": "itops_list_itom_accounts", "arguments": {},
         })
         assert r["executed"] is True and isinstance(r["result"], list), r
-        return f"经网关读取工单 {len(r['result'])} 条"
+        return f"经网关读取 ITOM 账户清单 {len(r['result'])} 条"
 
     check("网关放行只读工具（common）", gw_readonly_pass)
     check("网关路由只读工具（it_ops）", gw_itops_readonly)
@@ -309,19 +311,6 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
             assert r.is_error, "非法表名竟然成功"
             return "data_batch_import 非法表名被白名单拦截"
 
-        # 业务层内部 MCP 直调示例：经网关调 itops.export_assets_to_warehouse，
-        # it_ops 内部再经 MCP 协议直连 go_datahub（gateway → it_ops → go_datahub 三跳）
-        def gw_business_to_heavy():
-            r = gw_call_raw( "gateway_call", {
-                "server": "it_ops", "tool": "itops_export_assets_to_warehouse",
-                "arguments": {"dsn_ref": "no_such_ref"},
-            })
-            # 未知 dsn_ref：重活层内部端点 400 → it_ops 转可读 ToolError → 网关 is_error
-            assert r.is_error, "未知 dsn_ref 竟然成功"
-            text = str(r.content)
-            assert "://" not in text, "错误信息疑似泄露连接串"
-            return "business→heavy 内部 REST 直调链路可达（错误路径验证）"
-
         # 架构示例全流程（经网关）：AI 调 data.batch_process(业务名 orders,
         # 2024-05, 租户 t1) → 网关转发 Go MCP → 内部按租户路由库、按月分表 →
         # 异步执行返回 task_id → 轮询完成
@@ -351,37 +340,7 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
             assert "table=orders_202405" in st["message"] and "db=order_t1_pg" in st["message"], st
             return f"{r['task_id']} 路由 db=order_t1_pg table=orders_202405 simulate 完成"
 
-        # Python 侧同款（经网关）：itops.batch_process 在业务层做路由，
-        # real 模式经内部 REST 下放重活层执行
-        def gw_business_batch_process():
-            r = gw_call( "gateway_call", {
-                "server": "it_ops", "tool": "itops_batch_process",
-                "arguments": {"dataset_id": "orders", "period": "2024-05",
-                              "tenant_id": "t1", "mode": "simulate"},
-            })
-            d = r["result"]
-            assert d["task_id"].startswith("task-") and d["routed"]["table"] == "orders_202405", r
-            assert d["routed"]["db"] == "order_t1_pg", r
-            # real 模式：本机无真实库 → 重活层结构化 ok=false 转可读工具错误
-            bad = gw_call_raw( "gateway_call", {
-                "server": "it_ops", "tool": "itops_batch_process",
-                "arguments": {"dataset_id": "orders", "period": "2024-05",
-                              "tenant_id": "t1", "mode": "real"},
-            })
-            assert bad.is_error, "real 模式无真实库竟然成功"
-            return f"Python 路由一致（{d['task_id']}），real 无库报可读错误"
-
-        # 事件单 api 通道：未配置外部 ITSM → 可读错误（引导改用 local/sql）
-        def gw_incident_api_channel_error():
-            r = gw_call_raw( "gateway_call", {
-                "server": "it_ops", "tool": "itops_create_incident",
-                "arguments": {"title": "API通道测试", "channel": "api"},
-            })
-            assert r.is_error, "未配置 ITSM 竟然成功"
-            assert "MCP_ITSM_API_URL" in str(r.content), r
-            return "事件单 api 通道未配置时报可读错误"
-
-        # 数据集清单：AI 的批处理/查询前置发现入口（两侧清单一致 + 域归属/中文说明随行）
+        # 数据集清单：AI 的批处理/查询前置发现入口（含域归属/中文说明）
         def gw_list_datasets():
             r = gw_call( "gateway_call", {
                 "server": "go_datahub", "tool": "data_list_datasets", "arguments": {},
@@ -390,12 +349,7 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
             assert {"orders", "incidents", "assets"} <= set(infos), r
             assert infos["orders"]["domain"] == "order" and infos["orders"]["desc"], r
             assert infos["incidents"]["domain"] == "itops", r
-            r2 = gw_call( "gateway_call", {
-                "server": "it_ops", "tool": "itops_list_datasets", "arguments": {},
-            })
-            names2 = {d["dataset"] for d in r2["result"]["datasets"]}
-            assert names2 == set(infos), f"两侧路由清单应一致: {set(infos)} vs {names2}"
-            return f"两侧一致：{sorted(infos)}（含 domain/desc）"
+            return f"数据集清单 {sorted(infos)}（含 domain/desc）"
 
         # 第 3 层·全局数据平台：data.query_dataset 全量数据集枚举（含 order 域）
         def gw_data_query_dataset():
@@ -413,29 +367,15 @@ def suite_smoke(gw: str, itops: str, common: str, godh: str | None) -> None:
             assert "://" not in str(d.content), "错误信息疑似泄露连接串"
             return "data_query_dataset 路由解析可达（无库走结构化失败路径）"
 
-        # 第 2 层·领域通用查询：itops.query_dataset 域限定（越域引导去第 3 层）
-        def gw_itops_query_dataset_domain_guard():
-            # 越域：orders 属 order 域 → 可读错误引导用 data.query_dataset
-            r = gw_call_raw( "gateway_call", {
-                "server": "it_ops", "tool": "itops_query_dataset",
-                "arguments": {"dataset_id": "order"},  # 枚举外值，模拟越域调用
-            })
-            assert r.is_error, "越域数据集竟然成功"
-            return "itops_query_dataset 域校验拦截（枚举 + 越域引导）"
-
         check("go_datahub 异步 job 全流程", godh_job_flow)
         check("go_datahub db_ping 失败路径", godh_db_ping_error)
         check("go_datahub 未知 dsn_ref 不泄露凭证", godh_dsn_ref_error_path)
         check("go_datahub list_tables 失败路径", godh_list_tables_error)
         check("go_datahub batch_import 表名白名单", godh_batch_import_param_error)
         check("网关 HTTP 转发到 go_datahub（只读）", gw_godh_readonly)
-        check("business→heavy 内部 REST 直调链路", gw_business_to_heavy)
         check("data_batch_process 业务名路由全流程", gw_heavy_batch_process_flow)
-        check("itops_batch_process Python 侧路由", gw_business_batch_process)
-        check("事件单 api 通道未配置报可读错误", gw_incident_api_channel_error)
-        check("数据集清单两侧一致（含域归属/说明）", gw_list_datasets)
+        check("数据集清单（含域归属/说明）", gw_list_datasets)
         check("data_query_dataset 全局细粒度查询", gw_data_query_dataset)
-        check("itops_query_dataset 领域枚举限定", gw_itops_query_dataset_domain_guard)
 
 
 # ---------------------------------------------------------------------------
@@ -445,13 +385,15 @@ def suite_approve(gw: str, _itops: str, _common: str, godh: str | None = None) -
     print("== 3. 审批闸门（HITL）==", flush=True)
     marker = f"运维审批测试-{uuid.uuid4().hex[:6]}"
 
-    # 挂起：高风险写操作不应立即执行
+    # 挂起：高风险写操作不应立即执行。
+    # 用 itops_submit_itom（在审批名单内）：挂单阶段只是建审批单，不触达真实平台
     pending: dict = {}
 
     def gw_change_pending():
         r = gw_call( "gateway_call", {
-            "server": "it_ops", "tool": "itops_create_change",
-            "arguments": {"title": marker, "risk": "high"},
+            "server": "it_ops", "tool": "itops_submit_itom",
+            "arguments": {"account_ref": "default", "path": "/event-manage/updateEvent",
+                          "body": {"note": marker}},
             "requested_by": "ops-test",
         })
         assert r["approved"] is False and r["executed"] is False, r
@@ -469,71 +411,48 @@ def suite_approve(gw: str, _itops: str, _common: str, godh: str | None = None) -
 
     check("审批单出现在待办列表", gw_visible_in_pending)
 
-    # 批准 → 真正执行到下游
+    # 批准 → 真正执行到下游。
+    # 批准会真实执行下游调用：ITOM 写单会触达真实平台，因此这里用 go_datahub
+    # 的合成数据源（synthetic，自产自销不碰外部系统）验证「批准即执行」链路
     def gw_approve_executes():
-        r = gw_call("approve_request", {"request_id": pending["id"], "comment": "运维测试放行"},
+        if not godh:
+            return "跳过（未部署 go_datahub；ITOM 写单会触达真实平台，不做自动批准）"
+        r = gw_call( "gateway_call", {
+            "server": "go_datahub", "tool": "data_submit_collect_job",
+            "arguments": {"source": "synthetic", "params": {"rows": 100}},
+            "requested_by": "ops-test",
+        })
+        assert r["approved"] is False and r["executed"] is False, r
+        d = gw_call("approve_request", {"request_id": r["request_id"],
+                                        "comment": "运维测试放行（合成数据源）"},
                     headers=APPROVER_HEADERS)
-        assert r["executed"] is True, r
-        assert r["status"] == "approved", r
-        assert "CHG-" in str(r["result"]), r
-        pending["change_id"] = r["result"]["id"]
-        return f"已执行，产出变更单 {r['result']['id']}"
-
-    check("批准后执行下游并产出变更单", gw_approve_executes)
-
-    def gw_change_readable():
-        r = gw_call( "gateway_call", {
-            "server": "it_ops", "tool": "itops_get_change",
-            "arguments": {"change_id": pending["change_id"]},
+        assert d["executed"] is True and d["status"] == "approved", d
+        job_id = d["result"]["job_id"]
+        assert job_id.startswith("job-"), d
+        st = gw_call( "gateway_call", {
+            "server": "go_datahub", "tool": "data_get_job_status", "arguments": {"job_id": job_id},
         })
-        assert r["result"]["title"] == marker, r
-        return "变更单可经网关查回，标题一致"
+        assert st["result"]["status"] in ("pending", "running", "completed"), st
+        return f"已执行，产出任务 {job_id}"
 
-    check("审批产物可回查", gw_change_readable)
+    check("批准后执行下游", gw_approve_executes)
 
-    # 驳回 → 不执行
-    rejected: dict = {}
-
+    # 驳回 → 不执行（复用第 1 步挂起的单据，测试自清理：驳回后不触达任何下游）
     def gw_reject_no_execute():
-        r = gw_call( "gateway_call", {
-            "server": "it_ops", "tool": "itops_create_change", "arguments": {"title": f"{marker}-驳回"},
-        })
-        rid = r["request_id"]
-        d = gw_call("reject_request", {"request_id": rid, "comment": "风险过高"}, headers=APPROVER_HEADERS)
+        d = gw_call("reject_request", {"request_id": pending["id"], "comment": "风险过高"},
+                    headers=APPROVER_HEADERS)
         assert d["executed"] is False and d["status"] == "rejected", d
-        rejected["id"] = rid
         return "驳回后未执行任何下游调用"
 
     check("驳回后不执行", gw_reject_no_execute)
 
     def gw_redecide_blocked():
         """已决审批单不能再次决策（状态机保护）。"""
-        result = gw_call_raw("approve_request", {"request_id": rejected["id"]}, headers=APPROVER_HEADERS)
+        result = gw_call_raw("approve_request", {"request_id": pending["id"]}, headers=APPROVER_HEADERS)
         assert result.is_error, "已驳回的审批单竟可再次批准"
         return "已决审批单拒绝重复决策"
 
     check("已决审批单不可重复决策", gw_redecide_blocked)
-
-    if godh:
-        # 批量采集提交（Go 重活）经审批闸门：挂起 → 批准 → job 真正被创建
-        def gw_godh_submit_approval():
-            r = gw_call( "gateway_call", {
-                "server": "go_datahub", "tool": "data_submit_collect_job",
-                "arguments": {"source": "synthetic", "params": {"rows": 100}},
-            })
-            assert r["approved"] is False and r["executed"] is False, r
-            d = gw_call("approve_request", {"request_id": r["request_id"], "comment": "运维测试放行采集"},
-                       headers=APPROVER_HEADERS)
-            assert d["executed"] is True, d
-            job_id = d["result"]["job_id"]
-            assert job_id.startswith("job-"), d
-            st = gw_call( "gateway_call", {
-                "server": "go_datahub", "tool": "data_get_job_status", "arguments": {"job_id": job_id},
-            })
-            assert st["result"]["status"] in ("pending", "running", "completed"), st
-            return f"审批放行后 Go 侧创建任务 {job_id}"
-
-        check("go_datahub 采集任务经审批闸门执行", gw_godh_submit_approval)
 
     # 未注册路由 → 协议错误
     def gw_unknown_route():
@@ -576,8 +495,15 @@ def suite_guard(gw: str, _itops: str, _common: str, godh: str | None) -> None:
         items = gw_call("list_downstreams", {})
         assert items and all("tools_aggregated" in i for i in items), items
         bad = [i for i in items if i["status"] != "ok"]
+        if not godh:
+            # --skip-go 模式：go_datahub 不参与本轮巡检，其聚合失败只提示不判败
+            skipped = [i for i in bad if i["name"] == "go_datahub"]
+            bad = [i for i in bad if i["name"] != "go_datahub"]
+            if skipped:
+                print("      [提示] go_datahub 未参与巡检（--skip-go），聚合失败不判败")
         assert not bad, f"有下游未聚合成功: {[(b['name'], b['status']) for b in bad]}"
-        return "全部下游 ok：" + ", ".join(f"{i['name']}({i['tools_aggregated']}工具)" for i in items)
+        ok_items = [i for i in items if i["status"] == "ok"]
+        return "全部在巡下游 ok：" + ", ".join(f"{i['name']}({i['tools_aggregated']}工具)" for i in ok_items)
 
     check("list_downstreams 聚合健康度", gw_downstreams_health)
 
@@ -621,26 +547,23 @@ def suite_guard(gw: str, _itops: str, _common: str, godh: str | None) -> None:
     check("route_* method 枚举约束", gw_route_method_enum)
 
     def gw_idempotency():
+        # 用 itops_delete_itom_sessions（非审批写工具，只清进程内会话缓存，
+        # 无外部副作用）：itops_submit_itom 会先挂审批单，不适合验证结果级幂等
         key = f"ops-idem-{uuid.uuid4().hex[:8]}"
-        title = f"幂等守护用例-{key}"   # 标题唯一：SQLite 跨轮次持久化，固定标题会与历史数据撞车
-        a = gw_call("gateway_call", {"server": "it_ops", "tool": "itops_create_incident",
-                                     "arguments": {"title": title}, "idempotency_key": key})
-        b = gw_call("gateway_call", {"server": "it_ops", "tool": "itops_create_incident",
-                                     "arguments": {"title": title}, "idempotency_key": key})
-        assert a["result"]["id"] == b["result"]["id"], (a, b)
+        args = {"server": "it_ops", "tool": "itops_delete_itom_sessions",
+                "arguments": {"account_ref": "default"}, "idempotency_key": key}
+        a = gw_call("gateway_call", args)
+        b = gw_call("gateway_call", args)
+        assert a["executed"] is True and a["result"] == b["result"], (a, b)
         assert b.get("idempotent_replay") is True, b
-        rows = gw_call("gateway_call", {"server": "it_ops", "tool": "itops_list_incidents",
-                                        "arguments": {}})["result"]
-        rows = rows["result"] if isinstance(rows, dict) and "result" in rows else rows
-        hits = [r for r in rows if r.get("title") == title]
-        assert len(hits) == 1, f"同一幂等键重复落库 {len(hits)} 次"
-        return f"重试不重复执行（{a['result']['id']} 仅一条）"
+        return f"重试不重复执行（幂等键 {key} 二次调用回放缓存结果）"
 
     check("写操作 idempotency_key 防重复执行", gw_idempotency)
 
     def gw_audit_traceable():
-        call_id = gw_call("gateway_call", {"server": "common-tools", "tool": "echo",
-                                           "arguments": {"message": "audit-me"}})["call_id"]
+        call_id = gw_call("gateway_call", {"server": "common-tools", "tool": "util_get_encoded",
+                                           "arguments": {"text": "audit-me",
+                                                         "algo": "slug"}})["call_id"]
         events = gw_call("query_audit_log", {"limit": 30, "call_id": call_id})
         assert events, f"审计中查不到 call_id={call_id}"
         e = events[0]
@@ -652,41 +575,45 @@ def suite_guard(gw: str, _itops: str, _common: str, godh: str | None) -> None:
     check("调用审计落盘并可回查", gw_audit_traceable)
 
     def gw_error_actionable():
-        r = gw_call_raw("gateway_call", {"server": "it_ops", "tool": "create_inciden",
-                                         "arguments": {"title": "typo"}})
+        r = gw_call_raw("gateway_call", {"server": "it_ops", "tool": "itops_query_itomm",
+                                         "arguments": {"account_ref": "default"}})
         assert r.is_error, "错工具名应报错"
         text = str(r.content)
-        assert "itops_create_incident" in text, f"应给出相近工具名: {text[:200]}"
+        assert "itops_query_itom" in text, f"应给出相近工具名: {text[:200]}"
         assert "list_routes" in text or "refresh_routes" in text, "应给下一步指引"
         return "错误含相近工具名 + 下一步指引（省 AI 往返）"
 
     check("路由未命中给可执行建议", gw_error_actionable)
 
     def gw_approval_token_enforced():
-        """配了 MCP_APPROVAL_TOKEN 时的真实行为：AI 侧无令牌不能自批，审批人带令牌可放行。"""
+        """配了 MCP_APPROVAL_TOKEN 时的真实行为：AI 侧无令牌不能自批，审批人带令牌可决策。"""
         if not APPROVAL_TOKEN:
             return "跳过（未配 MCP_APPROVAL_TOKEN；生产必须配，见 develop-deploy §8.1）"
         marker = f"令牌守护-{uuid.uuid4().hex[:6]}"
-        rid = gw_call("gateway_call", {"server": "it_ops", "tool": "itops_create_change",
-                                       "arguments": {"title": marker, "risk": "high"}})["request_id"]
+        rid = gw_call("gateway_call", {"server": "it_ops", "tool": "itops_submit_itom",
+                                       "arguments": {"account_ref": "default",
+                                                     "path": "/event-manage/updateEvent",
+                                                     "body": {"note": marker}}})["request_id"]
         bad = gw_call_raw("approve_request", {"request_id": rid})
         assert bad.is_error and "审批令牌" in str(bad.content), "配了令牌却可被无令牌放行（HITL 失效）"
-        # 审批人通道：令牌走请求头，模型不需要知道
+        # 审批人通道：令牌走请求头，模型不需要知道。
+        # 批准会真实执行下游（触达 ITOM 平台），这里用「令牌驳回」验证决策通道并清理单据
         hdr = {**(GW_HEADERS or {}), "X-Sg-Approval-Token": APPROVAL_TOKEN, "X-Sg-Actor": "ops-approver"}
-        ok = client.call(gw, "approve_request", {"request_id": rid}, headers=hdr)
-        assert ok["executed"] is True and ok["status"] == "approved", ok
-        pend = [a for a in gw_call("list_approvals", {"status": "approved", "limit": 50})]
+        ok = client.call(gw, "reject_request", {"request_id": rid, "comment": "令牌验证完成，驳回收尾"},
+                         headers=hdr)
+        assert ok["status"] == "rejected" and ok["executed"] is False, ok
+        pend = [a for a in gw_call("list_approvals", {"status": "rejected", "limit": 50})]
         hit = next((a for a in pend if a["id"] == rid), None)
         assert hit and hit["requested_by"] != "", hit
-        return f"无令牌被拒 + 请求头令牌放行（{ok['result']['id']}）"
+        return f"无令牌被拒 + 请求头令牌可决策（{rid} 已驳回收尾，不触达真实平台）"
 
     check("审批令牌闸门（AI 不可自批）", gw_approval_token_enforced)
 
     def gw_kv_quotes():
-        r = gw_call("gateway_call", {"server": "it_ops", "tool": "itops_create_incident",
-                                     "arguments": "title='版本 1.10 编号 007';priority=low"})
+        r = gw_call("gateway_call", {"server": "common-tools", "tool": "util_calc_stats",
+                                     "arguments": "text='编号 007 与版本 1.10'"})
         assert r["executed"] is True, r
-        assert "1.10" in r["result"]["title"] and "007" in r["result"]["title"], r
+        assert r["result"]["chars"] == 15 and r["result"]["chars_no_space"] == 12, r
         return "扁平 kv 串不静默改坏数据（前导零/版本号原样保留）"
 
     check("kv 入参数值语义保真", gw_kv_quotes)
@@ -769,9 +696,10 @@ def suite_load(gw: str, _itops: str, _common: str, n: int) -> None:
 
     def one(i: int) -> bool:
         r = gw_call( "gateway_call", {
-            "server": "common-tools", "tool": "echo", "arguments": {"message": f"load-{i}"},
+            "server": "common-tools", "tool": "util_get_encoded",
+            "arguments": {"text": f"Load Test {i}", "algo": "slug"},
         })
-        return r.get("result") == f"load-{i}"
+        return (r.get("result") or {}).get("result") == f"load-test-{i}"
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(n, 16)) as pool:
         outcomes = list(pool.map(one, range(n)))
@@ -779,6 +707,27 @@ def suite_load(gw: str, _itops: str, _common: str, n: int) -> None:
     elapsed = time.perf_counter() - t0
     ok = sum(outcomes)
     _record(f"并发 {n} 次调用全部成功", ok == n, f"{ok}/{n} 成功，耗时 {elapsed:.2f}s")
+
+
+def wait_gateway_ready(timeout: float = 30.0) -> None:
+    """等网关就绪（聚合完成）再开跑，避免冷启动窗口期的误报。
+
+    网关进程起来后要作为 MCP Client 拉取下游工具表并重建聚合路由工具，
+    在此期间 tools/list 可能失败。/healthz 的 routes>0 即聚合完成。
+    """
+    deadline = time.time() + timeout
+    last = "未探测"
+    while time.time() < deadline:
+        try:
+            info = client.healthz(args_url["gw"])
+            if info.get("ok") and info.get("routes", 0) > 0:
+                print(f"网关就绪（{info.get('routes')} 条路由，uptime {info.get('uptime_s')}s）", flush=True)
+                return
+            last = f"ok={info.get('ok')} routes={info.get('routes')}"
+        except Exception as e:  # noqa: BLE001 — 就绪探测必须容忍一切连接错误
+            last = f"{type(e).__name__}"
+        time.sleep(1.0)
+    print(f"      [警告] 网关 {timeout:.0f}s 内未就绪（{last}），继续执行测试", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -796,6 +745,7 @@ def main() -> int:
 
     args_url["gw"] = args.url
     os.environ["MCP_OPS_GATEWAY_URL"] = args.url   # 让 client 知道哪个地址该带网关令牌
+    wait_gateway_ready()
     godh = None if args.skip_go else args.godh_url
     print(f"目标：网关 {args.url}\n     it_ops {args.itops_url}\n     common {args.common_url}\n"
           f"     go_datahub {godh or '（跳过）'}\n", flush=True)

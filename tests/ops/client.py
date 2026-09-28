@@ -70,16 +70,23 @@ def auto_headers(url: str) -> dict[str, str] | None:
 
 
 def _make_client(url: str, raise_exceptions: bool, headers: dict[str, str] | None):
-    """构造 SDK Client；headers 非空（或自动推断出令牌）时经自建 httpx2.AsyncClient 注入。"""
-    from mcp import Client
+    """构造 SDK Client；始终经自建 httpx2.AsyncClient 走 streamable_http_client。
 
-    headers = headers or auto_headers(url)
-    if not headers:
-        return Client(url, raise_exceptions=raise_exceptions, mode="legacy")
+    为什么不让 SDK 自己建客户端：它默认 trust_env=True，会吃进 HTTP(S)_PROXY
+    环境变量——本机配了代理时，连本机/内网 server 的请求被代理劫持，
+    「服务未启动」会表现成 502/读超时，排障方向全偏。
+    """
+    from mcp import Client
     import httpx2
     from mcp.client.streamable_http import streamable_http_client
 
-    transport = streamable_http_client(url, http_client=httpx2.AsyncClient(headers=headers))
+    headers = headers or auto_headers(url)
+    http = httpx2.AsyncClient(
+        headers=headers or {},
+        timeout=httpx2.Timeout(30.0, connect=10.0),
+        trust_env=False,
+    )
+    transport = streamable_http_client(url, http_client=http)
     return Client(transport, raise_exceptions=raise_exceptions, mode="legacy")
 
 
@@ -135,6 +142,8 @@ def healthz(mcp_url: str, path: str = "/healthz",
     import httpx2
 
     base = mcp_url[: mcp_url.rfind("/")] if "/mcp" in mcp_url else mcp_url.rstrip("/")
-    resp = httpx2.get(base + path, headers=headers or {}, timeout=10)
+    # trust_env=False：探活目标是本机/内网服务，不走系统代理（理由同 _make_client）
+    with httpx2.Client(headers=headers or {}, timeout=10, trust_env=False) as client:
+        resp = client.get(base + path)
     resp.raise_for_status()
     return resp.json()

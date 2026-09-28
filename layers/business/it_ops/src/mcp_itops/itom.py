@@ -59,8 +59,26 @@ _READ_SEGMENTS = (
 )
 
 
+# 错误码（转 ToolError 后以 [CODE] 前缀出现在错误文本里，AI 可据此纠正重试）
+CODE_NOT_CONFIGURED = "ITOM_NOT_CONFIGURED"
+CODE_INVALID_INPUT = "ITOM_INVALID_INPUT"
+CODE_UNREACHABLE = "ITOM_UNREACHABLE"
+CODE_HTTP_ERROR = "ITOM_HTTP_ERROR"
+CODE_API_ERROR = "ITOM_API_ERROR"
+CODE_AMBIGUOUS = "ITOM_AMBIGUOUS"
+CODE_NOT_FOUND = "ITOM_NOT_FOUND"
+
+
 class ItomError(RuntimeError):
-    """配置缺失、鉴权失败、路径非法、平台返回错误——统一带可执行建议。"""
+    """配置缺失、鉴权失败、路径非法、平台返回错误——统一带 error_code 与可执行建议。
+
+    str(e) 形如 ``[ITOM_NOT_FOUND] 没找到 …；建议 …``：AI 靠前缀里的错误码
+    分类理解失败原因，靠消息里的建议自行纠正后重试。
+    """
+
+    def __init__(self, message: str, *, code: str = "ITOM_ERROR") -> None:
+        self.code = code
+        super().__init__(f"[{code}] {message}")
 
 
 @dataclass
@@ -110,13 +128,19 @@ def account(ref: str) -> Account:
         raise ItomError(
             "ITOM 账户未配置：请在 config/platform.env 写 MCP_ITOM_ACCOUNTS=<引用名,逗号分隔> "
             "以及每个引用名的 MCP_ITOM_<引用名大写>_USER_ID/_PASSWORD（该文件不进版本库）。"
-            "AI 侧只需要引用名，不需要也不应该出现口令。"
+            "AI 侧只需要引用名，不需要也不应该出现口令。",
+            code=CODE_NOT_CONFIGURED,
         )
     ref = (ref or "").strip()
+    if ref in ("", "default"):
+        # 模型很习惯传 "default"；单账户部署时直接落到清单里的第一个引用名，
+        # 免得它在"未知引用名"和"该用哪个账号"之间反复横跳
+        ref = refs[0]
     if ref not in refs:
         raise ItomError(
             f"未知的 ITOM 账户引用名 {ref!r}；可用：{', '.join(refs)}"
-            "（先调 itops_itom_accounts 看完整清单）"
+            "（先调 itops_list_itom_accounts 看完整清单）",
+            code=CODE_NOT_FOUND,
         )
     stem = f"MCP_ITOM_{_env_suffix(ref)}_"
     acct = Account(
@@ -131,7 +155,8 @@ def account(ref: str) -> Account:
     if not acct.static_token and not acct.can_login:
         raise ItomError(
             f"账户 {ref} 缺少凭据：请配 {stem}USER_ID + {stem}PASSWORD，"
-            f"或改用长期令牌方式配 {stem}TOKEN"
+            f"或改用长期令牌方式配 {stem}TOKEN",
+            code=CODE_NOT_CONFIGURED,
         )
     return acct
 
@@ -169,10 +194,12 @@ def _base_url() -> str:
     if not base:
         raise ItomError(
             "ITOM 地址未配置：请在 config/platform.env 设 MCP_ITOM_URL"
-            "（形如 https://itom.shougang.com.cn/api，含 /api 前缀）"
+            "（形如 https://itom.shougang.com.cn/api，含 /api 前缀）",
+            code=CODE_NOT_CONFIGURED,
         )
     if not base.startswith(("http://", "https://")):
-        raise ItomError(f"MCP_ITOM_URL 必须是 http(s) 地址，当前 {base!r}")
+        raise ItomError(f"MCP_ITOM_URL 必须是 http(s) 地址，当前 {base!r}",
+                        code=CODE_INVALID_INPUT)
     return base
 
 
@@ -253,11 +280,13 @@ def _login(a: Account) -> _Session:
     try:
         resp = _send("POST", url, params=None, json_body=body, headers=_platform_headers())
     except httpx2.HTTPError as e:
-        raise ItomError(f"ITOM 登录请求失败（{url}）：{type(e).__name__}: {e}") from e
+        raise ItomError(f"ITOM 登录请求失败（{url}）：{type(e).__name__}: {e}",
+                        code=CODE_UNREACHABLE) from e
     if resp.status_code >= 400:
         raise ItomError(
             f"ITOM 登录返回 [{resp.status_code}]：{_snippet(resp.text)}"
-            "（403 多为平台 WAF 挑客户端，配 MCP_ITOM_USER_AGENT/MCP_ITOM_REFERER 再试）"
+            "（403 多为平台 WAF 挑客户端，配 MCP_ITOM_USER_AGENT/MCP_ITOM_REFERER 再试）",
+            code=CODE_HTTP_ERROR,
         )
     payload = _parse_body(resp)
     token, key = _find_token(payload)
@@ -266,7 +295,8 @@ def _login(a: Account) -> _Session:
         raise ItomError(
             "ITOM 登录成功但没找到 token：响应键名不在常见列表里。"
             f"实际键名={_keys_of(payload)}，cookie={list(cookies)}；"
-            "请把命中的键名配成 MCP_ITOM_TOKEN_KEY"
+            "请把命中的键名配成 MCP_ITOM_TOKEN_KEY",
+            code=CODE_NOT_CONFIGURED,
         )
     ttl = _ttl()
     # 纯 cookie 会话（Java 平台常见）：没有 token 也能带着 cookie 调后续接口
@@ -391,6 +421,7 @@ _RET_OK = {"0000000", "00000", "0000", "0", "success", "ok", "true"}
 _EXPIRED_WORDS = (
     "会话已失效", "会话失效", "会话过期", " session", "session expired", "invalid session",
     "未登录", "请先登录", "重新登录", "登录失效", "登录过期", "登录超时", "登录已失效",
+    "登录信息发生变化", "登录信息已变化", "登录状态异常",
     "token expired", "invalid token", "unauthorized", "认证失效", "身份失效", "not logged in",
 )
 
@@ -465,10 +496,12 @@ def safe_path(path: str) -> str:
     """只允许站内相对路径：挡掉换成任意外部主站的 SSRF 与 ../ 穿越。"""
     p = (path or "").strip()
     if not p.startswith("/"):
-        raise ItomError(f"path 必须是以 / 开头的站内相对路径，当前 {path!r}")
+        raise ItomError(f"path 必须是以 / 开头的站内相对路径，当前 {path!r}",
+                        code=CODE_INVALID_INPUT)
     if "//" in p or ".." in p or p.startswith("//") or "?" in p or "#" in p:
         raise ItomError(
-            f"path 不合法（禁止 //、..、查询串与锚点，查询参数请走 params）：{path!r}"
+            f"path 不合法（禁止 //、..、查询串与锚点，查询参数请走 params）：{path!r}",
+            code=CODE_INVALID_INPUT,
         )
     return check_text(p, limit=500, what="path")
 
@@ -492,20 +525,21 @@ def request_json(ref: str, method: str, path: str, *, params: dict[str, Any] | N
 
     会话复用：进程内按 account_ref 缓存，TTL 内不重复登录（并发下也只登一次）；
     平台提前让会话失效时（401/403，或 HTTP 200 + retCode 的失效文案）**自动重登一次再重试**，
-    调用方不需要先调 itops_itom_login。
+    调用方不需要手动登录，会话由服务端全自动维护。
     read_channel=True（只读工具走这条路）时，非 GET 的方法必须路径像只读接口，
     否则拒绝——平台的分页查询是 POST，但审批闸门不该因此形同虚设。
     """
     a = account(ref)
     verb = (method or "GET").strip().upper()
     if verb not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
-        raise ItomError(f"不支持的 method: {method!r}")
+        raise ItomError(f"不支持的 method: {method!r}", code=CODE_INVALID_INPUT)
     clean = safe_path(path)
     if read_channel and verb != "GET" and not read_like(clean):
         raise ItomError(
-            f"itops_itom_get 只放行 GET 或只读形态的路径（末段含 find/get/list/query 等，"
+            f"itops_query_itom 只放行 GET 或只读形态的路径（末段含 find/get/list/query 等，"
             f"可用 MCP_ITOM_READ_SEGMENTS 追加），{clean!r} 不像只读接口。"
-            "确实要写数据请改用 itops_itom_call（经网关需人工审批）"
+            "确实要写数据请改用 itops_submit_itom（经网关需人工审批）",
+            code=CODE_INVALID_INPUT,
         )
     url = _base_url() + clean
 
@@ -527,7 +561,8 @@ def request_json(ref: str, method: str, path: str, *, params: dict[str, Any] | N
                 raise ItomError(
                     f"ITOM {verb} {path} 返回 [{resp.status_code}]：{_snippet(resp.text)}"
                     + ("（重登后仍被拒，请核对账号权限或配 MCP_ITOM_USER_AGENT/_REFERER）"
-                       if attempt else "")
+                       if attempt else ""),
+                    code=CODE_HTTP_ERROR,
                 )
             data, meta = _unwrap(_parse_body(resp))
             code = str(meta.get("retCode") or "").strip()
@@ -536,10 +571,18 @@ def request_json(ref: str, method: str, path: str, *, params: dict[str, Any] | N
                 relogged = True
                 continue
             if failed:
+                expired = _auth_expired(meta, data)
+                hint = ""
+                if expired and attempt:
+                    hint = ("（已自动重登仍被拒：多半是同一账号在浏览器登录把服务端会话顶掉了，"
+                            "或平台按登录 IP/上下文绑会话；也可能是服务端没配 MCP_ITOM_UID_PARAM "
+                            "导致 uid 与 JSESSIONID 不是同一次登录）")
+                elif expired:
+                    hint = "（若反复出现请查 it_ops 日志确认是否已在服务端重登）"
                 raise ItomError(
                     f"ITOM {path} 业务失败 retCode={code} "
-                    f"retDesc={meta.get('retDesc') or _error_hint(data)}"
-                    + ("（若为会话失效可再调 itops_itom_login）" if not _auth_expired(meta, data) else "")
+                    f"retDesc={meta.get('retDesc') or _error_hint(data)}" + hint,
+                    code=CODE_API_ERROR,
                 )
             out: dict[str, Any] = {"ok": True, "status": resp.status_code,
                                    "account_ref": a.ref,
@@ -554,7 +597,8 @@ def request_json(ref: str, method: str, path: str, *, params: dict[str, Any] | N
     except httpx2.HTTPError as e:
         raise ItomError(
             f"调用 ITOM 失败（{verb} {url}）：{type(e).__name__}: {e}。"
-            "请确认 MCP_ITOM_URL 与网络可达，或稍后重试"
+            "请确认 MCP_ITOM_URL 与网络可达，或稍后重试",
+            code=CODE_UNREACHABLE,
         ) from e
     raise ItomError(f"ITOM {verb} {path} 未预期地走完重试循环")  # 循环必然 return/raise，兜底
 
@@ -779,29 +823,35 @@ def options(ref: str, kind: str, *, parent: str | int | None = None,
             role: str | None = None) -> list[dict[str, Any]]:
     """列出一个下拉的候选项（精简投影），供 AI 引导用户选择。
 
+    kind=form 返回建单表单字段说明书（承接原独立表单工具，能力不丢）。
     parent 是上一级选中的代码：group 传部门 orgCode、system 传 groupCode、
     subclass/menu 传上级 sysSid、staff 传系统 sysSid（必须一级系统）。
     role 仅 staff 用（1 一线/2 二线/3 系统负责人）——平台按 sysSid+sysUserType 两个键
     才查得到人，缺一个就返回空列表。
     """
     kind = (kind or "").strip()
+    if kind == "form":
+        return list(INCIDENT_FORM)
     if kind in DICT_KINDS:
         table = code_table(DICT_KINDS[kind], ref)
         return [{"code": c, "name": n} for c, n in sorted(table.items(), key=lambda x: x[0])]
     if kind not in OPTION_KINDS:
         raise ItomError(
-            f"未知的选项类别 {kind!r}；可用：{', '.join(list(OPTION_KINDS) + [f'dict:{v}' for v in DICT_KINDS])}"
+            f"未知的选项类别 {kind!r}；可用：form（建单表单说明书）、"
+            f"{', '.join(list(OPTION_KINDS) + [f'dict:{v}' for v in DICT_KINDS])}",
+            code=CODE_INVALID_INPUT,
         )
     path, parent_key, cols, name_key = OPTION_KINDS[kind]
     body: dict[str, Any] = {**({"pageSize": str(max(1, min(int(limit), 200)))})}
     if parent_key:
         if parent in (None, ""):
-            raise ItomError(f"kind={kind} 必须先确定上一级（body 需要 {parent_key}）")
+            raise ItomError(f"kind={kind} 必须先确定上一级（body 需要 {parent_key}）；"
+                            "先调本工具拿上级候选项再传 parent", code=CODE_INVALID_INPUT)
         body[parent_key] = parent if not parent_key.endswith("Sid") else int(parent)
     if kind == "staff":
         if not role:
             raise ItomError("kind=staff 必须同时给 role（1 一线/2 二线/3 系统负责人），"
-                            "否则平台返回 0 个处理人")
+                            "否则平台返回 0 个处理人", code=CODE_INVALID_INPUT)
         body["sysUserType"] = str(role)
     if keyword:
         body[_KEYWORD_FIELD.get(kind, "keyword")] = keyword
@@ -820,7 +870,7 @@ def resolve(ref: str, kind: str, value: str, *, parent: str | int | None = None,
     hint 用于同名消歧（如报修人重名时给部门名）——hint 能唯一命中才继续。
     """
     if not value or not str(value).strip():
-        raise ItomError(f"{kind} 不能为空")
+        raise ItomError(f"{kind} 不能为空", code=CODE_INVALID_INPUT)
     value = str(value).strip()
     if kind in DICT_KINDS:
         table = code_table(DICT_KINDS[kind], ref)
@@ -830,8 +880,10 @@ def resolve(ref: str, kind: str, value: str, *, parent: str | int | None = None,
         if len(hits) == 1:
             return {"code": hits[0][0], "name": hits[0][1]}
         if len(hits) > 1:
-            raise ItomError(f"{kind}={value!r} 匹配到多个码值：{hits}，请让用户确认")
-        raise ItomError(f"{kind}={value!r} 不在码表里；可选：{table}")
+            raise ItomError(f"{kind}={value!r} 匹配到多个码值：{hits}，请让用户确认",
+                            code=CODE_AMBIGUOUS)
+        raise ItomError(f"{kind}={value!r} 不在码表里；可选：{table}",
+                        code=CODE_NOT_FOUND)
     _, _, cols, name_key = OPTION_KINDS[kind]
     # 带关键字查：客户档案这类大表翻页取前 200 条是碰不到目标人的
     rows = options(ref, kind, parent=parent, keyword=value, limit=200, role=role)
@@ -848,7 +900,8 @@ def resolve(ref: str, kind: str, value: str, *, parent: str | int | None = None,
         raise ItomError(
             f"没找到 {kind}={value!r}"
             + (f"（上级 parent={parent}）" if parent else "")
-            + f"；该层级可选前 15 项：{sample}。请让用户重新选择，不要猜。"
+            + f"；该层级可选前 15 项：{sample}。请让用户重新选择，不要猜。",
+            code=CODE_NOT_FOUND,
         )
     if len(exact) > 1:
         # 逐行列出区分字段（截断 JSON 会把值切成半截，AI 就没法回问用户）
@@ -857,7 +910,8 @@ def resolve(ref: str, kind: str, value: str, *, parent: str | int | None = None,
         raise ItomError(
             f"{kind}={value!r} 在平台有 {len(exact)} 条同名记录，必须让用户确认是哪一条：\n"
             + "\n".join(lines)
-            + ("\n（把区分信息放进 hint 参数再调一次）" if not hint else "")
+            + ("\n（把区分信息放进 hint 参数再调一次）" if not hint else ""),
+            code=CODE_AMBIGUOUS,
         )
     return exact[0]
 
@@ -912,7 +966,8 @@ def prepare_incident(ref: str, *, dept: str, group: str, system: str, subclass: 
     if not (r.get("mobilePhone") or reporter_phone):
         raise ItomError(
             f"报修人 {reporter!r} 的客户档案里没有电话，而平台建单必填："
-            "请让用户提供报修电话后重试（reporter_phone 参数）"
+            "请让用户提供报修电话后重试（reporter_phone 参数）",
+            code=CODE_INVALID_INPUT,
         )
     warnings: list[str] = []
     rd_code = repair_dept_code
@@ -940,20 +995,35 @@ def submit_incident(ref: str, payload: dict[str, Any]) -> dict[str, Any]:
     return request_json(ref, "POST", "/event-manage/saveData", body=payload)
 
 
-def login_status(ref: str) -> dict[str, Any]:
-    """显式登录并把会话状态返回给调用方（不含 token 本身）。"""
-    a = account(ref)
-    sess = _session(a)
+def selfcheck() -> dict[str, Any]:
+    """ITOM 对接自检：只回配置"有没有/是什么形态"，绝不回值。
+
+    0200000「登录信息发生变化」这类问题九成是配置形态不对（缺 UID_PARAM、
+    配置文件不在以为的位置），以前只能登服务器 grep，现在一条工具调用说清楚。
+    """
+    from mcp_shared.config import config_path
+
+    path = config_path()
+    head, uid_param = _credential_placement()
+    sessions = {}
+    with _lock:
+        for ref, sess in _sessions.items():
+            sessions[ref] = {"has_token": bool(sess.token), "cookies": sorted(sess.cookies),
+                             "age_s": round(time.time() - sess.obtained_at, 1),
+                             "expired": sess.expired}
     return {
-        "ok": True,
-        "account_ref": a.ref,
-        "note": a.note,
-        "user_id": _mask(a.user_id or ""),
-        "credential": "token" if a.static_token else "password",
-        "token_source": "static" if a.static_token else _last_source.get(a.ref, "cookie"),
-        "has_token": bool(sess.token),
-        "cookie_names": sorted(sess.cookies),
-        "expires_in_s": max(0.0, round(sess.ttl - (time.time() - sess.obtained_at), 1)),
+        "config_file": str(path) if path else None,
+        "url_set": bool(cfg("MCP_ITOM_URL")),
+        "accounts": configured_refs(),
+        "uid_param": uid_param or None,
+        "token_header": head or None,
+        "envelope": (cfg("MCP_ITOM_ENVELOPE") or "1").strip().lower() not in {"0", "false", "no", "off"},
+        "token_ttl_s": _ttl(),
+        "timeout_s": _timeout(),
+        "sessions": sessions,
+        "hint": None if uid_param else
+                "未配 MCP_ITOM_UID_PARAM：ITOM 的业务接口要求把登录返回的 gm_auth_token "
+                "作为查询参数 uid 发送，缺了它平台会回 retCode=0200000「登录信息发生变化」",
     }
 
 

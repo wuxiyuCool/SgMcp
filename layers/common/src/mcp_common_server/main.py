@@ -1,8 +1,13 @@
 """【下层】通用工具 MCP server 入口。
 
 提供与业务无关的通用工具（实现见 tools.py），是三层中最底层的基础服务。
-入参枚举一律用 `Literal`——生成 JSON Schema enum 让 AI 第一次就填对，
-比运行时报错省一轮往返（与 it_ops 的 dataset 枚举同一做法）。
+
+规范（docs/develop-deploy.md「工具清单」）：
+- 命名 ``util_{action}_{resource}``，动词取白名单（get/create/search/calc），
+  全域 8 个（≤8 治理线），全局唯一、永久稳定、不含动态元素（WeKnora 兼容）；
+- description 写明「Use when / Do NOT use when」；错误带 ``[COMMON_<CODE>]`` 前缀；
+- 入参枚举一律用 `Literal`——生成 JSON Schema enum 让 AI 第一次就填对，
+  比运行时报错省一轮往返。
 
 运行：
 - stdio：  common-server
@@ -14,170 +19,124 @@ from __future__ import annotations
 from typing import Literal
 
 from mcp.server import MCPServer
+from mcp_types import ToolAnnotations
 
 from mcp_common_server import tools
 from mcp_shared import run_server
 
 mcp = MCPServer("common-tools")
 
+# 全部为无外部副作用的纯计算：只读。util_create_id 结果随机，非幂等。
+_RO = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True,
+                      open_world_hint=False)
+_RO_RANDOM = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=False,
+                             open_world_hint=False)
 
-@mcp.tool()
-def now(timezone_name: Literal["UTC", "Asia/Shanghai", "Asia/Tokyo", "Europe/London",
-                               "America/New_York", "Asia/Hong_Kong"] = "UTC") -> str:
-    """返回当前时间（ISO 8601 字符串，如 "2026-09-24T09:30:00+08:00"）。
 
-    参数 timezone_name：IANA 时区名枚举（默认 UTC）。需要其他时区请传最接近的
-    常用值，或改用 datetime_convert（它接受任意 IANA 名）。
+@mcp.tool(name="util_get_time", title="当前时间与时区换算", annotations=_RO)
+def util_get_time(timezone_name: str = "Asia/Shanghai", value: str = "",
+                  from_tz: str = "UTC", offset_days: int = 0, offset_hours: int = 0) -> dict:
+    """取当前时间，或做时区换算/时间偏移（value 留空=当前时间）。
+
+    Use when：需要"现在几点"、把某个 ISO 时间换算到别的时区、算相对时间
+    （如"3 天前到现在"用 offset_days=-3）。返回 converted/shifted 两个 ISO 串。
+    Do NOT use when：查业务单据里的时间（工单创建时间等）——那是平台数据本身。
+    参数：timezone_name=IANA 时区名（任意合法名，如 Asia/Shanghai）；
+    value=ISO 8601 时间串（留空取当前时间；也接受 "2026-09-24" 与 "Z" 后缀）；
+    from_tz=无时区标记的输入按此时区解释；offset_days/offset_hours=偏移（可负）。
     """
-    return tools.now(timezone_name)
+    return tools.get_time(timezone_name, value, from_tz, offset_days, offset_hours)
 
 
-@mcp.tool()
-def generate_id(prefix: str = "id") -> str:
-    """生成全局唯一 ID，返回字符串，形如 "ticket_a1b2c3d4e5f6"。
+@mcp.tool(name="util_create_id", title="生成 ID / 随机串", annotations=_RO_RANDOM)
+def util_create_id(kind: Literal["prefixed", "uuid", "random"] = "prefixed", count: int = 1,
+                   prefix: str = "id", version: Literal[4, 7] = 4, length: int = 16,
+                   charset: Literal["alnum", "alpha", "hex", "digits"] = "alnum",
+                   digits_only: bool = False) -> dict:
+    """批量生成唯一 ID / 随机串，返回 {"ids": [...]}（count 上限 100）。
 
-    参数 prefix：ID 前缀（小写英文为佳），如 "order" → "order_a1b2c3d4e5f6"。
-    每次调用结果必然不同，可用于幂等键/追踪号——经网关 gateway_call 的
-    idempotency_key 传回即可让写操作重试安全（同键不会二次执行）。
+    Use when：需要幂等键（经网关 gateway_call 的 idempotency_key 传回，让写操作
+    重试安全）、追踪号、临时密码/验证码。kind=prefixed 带前缀短 ID；uuid 标准
+    UUID（4 随机/7 时间有序）；random 密码学随机串（charset 选字符集，
+    digits_only 纯数字）。
+    Do NOT use when：需要业务单号（由平台系统自己生成，如 ITOM 的 eventNo）。
+    每次调用结果必然不同，生成后请原样复用，不要指望两次调用返回同值。
     """
-    return tools.generate_id(prefix)
+    return tools.create_id(kind, count, prefix, version, length, charset, digits_only)
 
 
-@mcp.tool()
-def slugify(text: str) -> str:
-    """把任意文本转为小写连字符 slug（用于命名/文件名/URL）。
+@mcp.tool(name="util_get_encoded", title="摘要 / Base64 / slug", annotations=_RO)
+def util_get_encoded(text: str,
+                     algo: Literal["md5", "sha1", "sha256", "sha512", "base64", "slug"] = "sha256",
+                     mode: Literal["encode", "decode"] = "encode") -> dict:
+    """文本摘要与编解码统一入口：md5/sha1/sha256/sha512 返回 {"algo","hex"}，
+    base64/slug 返回 {"algo","result"}。
 
-    例："Deploy API v2!" → "deploy-api-v2"。仅保留字母数字，其余字符折叠为单个 "-"。
-    注意：中文会被整体去除（结果可能为空串），中文命名请自行给拼音。
+    Use when：算校验哈希、Base64 编解码（mode=encode/decode）、把标题转成
+    文件名/URL slug。
+    Do NOT use when：加密敏感数据——这些都不是加密；口令类比较请走业务系统。
+    注意：slug 只保留字母数字，中文会被整体去除（结果可能为空串）。
     """
-    return tools.slugify(text)
+    return tools.get_encoded(text, algo, mode)
 
 
-@mcp.tool()
-def echo(message: str, uppercase: bool = False) -> str:
-    """原样返回消息。用于连通性/冒烟测试。
+@mcp.tool(name="util_get_json", title="JSON 校验与变换", annotations=_RO)
+def util_get_json(text: str,
+                  mode: Literal["validate", "pretty", "minify", "keys"] = "validate") -> dict:
+    """JSON 处理：validate（合法性+错误位置）/pretty（缩进）/minify（压缩）/keys（顶层键）。
 
-    参数：message=要回显的文本（必填）；uppercase=true 时返回其大写形式。
-    例：{"message": "abc", "uppercase": true} → "ABC"。
+    Use when：校验 AI 拼装或外部来的 JSON、格式化展示前压缩、看顶层结构。
+    Do NOT use when：解析 YAML/XML——本工具只认 JSON。
+    validate 对非法 JSON 也正常返回 {"valid": false, "error", "line", "column",
+    "hint"}，不报工具错误——直接看错在哪一行，不要盲目重试。
     """
-    return tools.echo(message, uppercase)
+    return tools.get_json(text, mode)
 
 
-@mcp.tool()
-def timestamp() -> int:
-    """返回当前 Unix 时间戳（秒，整数）。无参数。"""
-    return tools.timestamp()
+@mcp.tool(name="util_get_url", title="拆解 URL", annotations=_RO)
+def util_get_url(url: str) -> dict:
+    """拆解 URL，返回 scheme/host/port/path/query（参数字典）/fragment。
 
-
-@mcp.tool()
-def server_self_check() -> dict:
-    """下层自检：各工具跑一遍并回报规模上限配置（部署完先调它确认服务健康）。
-
-    返回 {"ok": true, "checks": {...}, "limits": {...}}；任一项失败 ok=false 且
-    details 里给出该项错误。运维巡检与 CI 起步用，替代手工逐个 ping。
+    Use when：从回调/ webhook 地址里取 host、path 或某个查询参数。
+    Do NOT use when：请求这个 URL——本工具不发起网络访问，只解析字符串。
     """
-    checks: dict[str, object] = {}
-    ok = True
-    probes = {
-        "now": lambda: tools.now("Asia/Shanghai"),
-        "echo": lambda: tools.echo("ping", True),
-        "hash_text": lambda: tools.hash_text("abc", "sha256"),
-        "base64_codec": lambda: tools.base64_codec(tools.base64_codec("abc")["result"], "decode"),
-        "uuid_generate": lambda: tools.uuid_generate(2, 4),
-        "random_string": lambda: tools.random_string(12, "alnum", False),
-        "json_tool": lambda: tools.json_tool('{"a":1}', "validate"),
-        "datetime_convert": lambda: tools.datetime_convert("2026-01-01T00:00:00", "UTC", "Asia/Shanghai", 0, 0),
-        "url_parse": lambda: tools.url_parse("https://example.com:443/a/b?x=1#f"),
-        "regex_find": lambda: tools.regex_find(r"(?P<y>\d{4})-\d{2}", "2026-09", False, 5),
-        "text_stats": lambda: tools.text_stats("a b\nc"),
-    }
-    for name, fn in probes.items():
-        try:
-            checks[name] = fn()
-        except Exception as e:  # noqa: BLE001 — 自检要把失败如实报出来
-            checks[name] = f"FAILED: {type(e).__name__}: {e}"
-            ok = False
-    from mcp_shared import limits
-
-    return {"ok": ok, "checks": checks,
-            "limits": {"max_text_chars": limits.max_text(), "max_list_items": limits.max_list(),
-                       "max_regex_text": limits.max_regex_text(),
-                       "file_roots": [str(p) for p in limits.file_roots()]}}
+    return tools.get_url(url)
 
 
-# ---------------- 通用文本/编码小工具（轻活档） ----------------
-
-@mcp.tool()
-def hash_text(text: str, algo: Literal["md5", "sha1", "sha256", "sha512"] = "sha256") -> dict:
-    """计算文本哈希值，返回 {"algo", "hex"}。
-
-    参数：text=待哈希文本（必填，长度受限）；algo=枚举 md5/sha1/sha256/sha512（默认 sha256）。"""
-    return tools.hash_text(text, algo)
-
-
-@mcp.tool()
-def base64_codec(text: str, mode: Literal["encode", "decode"] = "encode") -> dict:
-    """Base64 编码/解码，返回 {"result"}。参数：text=输入；mode=encode（文本→Base64）/decode（Base64→文本）。"""
-    return tools.base64_codec(text, mode)
-
-
-@mcp.tool()
-def uuid_generate(count: int = 1, version: Literal[4, 7] = 4) -> dict:
-    """批量生成 UUID，返回 {"ids": [...]}。参数：count=数量（默认 1，上限 100）；version=4 随机 / 7 时间有序。"""
-    return tools.uuid_generate(count, version)
-
-
-@mcp.tool()
-def random_string(length: int = 16, charset: Literal["alnum", "alpha", "hex", "digits"] = "alnum",
-                  digits_only: bool = False) -> dict:
-    """生成密码学安全随机串（临时密码/验证码/唯一后缀）。
-
-    参数：length=长度（默认 16，上限 512）；charset=枚举 alnum/alpha/hex/digits；
-    digits_only=true 快捷生成纯数字串。"""
-    return tools.random_string(length, charset, digits_only)
-
-
-@mcp.tool()
-def json_tool(text: str, mode: Literal["validate", "pretty", "minify", "keys"] = "validate") -> dict:
-    """JSON 工具箱。参数：text=JSON 文本；mode=枚举 validate（校验+错误位置）/pretty（美化）/minify（压缩）/keys（顶层键）。
-
-    validate 对非法 JSON 也正常返回 {"valid": false, "error", "line", "column", "hint"}，
-    不报工具错误——让 AI 直接看到错在哪一行而不是重试。"""
-    return tools.json_tool(text, mode)
-
-
-@mcp.tool()
-def datetime_convert(value: str = "", from_tz: str = "UTC", to_tz: str = "Asia/Shanghai",
-                     offset_days: int = 0, offset_hours: int = 0) -> dict:
-    """时区换算 + 时间偏移计算。
-
-    参数：value=ISO 8601 时间串（留空=当前时间；也接受 "2026-09-24" 与 "Z" 后缀）；
-    from_tz=无时区标记的输入按此时区解释（任意 IANA 名）；
-    to_tz=目标时区（IANA 名，如 Asia/Shanghai）；offset_days/offset_hours=偏移（可为负）。
-    返回 input/converted/shifted 三个时间点。"""
-    return tools.datetime_convert(value, from_tz, to_tz, offset_days, offset_hours)
-
-
-@mcp.tool()
-def url_parse(url: str) -> dict:
-    """拆解 URL，返回 scheme/host/port/path/query（参数字典）/fragment。"""
-    return tools.url_parse(url)
-
-
-@mcp.tool()
-def regex_find(pattern: str, text: str, flags_ignorecase: bool = False, limit: int = 50) -> dict:
+@mcp.tool(name="util_search_text", title="正则搜索", annotations=_RO)
+def util_search_text(pattern: str, text: str, flags_ignorecase: bool = False,
+                     limit: int = 50) -> dict:
     """正则搜索，返回 {"count", "matches": [{"text","span","groups"}], "pattern"}。
 
-    参数：pattern=正则（支持 Python 命名分组 (?P<name>...)；疑似灾难性回溯的写法会被
-    拒绝并说明原因）；text=目标文本（长度受限）；flags_ignorecase=忽略大小写；
-    limit=最多条数（默认 50，上限 200）。"""
-    return tools.regex_find(pattern, text, flags_ignorecase, limit)
+    Use when：在一段文本里批量提取符合模式的内容（单号、IP、编码等）。
+    支持 Python 命名分组 (?P<name>...)，分组结果在 groups 里。
+    Do NOT use when：全文语义检索——那是知识库的事；疑似灾难性回溯的正则
+    （嵌套量词等）会被拒绝并说明原因。
+    参数：flags_ignorecase=忽略大小写；limit=最多条数（默认 50，上限 200）。
+    """
+    return tools.search_text(pattern, text, flags_ignorecase, limit)
 
 
-@mcp.tool()
-def text_stats(text: str) -> dict:
-    """文本统计，返回 chars/chars_no_space/words/lines 四项计数。"""
-    return tools.text_stats(text)
+@mcp.tool(name="util_calc_stats", title="文本字数统计", annotations=_RO)
+def util_calc_stats(text: str) -> dict:
+    """文本统计，返回 chars/chars_no_space/words/lines 四项计数。
+
+    Use when：估算一段文本的规模（是否超接口长度限制、要不要截断）。
+    Do NOT use when：统计 token 数——words 不等于 tokens，只能做量级参考。
+    """
+    return tools.calc_stats(text)
+
+
+@mcp.tool(name="util_get_status", title="下层服务自检", annotations=_RO)
+def util_get_status() -> dict:
+    """下层自检：各 util_* 工具跑一遍并回报规模上限配置。
+
+    Use when：部署完确认服务健康、排障时判断下层是否可用。
+    Do NOT use when：查 ITOM 对接状态——那是 itops_get_itom_status。
+    返回 {"ok": true, "checks": {...}, "limits": {...}}；任一项失败 ok=false
+    且 checks 里给出该项错误。运维巡检与 CI 起步用。
+    """
+    return tools.self_check()
 
 
 def main() -> None:

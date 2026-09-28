@@ -43,9 +43,9 @@ DEFAULT_DOWNSTREAMS = (
 # 默认需审批工具（工具名带层级前缀：itops_=领域工具 / data_=全局数据平台；
 # 匹配时点号会先归一为下划线，兼容旧写法；可用 MCP_APPROVAL_TOOLS 覆盖）
 DEFAULT_APPROVAL_TOOLS = frozenset({
-    "itops_create_change", "data_submit_collect_job",
-    # 写真实生产 ITOM 数据的透传口（只读的 itops_itom_get 不在名单内）
-    "itops_itom_call", "itops_itom_create_incident",
+    # 写真实生产 ITOM 数据的透传口（只读的 itops_query_itom 不在名单内；
+    # itops_delete_itom_sessions 仅登出会话，不写数据，无需审批）
+    "itops_submit_itom", "itops_create_itom_incident", "data_submit_collect_job",
 })
 
 
@@ -271,8 +271,10 @@ class Aggregator:
                     endpoint=spec.url,
                     headers=spec.headers,
                     input_schema=t.input_schema,
-                    read_only=bool(getattr(ann, "readOnlyHint", False)),
-                    open_world=getattr(ann, "openWorldHint", None),
+                    # pydantic 模型属性是 snake_case（readOnlyHint 只是 Field 别名，
+                    # getattr 用 camelCase 永远取不到值 → 只读工具自动重试从未生效）
+                    read_only=bool(getattr(ann, "read_only_hint", False) or False),
+                    open_world=getattr(ann, "open_world_hint", None),
                 )
             )
         self.router.replace_server_routes(spec.name, routes)

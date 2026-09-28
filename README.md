@@ -51,7 +51,7 @@ AI ──MCP──▶ 网关（唯一入口）
 - **启动竞态容忍**：下游未就绪时每秒重试（窗口 `MCP_DISCOVERY_RETRY_SECONDS`，
   默认 6s）；彻底缺席则跳过告警照常启动，上线后调 `refresh_routes` 工具补拉。
 - **审批策略外置**：需 HITL 审批的工具名由 `MCP_APPROVAL_TOOLS` 配置
-  （默认 `itops_create_change,data_submit_collect_job,itops_itom_call`；支持 `data_batch_*` 前缀通配
+  （默认 `itops_submit_itom,itops_create_itom_incident,data_submit_collect_job`；支持 `data_batch_*` 前缀通配
   与 `go_datahub:data_submit_collect_job` 形式的 server 限定）。
 - 详见 `docs/architecture.md` §2 与 `mcp_gateway/aggregator.py`。
 
@@ -70,10 +70,8 @@ AI ──MCP──▶ 网关（唯一入口）
   `POST /internal/v1/batch/import`、`POST /internal/v1/batch/query`、`POST /internal/v1/batch/process`
   ——与同名 `data_*` 工具共用 dbhub 核心实现，行为一致（参数错误 4xx；库侧失败 200 + ok=false；
   两侧同规则支持 db_type 自动推断与 `tenant_id=default` 兜底路由）。
-  内置示例（it_ops，完整三跳链路 `gateway → business → data`）：
-  - `itops_export_assets_to_warehouse`：CMDB 资产批量归档入库，
-    内部直调 `/internal/v1/batch/import`（事务写入、dsn_ref 引用服务端 DSN）。
-  - `itops_query_warehouse_assets`：查询归档结果，内部直调 `/internal/v1/batch/query`。
+  it_ops 收敛为 ITOM 域后当前未内置直调示例；业务层将来做归档/数仓场景时按此
+  机制直调（完整三跳链路 `gateway → business → data`），AI 侧无感知。
 - **重活层库表操作**（均列名白名单 + 值参数绑定 + 连接串脱敏，支持 pg/mysql/mssql/oracle）：
   `data_list_tables`（列用户表）、`data_batch_import`（事务批量写入，单次上限 5 万行）、
   `data_batch_query`（等值过滤 + 行数上限防拖库）。目标库经 `dsn_ref` 引用
@@ -135,9 +133,10 @@ AI 与业务层只认**业务数据集名**（不是表名），物理库表由�
 - 路由配置（env，Go/Python 两侧同一套约定，见 `datahub.env.example`）：
   `DATASET_<名称>_DBTYPE`、`DATASET_<名称>_DSN_<租户大写>`（租户专属）、
   `DATASET_<名称>_DSN_DEFAULT`（兜底）；值为 `dsn_ref`，不存连接串。
-- **两侧都实现了同款**：Go `data_batch_process`（异步 job，`data_list_datasets`
-  发现数据集）；Python `itops_batch_process`（业务层路由解析，real 模式经内部
-  REST 下放重活层执行）+ `itops_list_datasets`。两侧清单与域归属/中文说明字段一致（有测试断言）。
+- **Go 侧** `data_batch_process`（异步 job，`data_list_datasets` 发现数据集，含
+  域归属/中文说明）承担全部批处理执行；**Python 侧** `mcp_shared/dsrouting.py`
+  是同款路由约定的纯库函数（`route_db` / `route_table` / `list_datasets`，
+  供业务层将来复用），当前不暴露 MCP 工具。
 - `tenant_id` 传 `default`（各工具默认值）即走 `_DSN_DEFAULT` 兜底路由；租户名限字符集，
   防借 `tenant_id` 拼接读取任意配置键。
 - mode=simulate 演练（不触库，任意环境可跑通全流程）；mode=real 真实执行。

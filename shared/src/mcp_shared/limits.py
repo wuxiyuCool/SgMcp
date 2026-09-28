@@ -17,6 +17,8 @@ import os
 import re
 from pathlib import Path
 
+from mcp.server.mcpserver.exceptions import ToolError
+
 
 def _int_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
@@ -27,6 +29,16 @@ def _int_env(name: str, default: int) -> int:
         return val if val > 0 else default
     except ValueError:
         return default
+
+
+class LimitError(ValueError, ToolError):
+    """规模/路径/正则护栏错误：双身份。
+
+    是 ValueError——老调用方 `except ValueError` 的兼容不破；
+    是 ToolError——SDK 只把 ToolError 的消息原样带给调用方，
+    非 ToolError 异常会被裹成 UnexpectedToolError 并丢掉消息，
+    护栏文案（含"怎么办"的建议）AI 一个字都看不到。
+    """
 
 
 def max_text() -> int:
@@ -49,9 +61,9 @@ def check_text(text: str, *, limit: int | None = None, what: str = "text") -> st
     """文本规模校验：超限给可读错误（而不是把 worker 打满）。"""
     cap = limit or max_text()
     if not isinstance(text, str):
-        raise ValueError(f"{what} 必须是字符串，实为 {type(text).__name__}")
+        raise LimitError(f"{what} 必须是字符串，实为 {type(text).__name__}")
     if len(text) > cap:
-        raise ValueError(
+        raise LimitError(
             f"{what} 过长（{len(text)} 字符 > 上限 {cap}）。请分段处理，"
             "大文件请用重活层的文件工具（data_file_stats / data_convert_file）"
         )
@@ -61,7 +73,7 @@ def check_text(text: str, *, limit: int | None = None, what: str = "text") -> st
 def check_list_size(items, *, limit: int | None = None, what: str = "列表") -> None:
     cap = limit or max_list()
     if items is not None and len(items) > cap:
-        raise ValueError(f"{what} 超过上限 {cap}（实为 {len(items)} 项），请分批处理")
+        raise LimitError(f"{what} 超过上限 {cap}（实为 {len(items)} 项），请分批处理")
 
 
 # ReDoS 经验性护栏：Python re 没有超时机制，"分组内含不定量词 + 分组本身再被
@@ -78,16 +90,16 @@ def check_pattern(pattern: str) -> str:
     共享的工具进程一旦卡住，整条链路的 AI 调用全跟着挂。
     """
     if len(pattern) > max_pattern():
-        raise ValueError(f"正则过长（{len(pattern)} > {max_pattern()} 字符）")
+        raise LimitError(f"正则过长（{len(pattern)} > {max_pattern()} 字符）")
     if _NESTED_QUANTIFIER.search(pattern):
-        raise ValueError(
+        raise LimitError(
             f"正则疑似存在灾难性回溯（嵌套量词/重叠分支）：{pattern!r}。"
             "请改用非回溯写法（原子分组思路：减少 * 与 + 的嵌套），或分多步匹配"
         )
     try:
         re.compile(pattern)
     except re.error as e:
-        raise ValueError(f"正则非法: {e}") from e
+        raise LimitError(f"正则非法: {e}") from e
     return pattern
 
 
@@ -109,27 +121,27 @@ def safe_path(path: str, *, for_write: bool = False, env_key: str = "MCP_FILE_RO
     运维放开时配 `MCP_FILE_ROOTS=/data/exports,/tmp` 即可，无需改代码。
     """
     if not path or not str(path).strip():
-        raise ValueError("path 不能为空")
+        raise LimitError("path 不能为空")
     roots = file_roots(env_key)
     if not roots:
-        raise ValueError(
+        raise LimitError(
             "本机文件路径未开放：请配 MCP_FILE_ROOTS（逗号分隔的允许根目录）后重试，"
-            "或改用直接传内容的工具（如 common 的 hash_text / json_tool）"
+            "或改用直接传内容的工具（如 common 的 util_get_encoded / util_get_json）"
         )
     p = Path(str(path).strip()).expanduser()
     try:
         resolved = (p if p.is_absolute() else Path.cwd() / p).resolve()
     except OSError as e:
-        raise ValueError(f"路径无法解析: {path!r}（{e}）") from e
+        raise LimitError(f"路径无法解析: {path!r}（{e}）") from e
     for root in roots:
         try:
             resolved.relative_to(root)
         except ValueError:
             continue
         if for_write and resolved.exists() and resolved.is_dir():
-            raise ValueError(f"目标已是目录，不能写入: {resolved}")
+            raise LimitError(f"目标已是目录，不能写入: {resolved}")
         return resolved
-    raise ValueError(
+    raise LimitError(
         f"路径越界：{resolved} 不在允许清单内（MCP_FILE_ROOTS={','.join(str(r) for r in roots)}）。"
         "请改用清单内目录，或由运维扩展该配置"
     )

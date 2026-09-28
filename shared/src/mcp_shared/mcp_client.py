@@ -10,7 +10,7 @@
 
 1. **超时**：必须给整条调用（连接 + initialize + 工具执行）设上限，否则下游半死
    （TCP 连着但不响应）会永久占住 SDK worker 线程，把整个网关拖成不可用。
-   默认 ``MCP_DOWNSTREAM_TIMEOUT_SECONDS``（60s），可按工具覆盖
+   默认 ``MCP_DOWNSTREAM_TIMEOUT_SECONDS``（120s），可按工具覆盖
    （``MCP_DOWNSTREAM_TIMEOUT_<工具名大写>``）。
 2. **幂等重试**：只对**只读/幂等**工具在超时或连接失败后重试一次
    （``MCP_DOWNSTREAM_RETRIES``，默认 1，0=关闭）。写操作绝不自动重试——
@@ -31,7 +31,7 @@ from typing import Any
 
 logger = logging.getLogger("mcp_shared.mcp_client")
 
-DEFAULT_TIMEOUT = 60.0
+DEFAULT_TIMEOUT = 120.0
 
 
 def bearer_headers(token: str | None) -> dict[str, str] | None:
@@ -167,6 +167,10 @@ def new_http_client(headers: dict[str, str] | None, timeout: float,
         headers=headers or {},
         timeout=httpx2.Timeout(timeout, connect=min(timeout, 10.0)),
         event_hooks={"response": [_record]},
+        # trust_env=False：下游是内网服务地址，不吃 HTTP(S)_PROXY/NO_PROXY 环境变量。
+        # 踩过的坑：本机配了代理时，「下游未启动」的连接拒绝会被代理转成读超时，
+        # 错误分类从 unreachable 变 timeout，把排障方向带偏。
+        trust_env=False,
     )
 
 
@@ -194,7 +198,7 @@ def _unwrap_result(result: Any) -> Any:
     与 tests/ops/client.py 的 _unwrap 同一套规则：
     - SDK v2 对「返回 list」的工具会用 ``{"result": [...]}`` 包一层信封 → 剥掉；
     - 无结构化输出时取文本内容，单一文本尝试 JSON 解析（dict/list 工具的常见形态），
-      解析失败则原样返回字符串（echo/slugify 等纯文本工具）。
+      解析失败则原样返回字符串（util_* 等纯文本工具）。
     """
     if result.structured_content is not None:
         data = result.structured_content

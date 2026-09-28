@@ -116,16 +116,16 @@ AI 侧配置保持只有 `Authorization`，看不到审批令牌：
 | `query_audit_log(limit, event?, server?, tool?, call_id?)` | 调用审计回查（敏感入参已脱敏） |
 
 **下游工具**：随部署而变，**不要背名字**——用 `list_tool_catalog`（或
-`route_*` 的 method 枚举）现场确认。三层粒度约定：`itops_*` 领域工具、
-`itops_query_dataset` 领域通用查询、`data_*` 全局数据平台（Go 重活）。
+`route_*` 的 method 枚举）现场确认。三层粒度约定：`itops_*` 领域工具
+（ITOM 平台对接）、`data_*` 全局数据平台（Go 重活）、无前缀 common 轻活工具。
 
-## 示例调用序列（变更单审批）
+## 示例调用序列（ITOM 写操作审批）
 
-1. AI 调用：`route_it_ops(method="itops_create_change", params={"title": "升级财务库", "risk": "high"})`
+1. AI 调用：`route_it_ops(method="itops_submit_itom", params={"account_ref": "wangxu", "path": "/event-manage/updateEvent", "body": {...}})`
 2. 网关返回：`{approved: false, executed: false, request_id: "apr_...", expires_at: "...", call_id: "cal_..."}`
    ——目标操作**尚未执行**，AI 应把 request_id 交给审批人后停手。
 3. 审批人（独立客户端）：`list_pending_approvals` → `approve_request("apr_...", approval_token="<令牌>")`
-4. 网关转发执行 `it_ops_create_change`，返回变更单；若下游失败，单据转 `exec_failed`，
+4. 网关转发执行 `itops_submit_itom`，返回平台执行结果；若下游失败，单据转 `exec_failed`，
    修正原因后 `retry_execution` 重放即可。
 
 ## 接入自查（AI 客户端连不上时）
