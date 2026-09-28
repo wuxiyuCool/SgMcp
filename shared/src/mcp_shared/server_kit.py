@@ -85,9 +85,11 @@ def run_server(
 
     import uvicorn
 
-    # 始终加前置层：/healthz 探活对运维恒可用；鉴权与限流按配置生效
+    # 必须把 host 传给 streamable_http_app()：SDK 在 host 为 127.0.0.1/localhost 时会自动
+    # 开启 DNS-rebinding 防护（只放行本机 Host 头）。漏传就会用默认值 127.0.0.1，导致
+    # --host 0.0.0.0 部署后外部访问被拒（initialize 报 421/400，AI 平台显示成 500）。
     app = http_kit.wrap_mcp_app(
-        mcp.streamable_http_app(),
+        mcp.streamable_http_app(host=args.host, transport_security=_security(args.host)),
         server_name=getattr(mcp, "name", None) or description,
         token=token or None,
         rate_limit_per_second=limit,
@@ -97,6 +99,30 @@ def run_server(
     if token:
         print(f"[{getattr(mcp, 'name', 'server')}] 已启用 Bearer 鉴权（{token_env}）；/healthz 免鉴权")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
+def _security(host: str):
+    """DNS-rebinding 防护策略（放在 nginx/TLS 反代后面时用）。
+
+    - 未配 `MCP_ALLOWED_HOSTS` / `MCP_ALLOWED_ORIGINS` → 返回 None，沿用 SDK 默认
+      （`--host 0.0.0.0` 不加限制；本机 host 只放行 127.0.0.1/localhost）。
+    - 配了 → 在本机默认白名单上追加这些值（支持 `mcp.corp:*` 通配端口），
+      这样用真实域名访问不会被 421/403 拦掉。
+    """
+    raw_hosts = [x.strip() for x in (cfg("MCP_ALLOWED_HOSTS") or "").split(",") if x.strip()]
+    raw_origins = [x.strip() for x in (cfg("MCP_ALLOWED_ORIGINS") or "").split(",") if x.strip()]
+    if not raw_hosts and not raw_origins:
+        return None
+
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    origins = [f"{scheme}://{h}" for h in hosts for scheme in ("http", "https")]
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[*hosts, *raw_hosts],
+        allowed_origins=[*origins, *raw_origins],
+    )
 
 
 def _positive_int(raw: str | None) -> int:

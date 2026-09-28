@@ -277,6 +277,22 @@ unit 只注入路径/用户；监听、token、DSN 全由 `config/datahub.env` �
 
 ## 6. 常见问题速查
 
+> **AI 平台「测试连接」报 `Initialization failed … status 500`（或 421/403）**：
+> 九成是 Host/Origin 校验没过，不是令牌问题。看网关日志
+> （`journalctl -u mcp-gateway | grep -i "Invalid Host\|Invalid Origin"`）：
+> - 有 `Invalid Host header: <你填的地址>` → 网关以 `--host 127.0.0.1` 启动却被外部访问。
+>   改 `MCP_HOST=0.0.0.0` 对外服务（推荐），或配 `MCP_ALLOWED_HOSTS=<该地址>:*`。
+> - 有 `Invalid Origin header` → 同理补 `MCP_ALLOWED_ORIGINS=<scheme>://<地址>:<端口>`。
+> - 都没有、日志里是 401 → 才是 `MCP_GATEWAY_TOKEN` 不匹配。
+> 自查命令（绕开 MCP 协议直接看状态码）：
+> ```bash
+> curl -s -o /dev/null -w "HTTP %{http_code}" -X POST http://<网关>:9000/mcp \
+>   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+>   -H 'Host: <网关IP>:9000' -H 'Origin: http://<网关IP>:9000' \
+>   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}'
+> ```
+> 期望 200；421/403 即上述 Host/Origin 问题，401 是令牌问题。
+
 | 症状 | 原因/解法 |
 |------|-----------|
 | 客户端连不上，curl `/mcp` 返回 400 Missing session ID | 服务正常！检查 URL 是否带 `/mcp` |
@@ -311,6 +327,7 @@ unit 只注入路径/用户；监听、token、DSN 全由 `config/datahub.env` �
 | `MCP_APPROVAL_TOKEN` | 空 | **审批令牌**：approve/reject/retry 必须携带 | AI 可自问自答放行高风险写操作 |
 | `MCP_RATE_LIMIT_PER_SECOND` | 0（不限） | 按客户端滑动窗口限流，超限 429 | 平台重试风暴直接打穿下游 |
 | `MCP_TRUSTED_PROXY` | 空 | 可信反代 IP/CIDR，仅此来源采信 X-Forwarded-For | 伪造头即可绕过限流分桶 |
+| `MCP_ALLOWED_HOSTS` / `MCP_ALLOWED_ORIGINS` | 空（=沿用 SDK 默认） | 本机绑定时追加放行域名/IP（支持 `host:*`） | 用域名或内网 IP 访问时 initialize 被 421/403 拒（AI 平台显示成 500） |
 | `MCP_DOWNSTREAM_TIMEOUT_SECONDS` | 60 | 下游调用整体超时（可按工具覆盖） | 下游半死→worker 线程挂死→网关整体不可用 |
 | `MCP_DOWNSTREAM_RETRIES` | 1 | **只读**工具的失败重试次数（写操作恒不重试） | 手动重试写操作=重复落库 |
 | `MCP_IDEMPOTENCY_TTL_SECONDS` | 600 | `idempotency_key` 缓存窗口（0=关闭） | AI 重发即二次执行 |

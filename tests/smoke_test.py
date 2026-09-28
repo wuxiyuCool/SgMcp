@@ -780,6 +780,67 @@ def test_itops_dataset_enum_from_config() -> None:
     print("PASS  it_ops·数据集枚举配置驱动（含越域引导）")
 
 
+def test_external_host_allowed() -> None:
+    """回归：绑定 0.0.0.0 对外部署时，外部 Host/Origin 不得被 DNS-rebinding 防护拦掉。
+
+    踩过的坑：run_server 自己套前置层后漏传 host 给 streamable_http_app()，SDK 按默认
+    127.0.0.1 开启防护 → AI 平台用 http://内网IP:9000 连就 421/403，界面显示成 500。
+    """
+    import httpx2
+    import uvicorn
+
+    from mcp_common_server import main as common
+    from mcp_shared.http_kit import HttpFrontend
+
+    app = HttpFrontend(common.mcp.streamable_http_app(host="0.0.0.0"), server_name="t")
+    srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error"))
+    th = threading.Thread(target=srv.run, daemon=True)
+    th.start()
+    deadline = time.time() + 10
+    while not srv.started:
+        if time.time() > deadline:
+            raise RuntimeError("HTTP server 启动超时")
+        time.sleep(0.05)
+    try:
+        port = srv.servers[0].sockets[0].getsockname()[1]
+        url = f"http://127.0.0.1:{port}/mcp"
+        body = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": "p", "version": "1"}}}
+        base = {"content-type": "application/json",
+                "accept": "application/json, text/event-stream"}
+        cases = {
+            "外部 IP Host": {**base, "host": f"10.45.34.223:{port}"},
+            "外部 Origin": {**base, "origin": f"http://10.45.34.223:{port}"},
+            "本机 Host": {**base, "host": f"127.0.0.1:{port}"},
+        }
+        for label, headers in cases.items():
+            r = httpx2.post(url, headers=headers, json=body, timeout=10)
+            assert r.status_code == 200, f"{label} 被拒：{r.status_code} {r.text[:80]}"
+        # 反向确认：绑定本机时防护仍应生效（不是把安全一起关掉）
+        app2 = HttpFrontend(common.mcp.streamable_http_app(host="127.0.0.1"), server_name="t2")
+        srv2 = uvicorn.Server(uvicorn.Config(app2, host="127.0.0.1", port=0, log_level="error"))
+        th2 = threading.Thread(target=srv2.run, daemon=True)
+        th2.start()
+        d2 = time.time() + 10
+        while not srv2.started:
+            if time.time() > d2:
+                raise RuntimeError("HTTP server 启动超时")
+            time.sleep(0.05)
+        try:
+            p2 = srv2.servers[0].sockets[0].getsockname()[1]
+            r = httpx2.post(f"http://127.0.0.1:{p2}/mcp",
+                            headers={**base, "host": f"10.45.34.223:{p2}"}, json=body, timeout=10)
+            assert r.status_code == 421, f"本机绑定应拦外部 Host，实为 {r.status_code}"
+        finally:
+            srv2.should_exit = True
+            th2.join(timeout=5)
+    finally:
+        srv.should_exit = True
+        th.join(timeout=5)
+    print("PASS  传输层·对外部署 Host/Origin 放行（本机绑定仍防护）")
+
+
 def test_gateway_identity_channels() -> None:
     """审批令牌的两条通道与真实身份：请求头优先，AI 侧无令牌即无法自批。"""
     import mcp_gateway.main as gw
@@ -842,4 +903,5 @@ if __name__ == "__main__":
     test_http_frontend_guards()
     test_downstream_failure_class()
     test_gateway_identity_channels()
+    test_external_host_allowed()
     print("\n全部冒烟测试通过 ✅")
